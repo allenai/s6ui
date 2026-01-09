@@ -1,0 +1,11 @@
+# Compiled binaries
+imgui_demo
+
+# Object files
+*.o
+
+# ImGui generated config
+imgui.ini
+
+# macOS
+.DS_Store
