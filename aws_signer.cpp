@@ -5,6 +5,7 @@
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
+#include <vector>
 
 static std::string to_hex(const unsigned char* data, size_t len) {
     std::ostringstream ss;
@@ -46,6 +47,37 @@ static std::string get_date(const std::string& timestamp) {
     return timestamp.substr(0, 8);
 }
 
+static std::string sort_query_string(const std::string& query) {
+    if (query.empty()) return "";
+
+    // Parse query string into key-value pairs
+    std::vector<std::pair<std::string, std::string>> params;
+    std::istringstream iss(query);
+    std::string param;
+    while (std::getline(iss, param, '&')) {
+        size_t eq = param.find('=');
+        if (eq != std::string::npos) {
+            params.emplace_back(param.substr(0, eq), param.substr(eq + 1));
+        } else {
+            params.emplace_back(param, "");
+        }
+    }
+
+    // Sort by key (and value if keys are equal)
+    std::sort(params.begin(), params.end());
+
+    // Rebuild query string
+    std::ostringstream result;
+    for (size_t i = 0; i < params.size(); ++i) {
+        if (i > 0) result << "&";
+        result << params[i].first;
+        if (!params[i].second.empty() || params[i].first.find('=') != std::string::npos) {
+            result << "=" << params[i].second;
+        }
+    }
+    return result.str();
+}
+
 AWSSignedRequest aws_sign_request(
     const std::string& method,
     const std::string& host,
@@ -66,8 +98,8 @@ AWSSignedRequest aws_sign_request(
     // Canonical URI (path)
     std::string canonical_uri = path.empty() ? "/" : path;
 
-    // Canonical query string (already URL-encoded, just sort parameters)
-    std::string canonical_query = query;
+    // Canonical query string (must be sorted alphabetically by parameter name)
+    std::string canonical_query = sort_query_string(query);
 
     // Canonical headers (must be sorted, lowercase)
     std::ostringstream canonical_headers_ss;
@@ -120,8 +152,8 @@ AWSSignedRequest aws_sign_request(
     AWSSignedRequest result;
     std::ostringstream url_ss;
     url_ss << "https://" << host << canonical_uri;
-    if (!query.empty()) {
-        url_ss << "?" << query;
+    if (!canonical_query.empty()) {
+        url_ss << "?" << canonical_query;
     }
     result.url = url_ss.str();
 
