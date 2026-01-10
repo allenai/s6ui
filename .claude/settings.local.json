@@ -3,7 +3,8 @@
     "allow": [
       "Bash(brew list:*)",
       "Bash(make)",
-      "Bash(git init:*)"
+      "Bash(git init:*)",
+      "Bash(make clean:*)"
     ]
   }
 }

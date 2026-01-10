@@ -1,5 +1,6 @@
 # Compiled binaries
 imgui_demo
+s3v
 
 # Object files
 *.o

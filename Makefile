@@ -1,4 +1,4 @@
-# Dear ImGui GLFW + Metal Makefile for macOS
+# S3 Browser - Dear ImGui + GLFW + Metal + libcurl
 
 CXX = clang++
 OBJCXX = clang++
@@ -17,12 +17,14 @@ OBJCXXFLAGS = $(CXXFLAGS) -fobjc-arc
 # Linker flags
 LDFLAGS = -L$(HOMEBREW_PREFIX)/lib
 LDFLAGS += -lglfw
+LDFLAGS += -lcurl
 LDFLAGS += -framework Metal
 LDFLAGS += -framework MetalKit
 LDFLAGS += -framework Cocoa
 LDFLAGS += -framework IOKit
 LDFLAGS += -framework CoreVideo
 LDFLAGS += -framework QuartzCore
+LDFLAGS += -framework Security
 
 # Source files
 IMGUI_DIR = imgui
@@ -35,17 +37,22 @@ IMGUI_SOURCES = $(IMGUI_DIR)/imgui.cpp \
 
 IMGUI_METAL_SOURCES = $(IMGUI_DIR)/imgui_impl_metal.mm
 
+APP_SOURCES = aws_credentials.cpp \
+              aws_signer.cpp \
+              s3_client.cpp
+
 MAIN_SOURCES = main.mm
 
 # Object files
 IMGUI_OBJS = $(IMGUI_SOURCES:.cpp=.o)
 IMGUI_METAL_OBJS = $(IMGUI_METAL_SOURCES:.mm=.o)
+APP_OBJS = $(APP_SOURCES:.cpp=.o)
 MAIN_OBJS = $(MAIN_SOURCES:.mm=.o)
 
-ALL_OBJS = $(IMGUI_OBJS) $(IMGUI_METAL_OBJS) $(MAIN_OBJS)
+ALL_OBJS = $(IMGUI_OBJS) $(IMGUI_METAL_OBJS) $(APP_OBJS) $(MAIN_OBJS)
 
 # Output
-TARGET = imgui_demo
+TARGET = s3v
 
 # Rules
 all: $(TARGET)
