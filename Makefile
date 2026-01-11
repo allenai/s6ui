@@ -39,7 +39,9 @@ IMGUI_METAL_SOURCES = $(IMGUI_DIR)/imgui_impl_metal.mm
 
 APP_SOURCES = aws_credentials.cpp \
               aws_signer.cpp \
-              s3_client.cpp
+              s3_backend.cpp \
+              browser_model.cpp \
+              browser_ui.cpp
 
 MAIN_SOURCES = main.mm
 
