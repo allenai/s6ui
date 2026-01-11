@@ -83,10 +83,15 @@ struct S3BrowserState {
         std::atomic<bool> loading{false};
         std::string error;
         bool expanded = false;
+        bool pending_expand = false;  // One-shot flag for programmatic expansion
     };
 
     // Tree of expanded paths
     std::map<std::string, std::shared_ptr<PathNode>> path_nodes;
+
+    // Current navigation path
+    std::string current_bucket;
+    std::string current_prefix;
 
     // Get or create a path node
     std::shared_ptr<PathNode> get_path_node(const std::string& bucket, const std::string& prefix);
