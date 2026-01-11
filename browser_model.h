@@ -7,7 +7,6 @@
 #include <vector>
 #include <map>
 #include <memory>
-#include <mutex>
 
 // Node representing a folder in the tree
 struct FolderNode {
@@ -70,16 +69,11 @@ public:
     void clearScrollTarget() { m_scrollToTarget = false; }
 
 private:
-    void onEvent(StateEvent event);
     FolderNode& getOrCreateNode(const std::string& bucket, const std::string& prefix);
     static std::string makeNodeKey(const std::string& bucket, const std::string& prefix);
     static bool parseS3Path(const std::string& path, std::string& bucket, std::string& prefix);
 
     std::unique_ptr<IBackend> m_backend;
-
-    // Event queue (thread-safe)
-    std::mutex m_eventMutex;
-    std::vector<StateEvent> m_pendingEvents;
 
     // Profiles
     std::vector<AWSProfile> m_profiles;

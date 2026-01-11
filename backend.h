@@ -2,20 +2,18 @@
 
 #include "events.h"
 #include <string>
-#include <functional>
+#include <vector>
 #include <memory>
 
-// Callback type for pushing events to the model
-using EventCallback = std::function<void(StateEvent)>;
-
 // Abstract backend interface
-// Implementations are responsible for async execution and pushing events via callback
+// Implementations handle async execution and queue events for the model to poll
 class IBackend {
 public:
     virtual ~IBackend() = default;
 
-    // Set the callback for pushing events (called by BrowserModel)
-    virtual void setEventCallback(EventCallback callback) = 0;
+    // Take all pending events (called by model each frame)
+    // Returns events and clears the internal queue
+    virtual std::vector<StateEvent> takeEvents() = 0;
 
     // Request bucket list
     virtual void listBuckets() = 0;
@@ -31,6 +29,3 @@ public:
     // Cancel all pending requests (optional, for cleanup)
     virtual void cancelAll() {}
 };
-
-// Factory function type for creating backends
-using BackendFactory = std::function<std::unique_ptr<IBackend>()>;

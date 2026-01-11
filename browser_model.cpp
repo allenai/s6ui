@@ -7,11 +7,6 @@ BrowserModel::~BrowserModel() = default;
 
 void BrowserModel::setBackend(std::unique_ptr<IBackend> backend) {
     m_backend = std::move(backend);
-    if (m_backend) {
-        m_backend->setEventCallback([this](StateEvent event) {
-            onEvent(std::move(event));
-        });
-    }
 }
 
 void BrowserModel::loadProfiles() {
@@ -154,12 +149,9 @@ void BrowserModel::addManualBucket(const std::string& bucket_name) {
 }
 
 void BrowserModel::processEvents() {
-    std::vector<StateEvent> events;
-    {
-        std::lock_guard<std::mutex> lock(m_eventMutex);
-        events = std::move(m_pendingEvents);
-        m_pendingEvents.clear();
-    }
+    if (!m_backend) return;
+
+    auto events = m_backend->takeEvents();
 
     for (auto& event : events) {
         switch (event.type) {
@@ -204,11 +196,6 @@ void BrowserModel::processEvents() {
             }
         }
     }
-}
-
-void BrowserModel::onEvent(StateEvent event) {
-    std::lock_guard<std::mutex> lock(m_eventMutex);
-    m_pendingEvents.push_back(std::move(event));
 }
 
 FolderNode* BrowserModel::getNode(const std::string& bucket, const std::string& prefix) {

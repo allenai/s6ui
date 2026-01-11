@@ -31,7 +31,7 @@ public:
     explicit S3Backend(const AWSProfile& profile);
     ~S3Backend() override;
 
-    void setEventCallback(EventCallback callback) override;
+    std::vector<StateEvent> takeEvents() override;
     void listBuckets() override;
     void listObjects(
         const std::string& bucket,
@@ -72,12 +72,17 @@ private:
     ListObjectsResult parseListObjectsXml(const std::string& xml);
 
     AWSProfile m_profile;
-    EventCallback m_callback;
 
-    // Worker thread and queue
+    // Worker thread and work queue
     std::thread m_worker;
-    std::mutex m_queueMutex;
-    std::condition_variable m_queueCv;
+    std::mutex m_workMutex;
+    std::condition_variable m_workCv;
     std::queue<WorkItem> m_workQueue;
     std::atomic<bool> m_shutdown{false};
+
+    // Event queue (results from worker thread)
+    std::mutex m_eventMutex;
+    std::vector<StateEvent> m_events;
+
+    void pushEvent(StateEvent event);
 };

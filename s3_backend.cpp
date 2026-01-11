@@ -42,11 +42,11 @@ S3Backend::~S3Backend() {
 
     // Signal shutdown
     {
-        std::lock_guard<std::mutex> lock(m_queueMutex);
+        std::lock_guard<std::mutex> lock(m_workMutex);
         m_shutdown = true;
         m_workQueue.push({WorkItem::Type::Shutdown, "", "", ""});
     }
-    m_queueCv.notify_one();
+    m_workCv.notify_one();
 
     if (m_worker.joinable()) {
         m_worker.join();
@@ -55,8 +55,16 @@ S3Backend::~S3Backend() {
     curl_global_cleanup();
 }
 
-void S3Backend::setEventCallback(EventCallback callback) {
-    m_callback = std::move(callback);
+std::vector<StateEvent> S3Backend::takeEvents() {
+    std::lock_guard<std::mutex> lock(m_eventMutex);
+    std::vector<StateEvent> events = std::move(m_events);
+    m_events.clear();
+    return events;
+}
+
+void S3Backend::pushEvent(StateEvent event) {
+    std::lock_guard<std::mutex> lock(m_eventMutex);
+    m_events.push_back(std::move(event));
 }
 
 void S3Backend::setProfile(const AWSProfile& profile) {
@@ -76,25 +84,25 @@ void S3Backend::listObjects(
 }
 
 void S3Backend::cancelAll() {
-    std::lock_guard<std::mutex> lock(m_queueMutex);
+    std::lock_guard<std::mutex> lock(m_workMutex);
     std::queue<WorkItem> empty;
     std::swap(m_workQueue, empty);
 }
 
 void S3Backend::enqueue(WorkItem item) {
     {
-        std::lock_guard<std::mutex> lock(m_queueMutex);
+        std::lock_guard<std::mutex> lock(m_workMutex);
         m_workQueue.push(std::move(item));
     }
-    m_queueCv.notify_one();
+    m_workCv.notify_one();
 }
 
 void S3Backend::workerThread() {
     while (true) {
         WorkItem item;
         {
-            std::unique_lock<std::mutex> lock(m_queueMutex);
-            m_queueCv.wait(lock, [this] {
+            std::unique_lock<std::mutex> lock(m_workMutex);
+            m_workCv.wait(lock, [this] {
                 return !m_workQueue.empty() || m_shutdown;
             });
 
@@ -110,8 +118,6 @@ void S3Backend::workerThread() {
             break;
         }
 
-        if (!m_callback) continue;
-
         if (item.type == WorkItem::Type::ListBuckets) {
             std::string host = "s3." + m_profile.region + ".amazonaws.com";
 
@@ -123,14 +129,14 @@ void S3Backend::workerThread() {
             std::string response = httpGet(signedReq.url, signedReq.headers);
 
             if (response.find("ERROR:") == 0) {
-                m_callback(StateEvent::bucketsError(response));
+                pushEvent(StateEvent::bucketsError(response));
             } else {
                 std::string error = extractError(response);
                 if (!error.empty()) {
-                    m_callback(StateEvent::bucketsError(error));
+                    pushEvent(StateEvent::bucketsError(error));
                 } else {
                     auto buckets = parseListBucketsXml(response);
-                    m_callback(StateEvent::bucketsLoaded(std::move(buckets)));
+                    pushEvent(StateEvent::bucketsLoaded(std::move(buckets)));
                 }
             }
         }
@@ -157,13 +163,13 @@ void S3Backend::workerThread() {
             std::string response = httpGet(signedReq.url, signedReq.headers);
 
             if (response.find("ERROR:") == 0) {
-                m_callback(StateEvent::objectsError(item.bucket, item.prefix, response));
+                pushEvent(StateEvent::objectsError(item.bucket, item.prefix, response));
             } else {
                 auto result = parseListObjectsXml(response);
                 if (!result.error.empty()) {
-                    m_callback(StateEvent::objectsError(item.bucket, item.prefix, result.error));
+                    pushEvent(StateEvent::objectsError(item.bucket, item.prefix, result.error));
                 } else {
-                    m_callback(StateEvent::objectsLoaded(
+                    pushEvent(StateEvent::objectsLoaded(
                         item.bucket,
                         item.prefix,
                         item.continuation_token,
