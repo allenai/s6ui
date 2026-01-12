@@ -19,6 +19,7 @@ BUILD_DIR = build
 CXXFLAGS = -std=c++17 -Wall -Wextra -O2
 CXXFLAGS += -I$(HOMEBREW_PREFIX)/include
 CXXFLAGS += -I$(LIBS_DIR)
+CXXFLAGS += -I$(LIBS_DIR)/imgui
 CXXFLAGS += -I$(LIBS_DIR)/loguru
 CXXFLAGS += -I$(SRC_DIR)
 
@@ -51,6 +52,9 @@ IMGUI_METAL_SOURCES = $(IMGUI_DIR)/imgui_impl_metal.mm
 LOGURU_DIR = $(LIBS_DIR)/loguru
 LOGURU_SOURCES = $(LOGURU_DIR)/loguru.cpp
 
+TEXTEDIT_DIR = $(LIBS_DIR)/imguicolortextedit
+TEXTEDIT_SOURCES = $(TEXTEDIT_DIR)/TextEditor.cpp
+
 AWS_SOURCES = $(AWS_DIR)/aws_credentials.cpp \
               $(AWS_DIR)/aws_signer.cpp \
               $(AWS_DIR)/s3_backend.cpp
@@ -64,11 +68,12 @@ MAIN_SOURCES = $(SRC_DIR)/main.mm
 IMGUI_OBJS = $(patsubst $(LIBS_DIR)/%.cpp,$(BUILD_DIR)/libs/%.o,$(IMGUI_SOURCES))
 IMGUI_METAL_OBJS = $(patsubst $(LIBS_DIR)/%.mm,$(BUILD_DIR)/libs/%.o,$(IMGUI_METAL_SOURCES))
 LOGURU_OBJS = $(patsubst $(LIBS_DIR)/%.cpp,$(BUILD_DIR)/libs/%.o,$(LOGURU_SOURCES))
+TEXTEDIT_OBJS = $(patsubst $(LIBS_DIR)/%.cpp,$(BUILD_DIR)/libs/%.o,$(TEXTEDIT_SOURCES))
 AWS_OBJS = $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/src/%.o,$(AWS_SOURCES))
 APP_OBJS = $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/src/%.o,$(APP_SOURCES))
 MAIN_OBJS = $(patsubst $(SRC_DIR)/%.mm,$(BUILD_DIR)/src/%.o,$(MAIN_SOURCES))
 
-ALL_OBJS = $(IMGUI_OBJS) $(IMGUI_METAL_OBJS) $(LOGURU_OBJS) $(AWS_OBJS) $(APP_OBJS) $(MAIN_OBJS)
+ALL_OBJS = $(IMGUI_OBJS) $(IMGUI_METAL_OBJS) $(LOGURU_OBJS) $(TEXTEDIT_OBJS) $(AWS_OBJS) $(APP_OBJS) $(MAIN_OBJS)
 
 # Output
 TARGET = s3v
@@ -80,11 +85,11 @@ $(TARGET): $(ALL_OBJS)
 	$(OBJCXX) $(ALL_OBJS) $(LDFLAGS) -o $@
 
 # Create build directories
-$(BUILD_DIR)/libs/imgui $(BUILD_DIR)/libs/loguru $(BUILD_DIR)/src/aws:
+$(BUILD_DIR)/libs/imgui $(BUILD_DIR)/libs/loguru $(BUILD_DIR)/libs/imguicolortextedit $(BUILD_DIR)/src/aws:
 	mkdir -p $@
 
 # Compile libs C++ files
-$(BUILD_DIR)/libs/%.o: $(LIBS_DIR)/%.cpp | $(BUILD_DIR)/libs/imgui $(BUILD_DIR)/libs/loguru
+$(BUILD_DIR)/libs/%.o: $(LIBS_DIR)/%.cpp | $(BUILD_DIR)/libs/imgui $(BUILD_DIR)/libs/loguru $(BUILD_DIR)/libs/imguicolortextedit
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 

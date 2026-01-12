@@ -1,11 +1,17 @@
 #include "browser_ui.h"
 #include "imgui/imgui.h"
 #include <cstring>
+#include <cctype>
 
 BrowserUI::BrowserUI(BrowserModel& model)
     : m_model(model)
 {
     std::strcpy(m_pathInput, "s3://");
+
+    // Configure the text editor for read-only preview
+    m_editor.SetReadOnly(true);
+    m_editor.SetPalette(TextEditor::GetDarkPalette());
+    m_editor.SetShowWhitespaces(false);
 }
 
 void BrowserUI::render(int windowWidth, int windowHeight) {
@@ -322,6 +328,7 @@ void BrowserUI::renderPreviewPane(float width, float height) {
     ImGui::BeginChild("PreviewPane", ImVec2(width, height), true);
 
     if (!m_model.hasSelection()) {
+        m_editorCurrentKey.clear();
         ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Select a file to preview");
     } else {
         // Show filename header
@@ -333,6 +340,7 @@ void BrowserUI::renderPreviewPane(float width, float height) {
         ImGui::Separator();
 
         if (!m_model.previewSupported()) {
+            m_editorCurrentKey.clear();
             ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Preview not supported for this file type");
             ImGui::Spacing();
             ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
@@ -340,23 +348,80 @@ void BrowserUI::renderPreviewPane(float width, float height) {
         } else if (m_model.previewLoading()) {
             ImGui::TextColored(ImVec4(0.5f, 0.5f, 1.0f, 1.0f), "Loading preview...");
         } else if (!m_model.previewError().empty()) {
+            m_editorCurrentKey.clear();
             ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
                 "Error: %s", m_model.previewError().c_str());
         } else {
-            // Show preview content in a scrollable child window
+            // Show preview content using the syntax-highlighted editor
             const std::string& content = m_model.previewContent();
             if (content.empty()) {
+                m_editorCurrentKey.clear();
                 ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "(empty file)");
             } else {
-                ImGui::BeginChild("PreviewContent", ImVec2(0, 0), false,
-                    ImGuiWindowFlags_HorizontalScrollbar);
-                ImGui::TextUnformatted(content.c_str(), content.c_str() + content.size());
-                ImGui::EndChild();
+                // Update editor content if file changed
+                std::string fullKey = m_model.selectedBucket() + "/" + key;
+                if (m_editorCurrentKey != fullKey) {
+                    m_editorCurrentKey = fullKey;
+                    m_editor.SetText(content);
+                    updateEditorLanguage(filename);
+                    // Reset cursor and selection for new file
+                    m_editor.SetCursorPosition(TextEditor::Coordinates(0, 0));
+                    m_editor.SetSelection(TextEditor::Coordinates(0, 0), TextEditor::Coordinates(0, 0));
+                }
+
+                // Render the editor (read-only, with syntax highlighting)
+                ImVec2 availSize = ImGui::GetContentRegionAvail();
+                m_editor.Render("##preview", availSize, false);
             }
         }
     }
 
     ImGui::EndChild();
+}
+
+void BrowserUI::updateEditorLanguage(const std::string& filename) {
+    // Find the extension
+    size_t dotPos = filename.rfind('.');
+    if (dotPos == std::string::npos) {
+        // No extension - disable colorization to avoid regex issues
+        m_editor.SetColorizerEnable(false);
+        return;
+    }
+
+    std::string ext = filename.substr(dotPos);
+    // Convert to lowercase for comparison
+    for (auto& c : ext) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+
+    // Set language based on extension
+    // For files with proper language definitions, enable colorization
+    if (ext == ".cpp" || ext == ".cxx" || ext == ".cc" || ext == ".hpp" || ext == ".hxx" || ext == ".h") {
+        m_editor.SetColorizerEnable(true);
+        m_editor.SetLanguageDefinition(TextEditor::LanguageDefinition::CPlusPlus());
+    } else if (ext == ".c") {
+        m_editor.SetColorizerEnable(true);
+        m_editor.SetLanguageDefinition(TextEditor::LanguageDefinition::C());
+    } else if (ext == ".lua") {
+        m_editor.SetColorizerEnable(true);
+        m_editor.SetLanguageDefinition(TextEditor::LanguageDefinition::Lua());
+    } else if (ext == ".sql") {
+        m_editor.SetColorizerEnable(true);
+        m_editor.SetLanguageDefinition(TextEditor::LanguageDefinition::SQL());
+    } else if (ext == ".hlsl" || ext == ".fx") {
+        m_editor.SetColorizerEnable(true);
+        m_editor.SetLanguageDefinition(TextEditor::LanguageDefinition::HLSL());
+    } else if (ext == ".glsl" || ext == ".vert" || ext == ".frag" || ext == ".geom") {
+        m_editor.SetColorizerEnable(true);
+        m_editor.SetLanguageDefinition(TextEditor::LanguageDefinition::GLSL());
+    } else if (ext == ".as") {
+        m_editor.SetColorizerEnable(true);
+        m_editor.SetLanguageDefinition(TextEditor::LanguageDefinition::AngelScript());
+    } else {
+        // For .txt, .md, .json, .jsonl, .html etc., disable colorization
+        // to avoid regex complexity issues with large/complex content
+        m_editor.SetColorizerEnable(false);
+    }
 }
 
 std::string BrowserUI::formatSize(int64_t bytes) {

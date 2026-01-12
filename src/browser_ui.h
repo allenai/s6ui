@@ -1,6 +1,7 @@
 #pragma once
 
 #include "browser_model.h"
+#include "imguicolortextedit/TextEditor.h"
 
 // Handles all ImGui rendering for the S3 browser
 class BrowserUI {
@@ -20,6 +21,8 @@ private:
     void renderStatusBar();
     void renderPreviewPane(float width, float height);
 
+    void updateEditorLanguage(const std::string& filename);
+
     static std::string formatSize(int64_t bytes);
     static std::string buildS3Path(const std::string& bucket, const std::string& prefix);
 
@@ -27,4 +30,8 @@ private:
 
     // Path input buffer
     char m_pathInput[2048] = "s3://";
+
+    // Text editor for preview with syntax highlighting
+    TextEditor m_editor;
+    std::string m_editorCurrentKey;  // Track which file is loaded in editor
 };
