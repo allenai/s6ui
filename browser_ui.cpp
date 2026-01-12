@@ -25,15 +25,32 @@ void BrowserUI::render(int windowWidth, int windowHeight) {
 
     ImGui::Separator();
 
-    // Reserve space for status bar at bottom
-    float statusBarHeight = ImGui::GetFrameHeightWithSpacing() + 4;
-    ImVec2 contentSize = ImGui::GetContentRegionAvail();
-    contentSize.y -= statusBarHeight;
+    // Calculate pane sizes
+    ImVec2 availSize = ImGui::GetContentRegionAvail();
+    float paneWidth = availSize.x * 0.5f - 4;  // Half width minus spacing
+    float paneHeight = availSize.y;
 
-    // Scrollable content area
-    ImGui::BeginChild("ScrollingContent", contentSize, true,
-        ImGuiWindowFlags_HorizontalScrollbar |
-        ImGuiWindowFlags_AlwaysVerticalScrollbar);
+    // Left pane (file browser + status bar)
+    renderLeftPane(paneWidth, paneHeight);
+
+    ImGui::SameLine();
+
+    // Right pane (preview)
+    renderPreviewPane(paneWidth, paneHeight);
+
+    ImGui::End();
+}
+
+void BrowserUI::renderLeftPane(float width, float height) {
+    ImGui::BeginChild("LeftPane", ImVec2(width, height), false);
+
+    // Reserve space for status bar
+    float statusBarHeight = ImGui::GetFrameHeightWithSpacing() + 4;
+    float contentHeight = height - statusBarHeight;
+
+    // File browser content
+    ImGui::BeginChild("FileContent", ImVec2(width, contentHeight), true,
+        ImGuiWindowFlags_HorizontalScrollbar);
 
     renderContent();
 
@@ -42,7 +59,7 @@ void BrowserUI::render(int windowWidth, int windowHeight) {
     // Status bar
     renderStatusBar();
 
-    ImGui::End();
+    ImGui::EndChild();
 }
 
 void BrowserUI::renderTopBar() {
@@ -183,8 +200,11 @@ void BrowserUI::renderFolderContents() {
         if (obj.is_folder) continue;
 
         std::string label = "    " + obj.display_name + "  (" + formatSize(obj.size) + ")";
-        // Files are just displayed, not clickable for navigation
-        ImGui::Selectable(label.c_str(), false, ImGuiSelectableFlags_Disabled);
+        // Check if this file is selected
+        bool isSelected = (m_model.selectedBucket() == bucket && m_model.selectedKey() == obj.key);
+        if (ImGui::Selectable(label.c_str(), isSelected)) {
+            m_model.selectFile(bucket, obj.key);
+        }
     }
 
     // Show inline loading indicator if loading more
@@ -264,6 +284,47 @@ void BrowserUI::renderStatusBar() {
             ImGui::Text("%s", status.c_str());
         }
     }
+}
+
+void BrowserUI::renderPreviewPane(float width, float height) {
+    ImGui::BeginChild("PreviewPane", ImVec2(width, height), true);
+
+    if (!m_model.hasSelection()) {
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Select a file to preview");
+    } else {
+        // Show filename header
+        // Extract just the filename from the key
+        const std::string& key = m_model.selectedKey();
+        size_t lastSlash = key.rfind('/');
+        std::string filename = (lastSlash != std::string::npos) ? key.substr(lastSlash + 1) : key;
+        ImGui::Text("Preview: %s", filename.c_str());
+        ImGui::Separator();
+
+        if (!m_model.previewSupported()) {
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Preview not supported for this file type");
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
+                "Supported: .txt, .md, .html, .htm, .json, .jsonl");
+        } else if (m_model.previewLoading()) {
+            ImGui::TextColored(ImVec4(0.5f, 0.5f, 1.0f, 1.0f), "Loading preview...");
+        } else if (!m_model.previewError().empty()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
+                "Error: %s", m_model.previewError().c_str());
+        } else {
+            // Show preview content in a scrollable child window
+            const std::string& content = m_model.previewContent();
+            if (content.empty()) {
+                ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "(empty file)");
+            } else {
+                ImGui::BeginChild("PreviewContent", ImVec2(0, 0), false,
+                    ImGuiWindowFlags_HorizontalScrollbar);
+                ImGui::TextUnformatted(content.c_str(), content.c_str() + content.size());
+                ImGui::EndChild();
+            }
+        }
+    }
+
+    ImGui::EndChild();
 }
 
 std::string BrowserUI::formatSize(int64_t bytes) {

@@ -44,8 +44,21 @@ public:
     void navigateInto(const std::string& bucket, const std::string& prefix);
     void addManualBucket(const std::string& bucket_name);
 
+    // File selection and preview
+    void selectFile(const std::string& bucket, const std::string& key);
+    void clearSelection();
+
     // Check if at root (bucket list view)
     bool isAtRoot() const { return m_currentBucket.empty(); }
+
+    // Preview state accessors
+    bool hasSelection() const { return !m_selectedKey.empty(); }
+    const std::string& selectedBucket() const { return m_selectedBucket; }
+    const std::string& selectedKey() const { return m_selectedKey; }
+    bool previewLoading() const { return m_previewLoading; }
+    const std::string& previewContent() const { return m_previewContent; }
+    const std::string& previewError() const { return m_previewError; }
+    bool previewSupported() const { return m_previewSupported; }
 
     // Call once per frame to process pending events from backend
     void processEvents();
@@ -67,6 +80,7 @@ private:
     FolderNode& getOrCreateNode(const std::string& bucket, const std::string& prefix);
     static std::string makeNodeKey(const std::string& bucket, const std::string& prefix);
     static bool parseS3Path(const std::string& path, std::string& bucket, std::string& prefix);
+    static bool isPreviewSupported(const std::string& key);
 
     std::unique_ptr<IBackend> m_backend;
 
@@ -85,4 +99,12 @@ private:
     // Current navigation path
     std::string m_currentBucket;
     std::string m_currentPrefix;
+
+    // File selection and preview
+    std::string m_selectedBucket;
+    std::string m_selectedKey;
+    bool m_previewLoading = false;
+    bool m_previewSupported = false;
+    std::string m_previewContent;
+    std::string m_previewError;
 };

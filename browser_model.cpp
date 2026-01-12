@@ -90,6 +90,7 @@ void BrowserModel::navigateTo(const std::string& s3_path) {
 
     if (bucket.empty()) {
         // Navigate to root (bucket list)
+        clearSelection();
         setCurrentPath("", "");
         return;
     }
@@ -110,6 +111,7 @@ void BrowserModel::navigateUp() {
     if (m_currentPrefix.empty()) {
         // In a bucket root, go back to bucket list
         LOG_F(INFO, "Navigating up to bucket list");
+        clearSelection();
         setCurrentPath("", "");
         return;
     }
@@ -138,6 +140,7 @@ void BrowserModel::navigateUp() {
 
 void BrowserModel::navigateInto(const std::string& bucket, const std::string& prefix) {
     LOG_F(INFO, "Navigating into: bucket=%s prefix=%s", bucket.c_str(), prefix.c_str());
+    clearSelection();  // Clear any selected file when navigating
     setCurrentPath(bucket, prefix);
     loadFolder(bucket, prefix);
 }
@@ -150,6 +153,54 @@ void BrowserModel::addManualBucket(const std::string& bucket_name) {
     newBucket.name = bucket_name;
     newBucket.creation_date = "(manually added)";
     m_buckets.push_back(std::move(newBucket));
+}
+
+void BrowserModel::selectFile(const std::string& bucket, const std::string& key) {
+    // If same file is already selected, do nothing
+    if (m_selectedBucket == bucket && m_selectedKey == key) {
+        return;
+    }
+
+    LOG_F(INFO, "Selecting file: bucket=%s key=%s", bucket.c_str(), key.c_str());
+    m_selectedBucket = bucket;
+    m_selectedKey = key;
+    m_previewContent.clear();
+    m_previewError.clear();
+    m_previewSupported = isPreviewSupported(key);
+
+    if (m_previewSupported && m_backend) {
+        m_previewLoading = true;
+        // Limit preview to 64KB
+        m_backend->getObject(bucket, key, 64 * 1024);
+    } else {
+        m_previewLoading = false;
+    }
+}
+
+void BrowserModel::clearSelection() {
+    m_selectedBucket.clear();
+    m_selectedKey.clear();
+    m_previewContent.clear();
+    m_previewError.clear();
+    m_previewLoading = false;
+    m_previewSupported = false;
+}
+
+bool BrowserModel::isPreviewSupported(const std::string& key) {
+    // Get file extension (lowercase)
+    size_t dotPos = key.rfind('.');
+    if (dotPos == std::string::npos) {
+        return false;
+    }
+    std::string ext = key.substr(dotPos);
+    // Convert to lowercase
+    for (char& c : ext) {
+        c = std::tolower(static_cast<unsigned char>(c));
+    }
+
+    // Supported text extensions
+    return ext == ".txt" || ext == ".md" || ext == ".html" || ext == ".htm" ||
+           ext == ".json" || ext == ".jsonl";
 }
 
 void BrowserModel::processEvents() {
@@ -204,6 +255,29 @@ void BrowserModel::processEvents() {
                 auto& node = getOrCreateNode(payload.bucket, payload.prefix);
                 node.loading = false;
                 node.error = payload.error_message;
+                break;
+            }
+            case EventType::ObjectContentLoaded: {
+                auto& payload = std::get<ObjectContentLoadedPayload>(event.payload);
+                LOG_F(INFO, "Event: ObjectContentLoaded bucket=%s key=%s size=%zu",
+                      payload.bucket.c_str(), payload.key.c_str(), payload.content.size());
+                // Only update if this is still the selected file
+                if (payload.bucket == m_selectedBucket && payload.key == m_selectedKey) {
+                    m_previewContent = std::move(payload.content);
+                    m_previewLoading = false;
+                    m_previewError.clear();
+                }
+                break;
+            }
+            case EventType::ObjectContentLoadError: {
+                auto& payload = std::get<ObjectContentErrorPayload>(event.payload);
+                LOG_F(WARNING, "Event: ObjectContentLoadError bucket=%s key=%s error=%s",
+                      payload.bucket.c_str(), payload.key.c_str(), payload.error_message.c_str());
+                // Only update if this is still the selected file
+                if (payload.bucket == m_selectedBucket && payload.key == m_selectedKey) {
+                    m_previewLoading = false;
+                    m_previewError = payload.error_message;
+                }
                 break;
             }
         }

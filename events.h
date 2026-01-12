@@ -14,6 +14,8 @@ enum class EventType {
     BucketsLoadError,
     ObjectsLoaded,
     ObjectsLoadError,
+    ObjectContentLoaded,
+    ObjectContentLoadError,
 };
 
 // Event payload types
@@ -36,13 +38,27 @@ struct ErrorPayload {
     std::string error_message;
 };
 
+struct ObjectContentLoadedPayload {
+    std::string bucket;
+    std::string key;
+    std::string content;
+};
+
+struct ObjectContentErrorPayload {
+    std::string bucket;
+    std::string key;
+    std::string error_message;
+};
+
 // A state change event from a backend
 struct StateEvent {
     EventType type;
     std::variant<
         BucketsLoadedPayload,
         ObjectsLoadedPayload,
-        ErrorPayload
+        ErrorPayload,
+        ObjectContentLoadedPayload,
+        ObjectContentErrorPayload
     > payload;
 
     // Helper constructors
@@ -85,6 +101,28 @@ struct StateEvent {
         StateEvent e;
         e.type = EventType::ObjectsLoadError;
         e.payload = ErrorPayload{bucket, prefix, error};
+        return e;
+    }
+
+    static StateEvent objectContentLoaded(
+        const std::string& bucket,
+        const std::string& key,
+        std::string content
+    ) {
+        StateEvent e;
+        e.type = EventType::ObjectContentLoaded;
+        e.payload = ObjectContentLoadedPayload{bucket, key, std::move(content)};
+        return e;
+    }
+
+    static StateEvent objectContentError(
+        const std::string& bucket,
+        const std::string& key,
+        const std::string& error
+    ) {
+        StateEvent e;
+        e.type = EventType::ObjectContentLoadError;
+        e.payload = ObjectContentErrorPayload{bucket, key, error};
         return e;
     }
 };

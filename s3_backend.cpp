@@ -48,7 +48,7 @@ S3Backend::~S3Backend() {
     {
         std::lock_guard<std::mutex> lock(m_workMutex);
         m_shutdown = true;
-        m_workQueue.push({WorkItem::Type::Shutdown, "", "", "", {}});
+        m_workQueue.push({WorkItem::Type::Shutdown, "", "", "", "", 0, {}});
     }
     m_workCv.notify_one();
 
@@ -79,7 +79,7 @@ void S3Backend::setProfile(const AWSProfile& profile) {
 
 void S3Backend::listBuckets() {
     LOG_F(INFO, "S3Backend: queuing listBuckets request");
-    enqueue({WorkItem::Type::ListBuckets, "", "", "", std::chrono::steady_clock::now()});
+    enqueue({WorkItem::Type::ListBuckets, "", "", "", "", 0, std::chrono::steady_clock::now()});
 }
 
 void S3Backend::listObjects(
@@ -90,7 +90,17 @@ void S3Backend::listObjects(
     LOG_F(INFO, "S3Backend: queuing listObjects bucket=%s prefix=%s token=%s",
           bucket.c_str(), prefix.c_str(),
           continuation_token.empty() ? "(none)" : continuation_token.substr(0, 20).c_str());
-    enqueue({WorkItem::Type::ListObjects, bucket, prefix, continuation_token, std::chrono::steady_clock::now()});
+    enqueue({WorkItem::Type::ListObjects, bucket, prefix, continuation_token, "", 0, std::chrono::steady_clock::now()});
+}
+
+void S3Backend::getObject(
+    const std::string& bucket,
+    const std::string& key,
+    size_t max_bytes
+) {
+    LOG_F(INFO, "S3Backend: queuing getObject bucket=%s key=%s max_bytes=%zu",
+          bucket.c_str(), key.c_str(), max_bytes);
+    enqueue({WorkItem::Type::GetObject, bucket, "", "", key, max_bytes, std::chrono::steady_clock::now()});
 }
 
 void S3Backend::cancelAll() {
@@ -230,6 +240,48 @@ void S3Backend::workerThread() {
                         result.next_continuation_token,
                         result.is_truncated
                     ));
+                }
+            }
+        }
+        else if (item.type == WorkItem::Type::GetObject) {
+            std::string host = item.bucket + ".s3." + m_profile.region + ".amazonaws.com";
+            std::string path = "/" + item.key;
+            LOG_F(1, "S3Backend: fetching object bucket=%s key=%s max_bytes=%zu",
+                  item.bucket.c_str(), item.key.c_str(), item.max_bytes);
+
+            auto signedReq = aws_sign_request(
+                "GET", host, path, "", m_profile.region, "s3",
+                m_profile.access_key_id, m_profile.secret_access_key
+            );
+
+            // Add Range header if max_bytes is set (doesn't need to be signed)
+            if (item.max_bytes > 0) {
+                signedReq.headers["Range"] = "bytes=0-" + std::to_string(item.max_bytes - 1);
+            }
+
+            auto http_start = std::chrono::steady_clock::now();
+            std::string response = httpGet(signedReq.url, signedReq.headers);
+            auto http_end = std::chrono::steady_clock::now();
+
+            auto now = std::chrono::steady_clock::now();
+            auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - item.queued_at).count();
+            auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
+
+            if (response.find("ERROR:") == 0) {
+                LOG_F(WARNING, "S3Backend: getObject HTTP error: %s (total=%lldms http=%lldms)",
+                      response.c_str(), total_ms, http_ms);
+                pushEvent(StateEvent::objectContentError(item.bucket, item.key, response));
+            } else {
+                // Check for S3 error in XML response
+                std::string error = extractError(response);
+                if (!error.empty()) {
+                    LOG_F(WARNING, "S3Backend: getObject S3 error: %s (total=%lldms http=%lldms)",
+                          error.c_str(), total_ms, http_ms);
+                    pushEvent(StateEvent::objectContentError(item.bucket, item.key, error));
+                } else {
+                    LOG_F(INFO, "S3Backend: getObject success bucket=%s key=%s size=%zu (total=%lldms http=%lldms)",
+                          item.bucket.c_str(), item.key.c_str(), response.size(), total_ms, http_ms);
+                    pushEvent(StateEvent::objectContentLoaded(item.bucket, item.key, std::move(response)));
                 }
             }
         }

@@ -39,6 +39,11 @@ public:
         const std::string& prefix,
         const std::string& continuation_token = ""
     ) override;
+    void getObject(
+        const std::string& bucket,
+        const std::string& key,
+        size_t max_bytes = 0
+    ) override;
     void cancelAll() override;
 
     // Change the active profile
@@ -47,11 +52,13 @@ public:
 private:
     // Work item for the background thread
     struct WorkItem {
-        enum class Type { ListBuckets, ListObjects, Shutdown };
+        enum class Type { ListBuckets, ListObjects, GetObject, Shutdown };
         Type type;
         std::string bucket;
         std::string prefix;
         std::string continuation_token;
+        std::string key;  // For GetObject
+        size_t max_bytes = 0;  // For GetObject
         std::chrono::steady_clock::time_point queued_at;
     };
 

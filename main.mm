@@ -62,6 +62,7 @@ int main(int argc, char* argv[])
     }
 
     // Navigate to initial path if provided
+    LOG_F(INFO, "Initial path from args: '%s' (empty=%d)", initialPath.c_str(), initialPath.empty());
     if (!initialPath.empty()) {
         LOG_F(INFO, "Navigating to initial path: %s", initialPath.c_str());
         model.navigateTo(initialPath);

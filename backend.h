@@ -26,6 +26,14 @@ public:
         const std::string& continuation_token = ""
     ) = 0;
 
+    // Request object content (for preview)
+    // max_bytes limits download size (0 = no limit)
+    virtual void getObject(
+        const std::string& bucket,
+        const std::string& key,
+        size_t max_bytes = 0
+    ) = 0;
+
     // Cancel all pending requests (optional, for cleanup)
     virtual void cancelAll() {}
 };
