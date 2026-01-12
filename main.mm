@@ -45,7 +45,6 @@ int main(int argc, char* argv[])
     // Initialize logging - stderr off by default, file always on
     loguru::g_stderr_verbosity = verbose ? loguru::Verbosity_INFO : loguru::Verbosity_OFF;
     loguru::init(filtered_argc, filtered_argv.data());
-    loguru::add_file("s3v.log", loguru::Truncate, loguru::Verbosity_INFO);
     LOG_F(INFO, "S3 Browser starting (verbose=%s)", verbose ? "true" : "false");
 
     // Initialize model and load profiles
@@ -139,6 +138,26 @@ int main(int argc, char* argv[])
 
             // Render browser UI
             ui.render(win_width, win_height);
+
+            // FPS overlay when verbose
+            if (verbose) {
+                ImGuiWindowFlags fps_flags = ImGuiWindowFlags_NoDecoration
+                    | ImGuiWindowFlags_AlwaysAutoResize
+                    | ImGuiWindowFlags_NoSavedSettings
+                    | ImGuiWindowFlags_NoFocusOnAppearing
+                    | ImGuiWindowFlags_NoNav
+                    | ImGuiWindowFlags_NoMove;
+                ImGui::SetNextWindowPos(
+                    ImVec2(win_width - 10, win_height - 10),
+                    ImGuiCond_Always,
+                    ImVec2(1.0f, 1.0f)  // Anchor to bottom-right
+                );
+                ImGui::SetNextWindowBgAlpha(0.5f);
+                if (ImGui::Begin("##FPS", nullptr, fps_flags)) {
+                    ImGui::Text("%.1f FPS (%.2f ms)", ImGui::GetIO().Framerate, 1000.0f / ImGui::GetIO().Framerate);
+                }
+                ImGui::End();
+            }
 
             // Rendering
             ImGui::Render();

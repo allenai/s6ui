@@ -2,6 +2,9 @@
 imgui_demo
 s3v
 
+# Logs
+s3v.log
+
 # Object files
 *.o
 
