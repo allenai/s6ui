@@ -71,12 +71,16 @@ std::vector<AWSProfile> load_aws_profiles() {
         it = values.find("aws_secret_access_key");
         if (it != values.end()) profile.secret_access_key = it->second;
 
-        // Look for region in config
+        // Look for region and endpoint_url in config
         auto cfg_it = config.find(name);
         if (cfg_it != config.end()) {
             auto reg_it = cfg_it->second.find("region");
             if (reg_it != cfg_it->second.end()) {
                 profile.region = reg_it->second;
+            }
+            auto endpoint_it = cfg_it->second.find("endpoint_url");
+            if (endpoint_it != cfg_it->second.end()) {
+                profile.endpoint_url = endpoint_it->second;
             }
         }
 

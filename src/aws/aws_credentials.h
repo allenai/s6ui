@@ -8,6 +8,7 @@ struct AWSProfile {
     std::string access_key_id;
     std::string secret_access_key;
     std::string region;
+    std::string endpoint_url;  // Custom S3 endpoint (e.g., https://weka-aus.beaker.org:9000)
 };
 
 // Load all AWS profiles from ~/.aws/credentials and ~/.aws/config

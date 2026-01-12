@@ -5,6 +5,32 @@
 #include <sstream>
 #include <cctype>
 
+// Helper to parse endpoint URL and extract host (with port if present)
+static std::string parseEndpointHost(const std::string& endpoint_url) {
+    // Expected format: https://host:port or http://host:port or just host:port
+    std::string url = endpoint_url;
+
+    // Strip scheme if present
+    if (url.find("https://") == 0) {
+        url = url.substr(8);
+    } else if (url.find("http://") == 0) {
+        url = url.substr(7);
+    }
+
+    // Remove trailing slash if present
+    if (!url.empty() && url.back() == '/') {
+        url.pop_back();
+    }
+
+    // Remove path if present (keep only host:port)
+    size_t pathPos = url.find('/');
+    if (pathPos != std::string::npos) {
+        url = url.substr(0, pathPos);
+    }
+
+    return url;
+}
+
 static size_t writeCallback(void* contents, size_t size, size_t nmemb, std::string* userp) {
     size_t total = size * nmemb;
     userp->append(static_cast<char*>(contents), total);
@@ -354,7 +380,12 @@ void S3Backend::workerThread(WorkItem::Priority priority, size_t workerIndex) {
 
 void S3Backend::processWorkItem(WorkItem& item) {
     if (item.type == WorkItem::Type::ListBuckets) {
-        std::string host = "s3." + m_profile.region + ".amazonaws.com";
+        std::string host;
+        if (!m_profile.endpoint_url.empty()) {
+            host = parseEndpointHost(m_profile.endpoint_url);
+        } else {
+            host = "s3." + m_profile.region + ".amazonaws.com";
+        }
         LOG_F(1, "S3Backend: fetching bucket list from %s", host.c_str());
 
         auto signedReq = aws_sign_request(
@@ -396,9 +427,19 @@ void S3Backend::processWorkItem(WorkItem& item) {
         }
     }
     else if (item.type == WorkItem::Type::ListObjects) {
-        std::string host = item.bucket + ".s3." + m_profile.region + ".amazonaws.com";
-        LOG_F(1, "S3Backend: fetching objects bucket=%s prefix=%s",
-              item.bucket.c_str(), item.prefix.c_str());
+        std::string host;
+        std::string path;
+        if (!m_profile.endpoint_url.empty()) {
+            // Path-style: endpoint/bucket
+            host = parseEndpointHost(m_profile.endpoint_url);
+            path = "/" + item.bucket;
+        } else {
+            // Virtual-host style: bucket.s3.region.amazonaws.com
+            host = item.bucket + ".s3." + m_profile.region + ".amazonaws.com";
+            path = "/";
+        }
+        LOG_F(1, "S3Backend: fetching objects bucket=%s prefix=%s host=%s path=%s",
+              item.bucket.c_str(), item.prefix.c_str(), host.c_str(), path.c_str());
 
         // Build query string
         std::ostringstream query;
@@ -413,7 +454,7 @@ void S3Backend::processWorkItem(WorkItem& item) {
         }
 
         auto signedReq = aws_sign_request(
-            "GET", host, "/", query.str(), m_profile.region, "s3",
+            "GET", host, path, query.str(), m_profile.region, "s3",
             m_profile.access_key_id, m_profile.secret_access_key
         );
 
@@ -463,10 +504,19 @@ void S3Backend::processWorkItem(WorkItem& item) {
         }
     }
     else if (item.type == WorkItem::Type::GetObject) {
-        std::string host = item.bucket + ".s3." + m_profile.region + ".amazonaws.com";
-        std::string path = "/" + item.key;
-        LOG_F(1, "S3Backend: fetching object bucket=%s key=%s max_bytes=%zu",
-              item.bucket.c_str(), item.key.c_str(), item.max_bytes);
+        std::string host;
+        std::string path;
+        if (!m_profile.endpoint_url.empty()) {
+            // Path-style: endpoint/bucket/key
+            host = parseEndpointHost(m_profile.endpoint_url);
+            path = "/" + item.bucket + "/" + item.key;
+        } else {
+            // Virtual-host style: bucket.s3.region.amazonaws.com/key
+            host = item.bucket + ".s3." + m_profile.region + ".amazonaws.com";
+            path = "/" + item.key;
+        }
+        LOG_F(1, "S3Backend: fetching object bucket=%s key=%s max_bytes=%zu host=%s path=%s",
+              item.bucket.c_str(), item.key.c_str(), item.max_bytes, host.c_str(), path.c_str());
 
         auto signedReq = aws_sign_request(
             "GET", host, path, "", m_profile.region, "s3",

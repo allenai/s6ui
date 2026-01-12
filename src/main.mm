@@ -29,14 +29,17 @@ static void glfw_error_callback(int error, const char* description)
 
 int main(int argc, char* argv[])
 {
-    // Check for verbose flag and S3 path, filter before passing to loguru
+    // Check for verbose flag, endpoint URL, and S3 path, filter before passing to loguru
     bool verbose = false;
     std::string initialPath;
+    std::string endpointUrl;
     std::vector<char*> filtered_argv;
     filtered_argv.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
             verbose = true;
+        } else if (strcmp(argv[i], "--endpoint-url") == 0 && i + 1 < argc) {
+            endpointUrl = argv[++i];
         } else if (strncmp(argv[i], "s3://", 5) == 0 || strncmp(argv[i], "s3:", 3) == 0) {
             initialPath = argv[i];
         } else {
@@ -54,6 +57,14 @@ int main(int argc, char* argv[])
     // Initialize model and load profiles
     BrowserModel model;
     model.loadProfiles();
+
+    // Apply endpoint URL to all profiles if specified
+    if (!endpointUrl.empty()) {
+        for (auto& profile : model.profiles()) {
+            profile.endpoint_url = endpointUrl;
+        }
+        LOG_F(INFO, "Using custom endpoint URL: %s", endpointUrl.c_str());
+    }
 
     // Create backend with first profile (if available)
     if (!model.profiles().empty()) {

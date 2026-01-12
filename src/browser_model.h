@@ -35,6 +35,7 @@ public:
     void selectProfile(int index);
     int selectedProfileIndex() const { return m_selectedProfileIdx; }
     const std::vector<AWSProfile>& profiles() const { return m_profiles; }
+    std::vector<AWSProfile>& profiles() { return m_profiles; }
 
     // Commands (call from UI thread)
     void refresh();
