@@ -8,7 +8,7 @@
 #include <mutex>
 #include <thread>
 #include <atomic>
-#include <queue>
+#include <deque>
 #include <condition_variable>
 #include <chrono>
 
@@ -46,6 +46,24 @@ public:
     ) override;
     void cancelAll() override;
 
+    // Prefetch support - low priority background requests
+    void listObjectsPrefetch(
+        const std::string& bucket,
+        const std::string& prefix
+    ) override;
+
+    // Boost a pending request to high priority (returns true if found and boosted)
+    bool prioritizeRequest(
+        const std::string& bucket,
+        const std::string& prefix
+    ) override;
+
+    // Check if a request is already pending for this bucket/prefix
+    bool hasPendingRequest(
+        const std::string& bucket,
+        const std::string& prefix
+    ) const override;
+
     // Change the active profile
     void setProfile(const AWSProfile& profile);
 
@@ -53,7 +71,9 @@ private:
     // Work item for the background thread
     struct WorkItem {
         enum class Type { ListBuckets, ListObjects, GetObject, Shutdown };
+        enum class Priority { High, Low };  // High = user action, Low = prefetch
         Type type;
+        Priority priority = Priority::High;
         std::string bucket;
         std::string prefix;
         std::string continuation_token;
@@ -82,11 +102,11 @@ private:
 
     AWSProfile m_profile;
 
-    // Worker thread and work queue
+    // Worker thread and work queue (deque for priority support)
     std::thread m_worker;
-    std::mutex m_workMutex;
+    mutable std::mutex m_workMutex;  // mutable for const methods like hasPendingRequest
     std::condition_variable m_workCv;
-    std::queue<WorkItem> m_workQueue;
+    std::deque<WorkItem> m_workQueue;
     std::atomic<bool> m_shutdown{false};
 
     // Event queue (results from worker thread)

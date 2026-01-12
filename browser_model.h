@@ -82,6 +82,9 @@ private:
     static bool parseS3Path(const std::string& path, std::string& bucket, std::string& prefix);
     static bool isPreviewSupported(const std::string& key);
 
+    // Prefetch support - queue low-priority requests for subfolders
+    void triggerPrefetch(const std::string& bucket, const std::vector<S3Object>& objects);
+
     std::unique_ptr<IBackend> m_backend;
 
     // Profiles

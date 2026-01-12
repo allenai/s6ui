@@ -36,4 +36,24 @@ public:
 
     // Cancel all pending requests (optional, for cleanup)
     virtual void cancelAll() {}
+
+    // Prefetch support - queue a low-priority background request
+    // Used to preload subfolders for faster navigation
+    virtual void listObjectsPrefetch(
+        const std::string& bucket,
+        const std::string& prefix
+    ) = 0;
+
+    // Boost a pending request to high priority (returns true if found and boosted)
+    // Called when user navigates to a prefix that's already being prefetched
+    virtual bool prioritizeRequest(
+        const std::string& bucket,
+        const std::string& prefix
+    ) = 0;
+
+    // Check if there's already a pending request for this bucket/prefix
+    virtual bool hasPendingRequest(
+        const std::string& bucket,
+        const std::string& prefix
+    ) const = 0;
 };

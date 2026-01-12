@@ -67,7 +67,12 @@ void BrowserModel::loadFolder(const std::string& bucket, const std::string& pref
     node.loading = true;
 
     if (m_backend) {
-        m_backend->listObjects(bucket, prefix);
+        // Check if there's already a prefetch request queued for this folder
+        // If so, prioritize it instead of making a new request
+        if (!m_backend->prioritizeRequest(bucket, prefix)) {
+            // No pending request, make a new high-priority one
+            m_backend->listObjects(bucket, prefix);
+        }
     }
 }
 
@@ -143,6 +148,13 @@ void BrowserModel::navigateInto(const std::string& bucket, const std::string& pr
     clearSelection();  // Clear any selected file when navigating
     setCurrentPath(bucket, prefix);
     loadFolder(bucket, prefix);
+
+    // If folder is already loaded (e.g. from prefetch), trigger prefetch for subfolders now
+    // (since no ObjectsLoaded event will fire)
+    const auto* node = getNode(bucket, prefix);
+    if (node && node->loaded) {
+        triggerPrefetch(bucket, node->objects);
+    }
 }
 
 void BrowserModel::addManualBucket(const std::string& bucket_name) {
@@ -246,6 +258,11 @@ void BrowserModel::processEvents() {
                 node.loading = false;
                 node.loaded = true;
                 node.error.clear();
+
+                // Trigger prefetch for subfolders if this is the currently viewed folder
+                if (payload.bucket == m_currentBucket && payload.prefix == m_currentPrefix) {
+                    triggerPrefetch(payload.bucket, node.objects);
+                }
                 break;
             }
             case EventType::ObjectsLoadError: {
@@ -347,4 +364,33 @@ bool BrowserModel::parseS3Path(const std::string& path, std::string& bucket, std
     }
 
     return true;
+}
+
+void BrowserModel::triggerPrefetch(const std::string& bucket, const std::vector<S3Object>& objects) {
+    if (!m_backend) return;
+
+    // Only prefetch subfolders, limit to first 20 to avoid overwhelming
+    constexpr size_t MAX_PREFETCH = 20;
+    size_t prefetch_count = 0;
+
+    for (const auto& obj : objects) {
+        if (!obj.is_folder) continue;
+        if (prefetch_count >= MAX_PREFETCH) break;
+
+        // Skip if already loaded or loading
+        const auto* node = getNode(bucket, obj.key);
+        if (node && (node->loaded || node->loading)) continue;
+
+        // Skip if already queued
+        if (m_backend->hasPendingRequest(bucket, obj.key)) continue;
+
+        // Queue low-priority prefetch request
+        LOG_F(INFO, "Prefetching: bucket=%s prefix=%s", bucket.c_str(), obj.key.c_str());
+        m_backend->listObjectsPrefetch(bucket, obj.key);
+        prefetch_count++;
+    }
+
+    if (prefetch_count > 0) {
+        LOG_F(INFO, "Queued %zu prefetch requests for bucket=%s", prefetch_count, bucket.c_str());
+    }
 }

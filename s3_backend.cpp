@@ -48,7 +48,7 @@ S3Backend::~S3Backend() {
     {
         std::lock_guard<std::mutex> lock(m_workMutex);
         m_shutdown = true;
-        m_workQueue.push({WorkItem::Type::Shutdown, "", "", "", "", 0, {}});
+        m_workQueue.push_back({WorkItem::Type::Shutdown, WorkItem::Priority::High, "", "", "", "", 0, {}});
     }
     m_workCv.notify_one();
 
@@ -79,7 +79,7 @@ void S3Backend::setProfile(const AWSProfile& profile) {
 
 void S3Backend::listBuckets() {
     LOG_F(INFO, "S3Backend: queuing listBuckets request");
-    enqueue({WorkItem::Type::ListBuckets, "", "", "", "", 0, std::chrono::steady_clock::now()});
+    enqueue({WorkItem::Type::ListBuckets, WorkItem::Priority::High, "", "", "", "", 0, std::chrono::steady_clock::now()});
 }
 
 void S3Backend::listObjects(
@@ -90,7 +90,7 @@ void S3Backend::listObjects(
     LOG_F(INFO, "S3Backend: queuing listObjects bucket=%s prefix=%s token=%s",
           bucket.c_str(), prefix.c_str(),
           continuation_token.empty() ? "(none)" : continuation_token.substr(0, 20).c_str());
-    enqueue({WorkItem::Type::ListObjects, bucket, prefix, continuation_token, "", 0, std::chrono::steady_clock::now()});
+    enqueue({WorkItem::Type::ListObjects, WorkItem::Priority::High, bucket, prefix, continuation_token, "", 0, std::chrono::steady_clock::now()});
 }
 
 void S3Backend::getObject(
@@ -100,19 +100,68 @@ void S3Backend::getObject(
 ) {
     LOG_F(INFO, "S3Backend: queuing getObject bucket=%s key=%s max_bytes=%zu",
           bucket.c_str(), key.c_str(), max_bytes);
-    enqueue({WorkItem::Type::GetObject, bucket, "", "", key, max_bytes, std::chrono::steady_clock::now()});
+    enqueue({WorkItem::Type::GetObject, WorkItem::Priority::High, bucket, "", "", key, max_bytes, std::chrono::steady_clock::now()});
 }
 
 void S3Backend::cancelAll() {
     std::lock_guard<std::mutex> lock(m_workMutex);
-    std::queue<WorkItem> empty;
-    std::swap(m_workQueue, empty);
+    m_workQueue.clear();
+}
+
+void S3Backend::listObjectsPrefetch(
+    const std::string& bucket,
+    const std::string& prefix
+) {
+    LOG_F(INFO, "S3Backend: queuing prefetch bucket=%s prefix=%s", bucket.c_str(), prefix.c_str());
+    enqueue({WorkItem::Type::ListObjects, WorkItem::Priority::Low, bucket, prefix, "", "", 0, std::chrono::steady_clock::now()});
+}
+
+bool S3Backend::prioritizeRequest(
+    const std::string& bucket,
+    const std::string& prefix
+) {
+    std::lock_guard<std::mutex> lock(m_workMutex);
+
+    // Find and remove the matching request
+    for (auto it = m_workQueue.begin(); it != m_workQueue.end(); ++it) {
+        if (it->type == WorkItem::Type::ListObjects &&
+            it->bucket == bucket && it->prefix == prefix) {
+            // Found it - extract, set high priority, and move to front
+            WorkItem item = std::move(*it);
+            m_workQueue.erase(it);
+            item.priority = WorkItem::Priority::High;
+            m_workQueue.push_front(std::move(item));
+            LOG_F(INFO, "S3Backend: prioritized request bucket=%s prefix=%s", bucket.c_str(), prefix.c_str());
+            return true;
+        }
+    }
+    return false;
+}
+
+bool S3Backend::hasPendingRequest(
+    const std::string& bucket,
+    const std::string& prefix
+) const {
+    std::lock_guard<std::mutex> lock(m_workMutex);
+
+    for (const auto& item : m_workQueue) {
+        if (item.type == WorkItem::Type::ListObjects &&
+            item.bucket == bucket && item.prefix == prefix) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void S3Backend::enqueue(WorkItem item) {
     {
         std::lock_guard<std::mutex> lock(m_workMutex);
-        m_workQueue.push(std::move(item));
+        // High priority items go to front, low priority to back
+        if (item.priority == WorkItem::Priority::High) {
+            m_workQueue.push_front(std::move(item));
+        } else {
+            m_workQueue.push_back(std::move(item));
+        }
     }
     m_workCv.notify_one();
 }
@@ -134,7 +183,7 @@ void S3Backend::workerThread() {
             }
 
             item = std::move(m_workQueue.front());
-            m_workQueue.pop();
+            m_workQueue.pop_front();
         }
 
         if (item.type == WorkItem::Type::Shutdown) {
