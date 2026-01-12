@@ -51,6 +51,9 @@ public:
     // Prefetch file preview on hover (low priority)
     void prefetchFilePreview(const std::string& bucket, const std::string& key);
 
+    // Prefetch folder contents on hover (low priority)
+    void prefetchFolder(const std::string& bucket, const std::string& prefix);
+
     // Check if at root (bucket list view)
     bool isAtRoot() const { return m_currentBucket.empty(); }
 

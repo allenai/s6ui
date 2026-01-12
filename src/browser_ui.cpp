@@ -193,6 +193,10 @@ void BrowserUI::renderFolderContents() {
         if (ImGui::Selectable(label.c_str())) {
             m_model.navigateInto(bucket, obj.key);
         }
+        // Prefetch folder contents on hover for instant navigation
+        if (ImGui::IsItemHovered()) {
+            m_model.prefetchFolder(bucket, obj.key);
+        }
     }
 
     // Render files

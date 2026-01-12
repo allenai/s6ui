@@ -231,6 +231,21 @@ std::string BrowserModel::makePreviewCacheKey(const std::string& bucket, const s
     return bucket + "/" + key;
 }
 
+void BrowserModel::prefetchFolder(const std::string& bucket, const std::string& prefix) {
+    if (!m_backend) return;
+
+    // Skip if already loaded or loading
+    const auto* node = getNode(bucket, prefix);
+    if (node && (node->loaded || node->loading)) return;
+
+    // Skip if already queued
+    if (m_backend->hasPendingRequest(bucket, prefix)) return;
+
+    // Queue low-priority prefetch
+    LOG_F(INFO, "Prefetching folder on hover: bucket=%s prefix=%s", bucket.c_str(), prefix.c_str());
+    m_backend->listObjectsPrefetch(bucket, prefix);
+}
+
 void BrowserModel::clearSelection() {
     m_selectedBucket.clear();
     m_selectedKey.clear();
