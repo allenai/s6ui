@@ -27,11 +27,17 @@ public:
     ssize_t append(const void* data, size_t size);
 
     // Get current file size (bytes written so far)
+    // Note: This may be larger than mappedSize() if remap() hasn't been called recently
     size_t size() const { return m_size.load(std::memory_order_acquire); }
+
+    // Get size of data that's safely readable via data()
+    // This is the amount of data covered by the current mmap - never larger than size()
+    size_t mappedSize() const { return std::min(m_mapped_size, m_size.load(std::memory_order_acquire)); }
 
     // Get read-only pointer to mapped data
     // Safe to call from UI thread while backend is still appending
     // Returns nullptr if not mapped or empty
+    // IMPORTANT: Only read up to mappedSize() bytes, not size() bytes!
     const char* data() const { return m_mapped_data; }
 
     // Update the memory mapping to include newly written data

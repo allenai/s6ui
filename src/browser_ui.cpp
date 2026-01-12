@@ -388,10 +388,15 @@ void BrowserUI::renderPreviewPane(float width, float height) {
 }
 
 void BrowserUI::renderStreamingPreview(const std::string& filename) {
-    size_t loaded = m_model.streamingPreviewSize();
+    size_t loaded = m_model.streamingPreviewSize();  // Total: initial_content + streaming file
     size_t total = m_model.streamingPreviewTotalSize();
     bool complete = m_model.streamingPreviewComplete();
     bool hasError = m_model.streamingPreviewHasError();
+
+    // Get the two data sources
+    const std::string& initialContent = m_model.streamingPreviewInitialContent();
+    const char* streamingData = m_model.streamingPreviewData();
+    size_t streamingSize = m_model.streamingPreviewFileSize();
 
     // Progress indicator
     if (!complete) {
@@ -413,9 +418,6 @@ void BrowserUI::renderStreamingPreview(const std::string& filename) {
         ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), " (Error: %s)",
             m_model.streamingPreviewError().c_str());
     }
-
-    // Get streaming data
-    const char* data = m_model.streamingPreviewData();
 
     // Check if we should update the editor
     // Update at thresholds: 64KB, 256KB, 1MB, then every 1MB, and on completion
@@ -448,14 +450,30 @@ void BrowserUI::renderStreamingPreview(const std::string& filename) {
         }
     }
 
-    if (shouldRefresh && data && loaded > 0) {
+    if (shouldRefresh && loaded > 0) {
         m_editorCurrentKey = fullKey;
 
         // Cap display at 10MB for performance
         static constexpr size_t MAX_DISPLAY = 10 * 1024 * 1024;
         size_t displaySize = std::min(loaded, MAX_DISPLAY);
 
-        std::string content(data, displaySize);
+        // Build content by combining initial content and streaming data
+        std::string content;
+        content.reserve(displaySize + 100);  // Extra for truncation message
+
+        // Add initial content (from prefetch cache)
+        size_t initialToUse = std::min(initialContent.size(), displaySize);
+        if (initialToUse > 0) {
+            content.append(initialContent, 0, initialToUse);
+        }
+
+        // Add streaming data (the rest of the file)
+        size_t remainingSpace = displaySize - content.size();
+        if (remainingSpace > 0 && streamingData && streamingSize > 0) {
+            size_t streamingToUse = std::min(streamingSize, remainingSpace);
+            content.append(streamingData, streamingToUse);
+        }
+
         if (loaded > MAX_DISPLAY) {
             content += "\n\n[... truncated - showing first 10MB of " +
                        std::to_string(loaded / (1024 * 1024)) + "MB ...]";

@@ -321,16 +321,23 @@ const char* BrowserModel::streamingPreviewData() const {
     return nullptr;
 }
 
+size_t BrowserModel::streamingPreviewFileSize() const {
+    if (!m_streamingPreview.active) {
+        return 0;
+    }
+    if (m_streamingPreview.state) {
+        // Use mappedSize() to only return bytes that are safely readable
+        return m_streamingPreview.state->file.mappedSize();
+    }
+    return 0;
+}
+
 size_t BrowserModel::streamingPreviewSize() const {
     if (!m_streamingPreview.active) {
         return 0;
     }
-    // Use stored streaming state
-    if (m_streamingPreview.state) {
-        // Add initial content size to file size
-        return m_streamingPreview.initial_content.size() + m_streamingPreview.state->file.size();
-    }
-    return m_streamingPreview.initial_content.size();
+    // Total size: initial_content + streaming file
+    return m_streamingPreview.initial_content.size() + streamingPreviewFileSize();
 }
 
 bool BrowserModel::isPreviewSupported(const std::string& key) {

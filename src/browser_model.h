@@ -69,12 +69,14 @@ public:
 
     // Streaming preview accessors
     bool isStreamingPreview() const { return m_streamingPreview.active; }
-    const char* streamingPreviewData() const;
-    size_t streamingPreviewSize() const;
+    const char* streamingPreviewData() const;       // Pointer to streaming file data (not including initial content)
+    size_t streamingPreviewFileSize() const;        // Size of just the streaming file
+    size_t streamingPreviewSize() const;            // Total size: initial_content + streaming file
     size_t streamingPreviewTotalSize() const { return m_streamingPreview.total_size; }
     bool streamingPreviewComplete() const { return m_streamingPreview.is_complete; }
     bool streamingPreviewHasError() const { return m_streamingPreview.has_error; }
     const std::string& streamingPreviewError() const { return m_streamingPreview.error_message; }
+    const std::string& streamingPreviewInitialContent() const { return m_streamingPreview.initial_content; }
 
     // Call once per frame to process pending events from backend
     void processEvents();
