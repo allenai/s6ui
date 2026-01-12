@@ -123,4 +123,8 @@ private:
     std::set<std::string> m_pendingObjectRequests;  // Track requests until event processed
     static std::string makePreviewCacheKey(const std::string& bucket, const std::string& key);
     static constexpr size_t PREVIEW_MAX_BYTES = 64 * 1024;  // 64KB
+
+    // Track current hover targets to avoid re-queueing the same request every frame
+    std::string m_lastHoveredFile;    // bucket/key of last hovered file
+    std::string m_lastHoveredFolder;  // bucket/prefix of last hovered folder
 };

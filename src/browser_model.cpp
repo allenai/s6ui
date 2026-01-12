@@ -52,6 +52,8 @@ void BrowserModel::refresh() {
     m_nodes.clear();
     m_previewCache.clear();
     m_pendingObjectRequests.clear();
+    m_lastHoveredFile.clear();
+    m_lastHoveredFolder.clear();
 
     if (m_backend) {
         m_backend->listBuckets();
@@ -223,12 +225,13 @@ void BrowserModel::prefetchFilePreview(const std::string& bucket, const std::str
     // Skip if already selected (will be fetched high-priority)
     if (m_selectedBucket == bucket && m_selectedKey == key) return;
 
-    // Skip if already pending (tracked locally to avoid race with event processing)
-    if (m_pendingObjectRequests.count(cacheKey) > 0) return;
+    // Skip if this is the same file we're already fetching (avoid re-queueing every frame)
+    if (m_lastHoveredFile == cacheKey) return;
 
-    // Queue low-priority prefetch
+    // Queue low-priority prefetch - the backend handles cancellation of stale requests.
+    // Tracking the hover target ensures we only queue when it changes, not every frame.
+    m_lastHoveredFile = cacheKey;
     LOG_F(INFO, "Prefetching file preview: bucket=%s key=%s", bucket.c_str(), key.c_str());
-    m_pendingObjectRequests.insert(cacheKey);
     m_backend->getObject(bucket, key, PREVIEW_MAX_BYTES, true /* lowPriority */);
 }
 
@@ -243,10 +246,13 @@ void BrowserModel::prefetchFolder(const std::string& bucket, const std::string& 
     const auto* node = getNode(bucket, prefix);
     if (node && (node->loaded || node->loading)) return;
 
-    // Skip if already queued
-    if (m_backend->hasPendingRequest(bucket, prefix)) return;
+    // Skip if this is the same folder we're already fetching (avoid re-queueing every frame)
+    std::string folderKey = bucket + "/" + prefix;
+    if (m_lastHoveredFolder == folderKey) return;
 
-    // Queue low-priority prefetch
+    // Queue low-priority prefetch - the backend handles cancellation of stale requests.
+    // Tracking the hover target ensures we only queue when it changes, not every frame.
+    m_lastHoveredFolder = folderKey;
     LOG_F(INFO, "Prefetching folder on hover: bucket=%s prefix=%s", bucket.c_str(), prefix.c_str());
     m_backend->listObjectsPrefetch(bucket, prefix);
 }

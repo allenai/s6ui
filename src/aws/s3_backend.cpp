@@ -31,6 +31,22 @@ static std::string extractError(const std::string& xml) {
     return "";
 }
 
+// Progress callback data for prefetch cancellation
+struct PrefetchProgressData {
+    const S3Backend* backend;
+    uint64_t prefetch_id;
+};
+
+static int prefetchProgressCallback(void* clientp, curl_off_t /*dltotal*/, curl_off_t /*dlnow*/,
+                                    curl_off_t /*ultotal*/, curl_off_t /*ulnow*/) {
+    auto* data = static_cast<PrefetchProgressData*>(clientp);
+    // If a newer prefetch request exists, abort this transfer
+    if (data->backend->shouldCancelPrefetch(data->prefetch_id)) {
+        return 1;  // Non-zero aborts the transfer
+    }
+    return 0;
+}
+
 S3Backend::S3Backend(const AWSProfile& profile, size_t numWorkers)
     : m_profile(profile), m_numWorkers(numWorkers)
 {
@@ -255,6 +271,8 @@ void S3Backend::enqueue(WorkItem item) {
         }
         m_highPriorityCv.notify_one();
     } else {
+        // Assign a prefetch ID so we can cancel stale requests
+        item.prefetch_id = ++m_latestPrefetchId;
         {
             std::lock_guard<std::mutex> lock(m_lowPriorityMutex);
             // Push to front so most recent prefetch request is fetched first
@@ -368,8 +386,15 @@ void S3Backend::processWorkItem(WorkItem& item) {
         );
 
         auto http_start = std::chrono::steady_clock::now();
-        std::string response = httpGet(signedReq.url, signedReq.headers);
+        std::string response = httpGet(signedReq.url, signedReq.headers, item.prefetch_id);
         auto http_end = std::chrono::steady_clock::now();
+
+        // If cancelled, just return without pushing any event
+        if (response == "CANCELLED") {
+            LOG_F(INFO, "S3Backend: listObjects cancelled bucket=%s prefix=%s (superseded by newer request)",
+                  item.bucket.c_str(), item.prefix.c_str());
+            return;
+        }
 
         if (response.find("ERROR:") == 0) {
             auto now = std::chrono::steady_clock::now();
@@ -422,8 +447,15 @@ void S3Backend::processWorkItem(WorkItem& item) {
         }
 
         auto http_start = std::chrono::steady_clock::now();
-        std::string response = httpGet(signedReq.url, signedReq.headers);
+        std::string response = httpGet(signedReq.url, signedReq.headers, item.prefetch_id);
         auto http_end = std::chrono::steady_clock::now();
+
+        // If cancelled, just return without pushing any event
+        if (response == "CANCELLED") {
+            LOG_F(INFO, "S3Backend: getObject cancelled bucket=%s key=%s (superseded by newer request)",
+                  item.bucket.c_str(), item.key.c_str());
+            return;
+        }
 
         auto now = std::chrono::steady_clock::now();
         auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - item.queued_at).count();
@@ -449,8 +481,14 @@ void S3Backend::processWorkItem(WorkItem& item) {
     }
 }
 
+bool S3Backend::shouldCancelPrefetch(uint64_t prefetch_id) const {
+    // A prefetch should be cancelled if a newer one has been requested
+    return prefetch_id > 0 && prefetch_id < m_latestPrefetchId.load();
+}
+
 std::string S3Backend::httpGet(const std::string& url,
-                               const std::map<std::string, std::string>& headers) {
+                               const std::map<std::string, std::string>& headers,
+                               uint64_t prefetch_id) {
     CURL* curl = curl_easy_init();
     if (!curl) return "ERROR: Failed to init curl";
 
@@ -459,6 +497,14 @@ std::string S3Backend::httpGet(const std::string& url,
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+
+    // For prefetch requests, enable progress callback for cancellation
+    PrefetchProgressData progressData{this, prefetch_id};
+    if (prefetch_id > 0) {
+        curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+        curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, prefetchProgressCallback);
+        curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &progressData);
+    }
 
     struct curl_slist* headerList = nullptr;
     for (const auto& [key, value] : headers) {
@@ -474,6 +520,9 @@ std::string S3Backend::httpGet(const std::string& url,
     if (headerList) curl_slist_free_all(headerList);
     curl_easy_cleanup(curl);
 
+    if (res == CURLE_ABORTED_BY_CALLBACK) {
+        return "CANCELLED";  // Special marker for cancelled prefetch
+    }
     if (res != CURLE_OK) {
         return "ERROR: " + std::string(curl_easy_strerror(res));
     }

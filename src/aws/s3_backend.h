@@ -80,6 +80,9 @@ public:
     // Change the active profile
     void setProfile(const AWSProfile& profile);
 
+    // Check if a prefetch request should be cancelled (newer request exists)
+    bool shouldCancelPrefetch(uint64_t prefetch_id) const;
+
 private:
     // Work item for the background thread
     struct WorkItem {
@@ -93,6 +96,7 @@ private:
         std::string key;  // For GetObject
         size_t max_bytes = 0;  // For GetObject
         std::chrono::steady_clock::time_point queued_at;
+        uint64_t prefetch_id = 0;  // For cancellation of stale prefetch requests
     };
 
     void workerThread(WorkItem::Priority priority, size_t workerIndex);
@@ -108,7 +112,8 @@ private:
 
     // HTTP and signing
     std::string httpGet(const std::string& url,
-                        const std::map<std::string, std::string>& headers);
+                        const std::map<std::string, std::string>& headers,
+                        uint64_t prefetch_id = 0);
     std::string urlEncode(const std::string& value);
 
     // XML parsing
@@ -137,6 +142,9 @@ private:
     std::deque<WorkItem> m_lowPriorityQueue;
 
     std::atomic<bool> m_shutdown{false};
+
+    // Prefetch cancellation - newer prefetch requests cancel older in-flight ones
+    std::atomic<uint64_t> m_latestPrefetchId{0};
 
     // Event queue (results from worker thread)
     std::mutex m_eventMutex;
