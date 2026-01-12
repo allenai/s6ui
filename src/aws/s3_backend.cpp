@@ -31,13 +31,22 @@ static std::string extractError(const std::string& xml) {
     return "";
 }
 
-S3Backend::S3Backend(const AWSProfile& profile)
-    : m_profile(profile)
+S3Backend::S3Backend(const AWSProfile& profile, size_t numWorkers)
+    : m_profile(profile), m_numWorkers(numWorkers)
 {
-    LOG_F(INFO, "S3Backend: initializing with profile=%s region=%s",
-          profile.name.c_str(), profile.region.c_str());
+    LOG_F(INFO, "S3Backend: initializing with profile=%s region=%s numWorkers=%zu",
+          profile.name.c_str(), profile.region.c_str(), numWorkers);
     curl_global_init(CURL_GLOBAL_DEFAULT);
-    m_worker = std::thread(&S3Backend::workerThread, this);
+
+    // Spawn high-priority workers
+    for (size_t i = 0; i < m_numWorkers; ++i) {
+        m_highPriorityWorkers.emplace_back(&S3Backend::workerThread, this, WorkItem::Priority::High, i);
+    }
+
+    // Spawn low-priority workers
+    for (size_t i = 0; i < m_numWorkers; ++i) {
+        m_lowPriorityWorkers.emplace_back(&S3Backend::workerThread, this, WorkItem::Priority::Low, i);
+    }
 }
 
 S3Backend::~S3Backend() {
@@ -45,15 +54,38 @@ S3Backend::~S3Backend() {
     cancelAll();
 
     // Signal shutdown
-    {
-        std::lock_guard<std::mutex> lock(m_workMutex);
-        m_shutdown = true;
-        m_workQueue.push_back({WorkItem::Type::Shutdown, WorkItem::Priority::High, "", "", "", "", 0, {}});
-    }
-    m_workCv.notify_one();
+    m_shutdown = true;
 
-    if (m_worker.joinable()) {
-        m_worker.join();
+    // Wake up all high-priority workers with shutdown items
+    {
+        std::lock_guard<std::mutex> lock(m_highPriorityMutex);
+        for (size_t i = 0; i < m_numWorkers; ++i) {
+            m_highPriorityQueue.push_back({WorkItem::Type::Shutdown, WorkItem::Priority::High, "", "", "", "", 0, {}});
+        }
+    }
+    m_highPriorityCv.notify_all();
+
+    // Wake up all low-priority workers with shutdown items
+    {
+        std::lock_guard<std::mutex> lock(m_lowPriorityMutex);
+        for (size_t i = 0; i < m_numWorkers; ++i) {
+            m_lowPriorityQueue.push_back({WorkItem::Type::Shutdown, WorkItem::Priority::Low, "", "", "", "", 0, {}});
+        }
+    }
+    m_lowPriorityCv.notify_all();
+
+    // Join all high-priority workers
+    for (auto& worker : m_highPriorityWorkers) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+
+    // Join all low-priority workers
+    for (auto& worker : m_lowPriorityWorkers) {
+        if (worker.joinable()) {
+            worker.join();
+        }
     }
 
     curl_global_cleanup();
@@ -104,8 +136,14 @@ void S3Backend::getObject(
 }
 
 void S3Backend::cancelAll() {
-    std::lock_guard<std::mutex> lock(m_workMutex);
-    m_workQueue.clear();
+    {
+        std::lock_guard<std::mutex> lock(m_highPriorityMutex);
+        m_highPriorityQueue.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_lowPriorityMutex);
+        m_lowPriorityQueue.clear();
+    }
 }
 
 void S3Backend::listObjectsPrefetch(
@@ -120,21 +158,47 @@ bool S3Backend::prioritizeRequest(
     const std::string& bucket,
     const std::string& prefix
 ) {
-    std::lock_guard<std::mutex> lock(m_workMutex);
+    WorkItem foundItem;
+    bool found = false;
 
-    // Find and remove the matching request
-    for (auto it = m_workQueue.begin(); it != m_workQueue.end(); ++it) {
-        if (it->type == WorkItem::Type::ListObjects &&
-            it->bucket == bucket && it->prefix == prefix) {
-            // Found it - extract, set high priority, and move to front
-            WorkItem item = std::move(*it);
-            m_workQueue.erase(it);
-            item.priority = WorkItem::Priority::High;
-            m_workQueue.push_front(std::move(item));
-            LOG_F(INFO, "S3Backend: prioritized request bucket=%s prefix=%s", bucket.c_str(), prefix.c_str());
-            return true;
+    // First, look in the low priority queue and extract if found
+    {
+        std::lock_guard<std::mutex> lock(m_lowPriorityMutex);
+        for (auto it = m_lowPriorityQueue.begin(); it != m_lowPriorityQueue.end(); ++it) {
+            if (it->type == WorkItem::Type::ListObjects &&
+                it->bucket == bucket && it->prefix == prefix) {
+                foundItem = std::move(*it);
+                m_lowPriorityQueue.erase(it);
+                found = true;
+                break;
+            }
         }
     }
+
+    if (found) {
+        // Move to high priority queue
+        foundItem.priority = WorkItem::Priority::High;
+        {
+            std::lock_guard<std::mutex> lock(m_highPriorityMutex);
+            m_highPriorityQueue.push_front(std::move(foundItem));
+        }
+        m_highPriorityCv.notify_one();
+        LOG_F(INFO, "S3Backend: prioritized request bucket=%s prefix=%s", bucket.c_str(), prefix.c_str());
+        return true;
+    }
+
+    // Also check if it's already in the high priority queue
+    {
+        std::lock_guard<std::mutex> lock(m_highPriorityMutex);
+        for (const auto& item : m_highPriorityQueue) {
+            if (item.type == WorkItem::Type::ListObjects &&
+                item.bucket == bucket && item.prefix == prefix) {
+                LOG_F(INFO, "S3Backend: request already high priority bucket=%s prefix=%s", bucket.c_str(), prefix.c_str());
+                return true;
+            }
+        }
+    }
+
     return false;
 }
 
@@ -142,201 +206,230 @@ bool S3Backend::hasPendingRequest(
     const std::string& bucket,
     const std::string& prefix
 ) const {
-    std::lock_guard<std::mutex> lock(m_workMutex);
-
-    for (const auto& item : m_workQueue) {
-        if (item.type == WorkItem::Type::ListObjects &&
-            item.bucket == bucket && item.prefix == prefix) {
-            return true;
+    // Check high priority queue
+    {
+        std::lock_guard<std::mutex> lock(m_highPriorityMutex);
+        for (const auto& item : m_highPriorityQueue) {
+            if (item.type == WorkItem::Type::ListObjects &&
+                item.bucket == bucket && item.prefix == prefix) {
+                return true;
+            }
         }
     }
+
+    // Check low priority queue
+    {
+        std::lock_guard<std::mutex> lock(m_lowPriorityMutex);
+        for (const auto& item : m_lowPriorityQueue) {
+            if (item.type == WorkItem::Type::ListObjects &&
+                item.bucket == bucket && item.prefix == prefix) {
+                return true;
+            }
+        }
+    }
+
     return false;
 }
 
 void S3Backend::enqueue(WorkItem item) {
-    {
-        std::lock_guard<std::mutex> lock(m_workMutex);
-        // High priority items go to front, low priority to back
-        if (item.priority == WorkItem::Priority::High) {
-            m_workQueue.push_front(std::move(item));
-        } else {
-            m_workQueue.push_back(std::move(item));
+    if (item.priority == WorkItem::Priority::High) {
+        {
+            std::lock_guard<std::mutex> lock(m_highPriorityMutex);
+            m_highPriorityQueue.push_back(std::move(item));
         }
+        m_highPriorityCv.notify_one();
+    } else {
+        {
+            std::lock_guard<std::mutex> lock(m_lowPriorityMutex);
+            m_lowPriorityQueue.push_back(std::move(item));
+        }
+        m_lowPriorityCv.notify_one();
     }
-    m_workCv.notify_one();
 }
 
-void S3Backend::workerThread() {
-    loguru::set_thread_name("S3Worker");
-    LOG_F(INFO, "S3Backend: worker thread started");
+void S3Backend::workerThread(WorkItem::Priority priority, size_t workerIndex) {
+    const char* priorityStr = (priority == WorkItem::Priority::High) ? "High" : "Low";
+    char threadName[32];
+    snprintf(threadName, sizeof(threadName), "S3%s%zu", priorityStr, workerIndex);
+    loguru::set_thread_name(threadName);
+    LOG_F(INFO, "S3Backend: %s priority worker %zu started", priorityStr, workerIndex);
+
+    // Select the appropriate queue, mutex, and cv based on priority
+    auto& queue = (priority == WorkItem::Priority::High) ? m_highPriorityQueue : m_lowPriorityQueue;
+    auto& mutex = (priority == WorkItem::Priority::High) ? m_highPriorityMutex : m_lowPriorityMutex;
+    auto& cv = (priority == WorkItem::Priority::High) ? m_highPriorityCv : m_lowPriorityCv;
 
     while (true) {
         WorkItem item;
         {
-            std::unique_lock<std::mutex> lock(m_workMutex);
-            m_workCv.wait(lock, [this] {
-                return !m_workQueue.empty() || m_shutdown;
+            std::unique_lock<std::mutex> lock(mutex);
+            cv.wait(lock, [this, &queue] {
+                return !queue.empty() || m_shutdown;
             });
 
-            if (m_shutdown && m_workQueue.empty()) {
+            if (m_shutdown && queue.empty()) {
                 break;
             }
 
-            item = std::move(m_workQueue.front());
-            m_workQueue.pop_front();
+            item = std::move(queue.front());
+            queue.pop_front();
         }
 
         if (item.type == WorkItem::Type::Shutdown) {
             break;
         }
 
-        if (item.type == WorkItem::Type::ListBuckets) {
-            std::string host = "s3." + m_profile.region + ".amazonaws.com";
-            LOG_F(1, "S3Backend: fetching bucket list from %s", host.c_str());
+        processWorkItem(item);
+    }
 
-            auto signedReq = aws_sign_request(
-                "GET", host, "/", "", m_profile.region, "s3",
-                m_profile.access_key_id, m_profile.secret_access_key
-            );
+    LOG_F(INFO, "S3Backend: %s priority worker %zu exiting", priorityStr, workerIndex);
+}
 
-            auto http_start = std::chrono::steady_clock::now();
-            std::string response = httpGet(signedReq.url, signedReq.headers);
-            auto http_end = std::chrono::steady_clock::now();
+void S3Backend::processWorkItem(WorkItem& item) {
+    if (item.type == WorkItem::Type::ListBuckets) {
+        std::string host = "s3." + m_profile.region + ".amazonaws.com";
+        LOG_F(1, "S3Backend: fetching bucket list from %s", host.c_str());
 
-            if (response.find("ERROR:") == 0) {
+        auto signedReq = aws_sign_request(
+            "GET", host, "/", "", m_profile.region, "s3",
+            m_profile.access_key_id, m_profile.secret_access_key
+        );
+
+        auto http_start = std::chrono::steady_clock::now();
+        std::string response = httpGet(signedReq.url, signedReq.headers);
+        auto http_end = std::chrono::steady_clock::now();
+
+        if (response.find("ERROR:") == 0) {
+            auto now = std::chrono::steady_clock::now();
+            auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - item.queued_at).count();
+            auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
+            LOG_F(WARNING, "S3Backend: listBuckets HTTP error: %s (total=%lldms http=%lldms)",
+                  response.c_str(), total_ms, http_ms);
+            pushEvent(StateEvent::bucketsError(response));
+        } else {
+            std::string error = extractError(response);
+            if (!error.empty()) {
                 auto now = std::chrono::steady_clock::now();
                 auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - item.queued_at).count();
                 auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
-                LOG_F(WARNING, "S3Backend: listBuckets HTTP error: %s (total=%lldms http=%lldms)",
-                      response.c_str(), total_ms, http_ms);
-                pushEvent(StateEvent::bucketsError(response));
-            } else {
-                std::string error = extractError(response);
-                if (!error.empty()) {
-                    auto now = std::chrono::steady_clock::now();
-                    auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - item.queued_at).count();
-                    auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
-                    LOG_F(WARNING, "S3Backend: listBuckets S3 error: %s (total=%lldms http=%lldms)",
-                          error.c_str(), total_ms, http_ms);
-                    pushEvent(StateEvent::bucketsError(error));
-                } else {
-                    auto parse_start = std::chrono::steady_clock::now();
-                    auto buckets = parseListBucketsXml(response);
-                    auto now = std::chrono::steady_clock::now();
-                    auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - item.queued_at).count();
-                    auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
-                    auto parse_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - parse_start).count();
-                    LOG_F(INFO, "S3Backend: listBuckets success, got %zu buckets (total=%lldms http=%lldms parse=%lldms)",
-                          buckets.size(), total_ms, http_ms, parse_ms);
-                    pushEvent(StateEvent::bucketsLoaded(std::move(buckets)));
-                }
-            }
-        }
-        else if (item.type == WorkItem::Type::ListObjects) {
-            std::string host = item.bucket + ".s3." + m_profile.region + ".amazonaws.com";
-            LOG_F(1, "S3Backend: fetching objects bucket=%s prefix=%s",
-                  item.bucket.c_str(), item.prefix.c_str());
-
-            // Build query string
-            std::ostringstream query;
-            query << "list-type=2";
-            query << "&delimiter=" << urlEncode("/");
-            query << "&max-keys=1000";
-            if (!item.prefix.empty()) {
-                query << "&prefix=" << urlEncode(item.prefix);
-            }
-            if (!item.continuation_token.empty()) {
-                query << "&continuation-token=" << urlEncode(item.continuation_token);
-            }
-
-            auto signedReq = aws_sign_request(
-                "GET", host, "/", query.str(), m_profile.region, "s3",
-                m_profile.access_key_id, m_profile.secret_access_key
-            );
-
-            auto http_start = std::chrono::steady_clock::now();
-            std::string response = httpGet(signedReq.url, signedReq.headers);
-            auto http_end = std::chrono::steady_clock::now();
-
-            if (response.find("ERROR:") == 0) {
-                auto now = std::chrono::steady_clock::now();
-                auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - item.queued_at).count();
-                auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
-                LOG_F(WARNING, "S3Backend: listObjects HTTP error: %s (total=%lldms http=%lldms)",
-                      response.c_str(), total_ms, http_ms);
-                pushEvent(StateEvent::objectsError(item.bucket, item.prefix, response));
+                LOG_F(WARNING, "S3Backend: listBuckets S3 error: %s (total=%lldms http=%lldms)",
+                      error.c_str(), total_ms, http_ms);
+                pushEvent(StateEvent::bucketsError(error));
             } else {
                 auto parse_start = std::chrono::steady_clock::now();
-                auto result = parseListObjectsXml(response);
+                auto buckets = parseListBucketsXml(response);
                 auto now = std::chrono::steady_clock::now();
                 auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - item.queued_at).count();
                 auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
                 auto parse_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - parse_start).count();
-
-                if (!result.error.empty()) {
-                    LOG_F(WARNING, "S3Backend: listObjects S3 error: %s (total=%lldms http=%lldms parse=%lldms)",
-                          result.error.c_str(), total_ms, http_ms, parse_ms);
-                    pushEvent(StateEvent::objectsError(item.bucket, item.prefix, result.error));
-                } else {
-                    LOG_F(INFO, "S3Backend: listObjects success bucket=%s prefix=%s count=%zu truncated=%d (total=%lldms http=%lldms parse=%lldms)",
-                          item.bucket.c_str(), item.prefix.c_str(),
-                          result.objects.size(), result.is_truncated, total_ms, http_ms, parse_ms);
-                    pushEvent(StateEvent::objectsLoaded(
-                        item.bucket,
-                        item.prefix,
-                        item.continuation_token,
-                        std::move(result.objects),
-                        result.next_continuation_token,
-                        result.is_truncated
-                    ));
-                }
-            }
-        }
-        else if (item.type == WorkItem::Type::GetObject) {
-            std::string host = item.bucket + ".s3." + m_profile.region + ".amazonaws.com";
-            std::string path = "/" + item.key;
-            LOG_F(1, "S3Backend: fetching object bucket=%s key=%s max_bytes=%zu",
-                  item.bucket.c_str(), item.key.c_str(), item.max_bytes);
-
-            auto signedReq = aws_sign_request(
-                "GET", host, path, "", m_profile.region, "s3",
-                m_profile.access_key_id, m_profile.secret_access_key
-            );
-
-            // Add Range header if max_bytes is set (doesn't need to be signed)
-            if (item.max_bytes > 0) {
-                signedReq.headers["Range"] = "bytes=0-" + std::to_string(item.max_bytes - 1);
-            }
-
-            auto http_start = std::chrono::steady_clock::now();
-            std::string response = httpGet(signedReq.url, signedReq.headers);
-            auto http_end = std::chrono::steady_clock::now();
-
-            auto now = std::chrono::steady_clock::now();
-            auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - item.queued_at).count();
-            auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
-
-            if (response.find("ERROR:") == 0) {
-                LOG_F(WARNING, "S3Backend: getObject HTTP error: %s (total=%lldms http=%lldms)",
-                      response.c_str(), total_ms, http_ms);
-                pushEvent(StateEvent::objectContentError(item.bucket, item.key, response));
-            } else {
-                // Check for S3 error in XML response
-                std::string error = extractError(response);
-                if (!error.empty()) {
-                    LOG_F(WARNING, "S3Backend: getObject S3 error: %s (total=%lldms http=%lldms)",
-                          error.c_str(), total_ms, http_ms);
-                    pushEvent(StateEvent::objectContentError(item.bucket, item.key, error));
-                } else {
-                    LOG_F(INFO, "S3Backend: getObject success bucket=%s key=%s size=%zu (total=%lldms http=%lldms)",
-                          item.bucket.c_str(), item.key.c_str(), response.size(), total_ms, http_ms);
-                    pushEvent(StateEvent::objectContentLoaded(item.bucket, item.key, std::move(response)));
-                }
+                LOG_F(INFO, "S3Backend: listBuckets success, got %zu buckets (total=%lldms http=%lldms parse=%lldms)",
+                      buckets.size(), total_ms, http_ms, parse_ms);
+                pushEvent(StateEvent::bucketsLoaded(std::move(buckets)));
             }
         }
     }
+    else if (item.type == WorkItem::Type::ListObjects) {
+        std::string host = item.bucket + ".s3." + m_profile.region + ".amazonaws.com";
+        LOG_F(1, "S3Backend: fetching objects bucket=%s prefix=%s",
+              item.bucket.c_str(), item.prefix.c_str());
 
-    LOG_F(INFO, "S3Backend: worker thread exiting");
+        // Build query string
+        std::ostringstream query;
+        query << "list-type=2";
+        query << "&delimiter=" << urlEncode("/");
+        query << "&max-keys=1000";
+        if (!item.prefix.empty()) {
+            query << "&prefix=" << urlEncode(item.prefix);
+        }
+        if (!item.continuation_token.empty()) {
+            query << "&continuation-token=" << urlEncode(item.continuation_token);
+        }
+
+        auto signedReq = aws_sign_request(
+            "GET", host, "/", query.str(), m_profile.region, "s3",
+            m_profile.access_key_id, m_profile.secret_access_key
+        );
+
+        auto http_start = std::chrono::steady_clock::now();
+        std::string response = httpGet(signedReq.url, signedReq.headers);
+        auto http_end = std::chrono::steady_clock::now();
+
+        if (response.find("ERROR:") == 0) {
+            auto now = std::chrono::steady_clock::now();
+            auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - item.queued_at).count();
+            auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
+            LOG_F(WARNING, "S3Backend: listObjects HTTP error: %s (total=%lldms http=%lldms)",
+                  response.c_str(), total_ms, http_ms);
+            pushEvent(StateEvent::objectsError(item.bucket, item.prefix, response));
+        } else {
+            auto parse_start = std::chrono::steady_clock::now();
+            auto result = parseListObjectsXml(response);
+            auto now = std::chrono::steady_clock::now();
+            auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - item.queued_at).count();
+            auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
+            auto parse_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - parse_start).count();
+
+            if (!result.error.empty()) {
+                LOG_F(WARNING, "S3Backend: listObjects S3 error: %s (total=%lldms http=%lldms parse=%lldms)",
+                      result.error.c_str(), total_ms, http_ms, parse_ms);
+                pushEvent(StateEvent::objectsError(item.bucket, item.prefix, result.error));
+            } else {
+                LOG_F(INFO, "S3Backend: listObjects success bucket=%s prefix=%s count=%zu truncated=%d (total=%lldms http=%lldms parse=%lldms)",
+                      item.bucket.c_str(), item.prefix.c_str(),
+                      result.objects.size(), result.is_truncated, total_ms, http_ms, parse_ms);
+                pushEvent(StateEvent::objectsLoaded(
+                    item.bucket,
+                    item.prefix,
+                    item.continuation_token,
+                    std::move(result.objects),
+                    result.next_continuation_token,
+                    result.is_truncated
+                ));
+            }
+        }
+    }
+    else if (item.type == WorkItem::Type::GetObject) {
+        std::string host = item.bucket + ".s3." + m_profile.region + ".amazonaws.com";
+        std::string path = "/" + item.key;
+        LOG_F(1, "S3Backend: fetching object bucket=%s key=%s max_bytes=%zu",
+              item.bucket.c_str(), item.key.c_str(), item.max_bytes);
+
+        auto signedReq = aws_sign_request(
+            "GET", host, path, "", m_profile.region, "s3",
+            m_profile.access_key_id, m_profile.secret_access_key
+        );
+
+        // Add Range header if max_bytes is set (doesn't need to be signed)
+        if (item.max_bytes > 0) {
+            signedReq.headers["Range"] = "bytes=0-" + std::to_string(item.max_bytes - 1);
+        }
+
+        auto http_start = std::chrono::steady_clock::now();
+        std::string response = httpGet(signedReq.url, signedReq.headers);
+        auto http_end = std::chrono::steady_clock::now();
+
+        auto now = std::chrono::steady_clock::now();
+        auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - item.queued_at).count();
+        auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
+
+        if (response.find("ERROR:") == 0) {
+            LOG_F(WARNING, "S3Backend: getObject HTTP error: %s (total=%lldms http=%lldms)",
+                  response.c_str(), total_ms, http_ms);
+            pushEvent(StateEvent::objectContentError(item.bucket, item.key, response));
+        } else {
+            // Check for S3 error in XML response
+            std::string error = extractError(response);
+            if (!error.empty()) {
+                LOG_F(WARNING, "S3Backend: getObject S3 error: %s (total=%lldms http=%lldms)",
+                      error.c_str(), total_ms, http_ms);
+                pushEvent(StateEvent::objectContentError(item.bucket, item.key, error));
+            } else {
+                LOG_F(INFO, "S3Backend: getObject success bucket=%s key=%s size=%zu (total=%lldms http=%lldms)",
+                      item.bucket.c_str(), item.key.c_str(), response.size(), total_ms, http_ms);
+                pushEvent(StateEvent::objectContentLoaded(item.bucket, item.key, std::move(response)));
+            }
+        }
+    }
 }
 
 std::string S3Backend::httpGet(const std::string& url,

@@ -29,7 +29,7 @@ struct S3Object {
 // S3 backend implementation
 class S3Backend : public IBackend {
 public:
-    explicit S3Backend(const AWSProfile& profile);
+    explicit S3Backend(const AWSProfile& profile, size_t numWorkers = 5);
     ~S3Backend() override;
 
     std::vector<StateEvent> takeEvents() override;
@@ -82,7 +82,8 @@ private:
         std::chrono::steady_clock::time_point queued_at;
     };
 
-    void workerThread();
+    void workerThread(WorkItem::Priority priority, size_t workerIndex);
+    void processWorkItem(WorkItem& item);
     void enqueue(WorkItem item);
 
     // HTTP and signing
@@ -101,12 +102,20 @@ private:
     ListObjectsResult parseListObjectsXml(const std::string& xml);
 
     AWSProfile m_profile;
+    size_t m_numWorkers;
 
-    // Worker thread and work queue (deque for priority support)
-    std::thread m_worker;
-    mutable std::mutex m_workMutex;  // mutable for const methods like hasPendingRequest
-    std::condition_variable m_workCv;
-    std::deque<WorkItem> m_workQueue;
+    // High-priority worker threads and queue (user actions)
+    std::vector<std::thread> m_highPriorityWorkers;
+    mutable std::mutex m_highPriorityMutex;
+    std::condition_variable m_highPriorityCv;
+    std::deque<WorkItem> m_highPriorityQueue;
+
+    // Low-priority worker threads and queue (prefetch)
+    std::vector<std::thread> m_lowPriorityWorkers;
+    mutable std::mutex m_lowPriorityMutex;
+    std::condition_variable m_lowPriorityCv;
+    std::deque<WorkItem> m_lowPriorityQueue;
+
     std::atomic<bool> m_shutdown{false};
 
     // Event queue (results from worker thread)

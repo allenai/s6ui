@@ -9,3 +9,6 @@ The idea is that the GUI will always be fast and responsive.
 
 When you need to run the executable, just build it, and tell the user to run it, don't just launch the
 main executable in the background.
+
+How to build the project:
+Just run `make clean && make`
