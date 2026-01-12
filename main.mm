@@ -29,13 +29,16 @@ static void glfw_error_callback(int error, const char* description)
 
 int main(int argc, char* argv[])
 {
-    // Check for verbose flag and filter it out before passing to loguru
+    // Check for verbose flag and S3 path, filter before passing to loguru
     bool verbose = false;
+    std::string initialPath;
     std::vector<char*> filtered_argv;
     filtered_argv.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
             verbose = true;
+        } else if (strncmp(argv[i], "s3://", 5) == 0 || strncmp(argv[i], "s3:", 3) == 0) {
+            initialPath = argv[i];
         } else {
             filtered_argv.push_back(argv[i]);
         }
@@ -56,6 +59,12 @@ int main(int argc, char* argv[])
         auto backend = std::make_unique<S3Backend>(model.profiles()[0]);
         model.setBackend(std::move(backend));
         model.refresh();
+    }
+
+    // Navigate to initial path if provided
+    if (!initialPath.empty()) {
+        LOG_F(INFO, "Navigating to initial path: %s", initialPath.c_str());
+        model.navigateTo(initialPath);
     }
 
     // Create UI
