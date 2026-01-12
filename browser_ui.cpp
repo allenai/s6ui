@@ -25,8 +25,12 @@ void BrowserUI::render(int windowWidth, int windowHeight) {
 
     ImGui::Separator();
 
-    // Scrollable content area
+    // Reserve space for status bar at bottom
+    float statusBarHeight = ImGui::GetFrameHeightWithSpacing() + 4;
     ImVec2 contentSize = ImGui::GetContentRegionAvail();
+    contentSize.y -= statusBarHeight;
+
+    // Scrollable content area
     ImGui::BeginChild("ScrollingContent", contentSize, true,
         ImGuiWindowFlags_HorizontalScrollbar |
         ImGuiWindowFlags_AlwaysVerticalScrollbar);
@@ -34,6 +38,9 @@ void BrowserUI::render(int windowWidth, int windowHeight) {
     renderContent();
 
     ImGui::EndChild();
+
+    // Status bar
+    renderStatusBar();
 
     ImGui::End();
 }
@@ -194,6 +201,68 @@ void BrowserUI::renderFolderContents() {
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
             "(%zu items loaded)", node->objects.size());
+    }
+}
+
+void BrowserUI::renderStatusBar() {
+    ImGui::Separator();
+
+    if (m_model.isAtRoot()) {
+        // At bucket list - show bucket count
+        if (m_model.bucketsLoading()) {
+            ImGui::Text("Loading buckets...");
+        } else if (!m_model.bucketsError().empty()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Error loading buckets");
+        } else {
+            size_t bucketCount = m_model.buckets().size();
+            ImGui::Text("%zu bucket%s", bucketCount, bucketCount == 1 ? "" : "s");
+        }
+    } else {
+        // In a folder - show object stats
+        const std::string& bucket = m_model.currentBucket();
+        const std::string& prefix = m_model.currentPrefix();
+        auto* node = m_model.getNode(bucket, prefix);
+
+        if (!node || (node->loading && node->objects.empty())) {
+            ImGui::Text("Loading...");
+        } else if (!node->error.empty()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Error");
+        } else {
+            // Count folders and files, sum sizes
+            size_t folderCount = 0;
+            size_t fileCount = 0;
+            int64_t totalSize = 0;
+
+            for (const auto& obj : node->objects) {
+                if (obj.is_folder) {
+                    folderCount++;
+                } else {
+                    fileCount++;
+                    totalSize += obj.size;
+                }
+            }
+
+            // Build status string
+            std::string status;
+            if (folderCount > 0) {
+                status += std::to_string(folderCount) + " folder" + (folderCount == 1 ? "" : "s");
+            }
+            if (fileCount > 0) {
+                if (!status.empty()) status += ", ";
+                status += std::to_string(fileCount) + " file" + (fileCount == 1 ? "" : "s");
+                status += " (" + formatSize(totalSize) + ")";
+            }
+            if (status.empty()) {
+                status = "Empty folder";
+            }
+
+            // Add truncation indicator
+            if (node->is_truncated) {
+                status += "  [more available]";
+            }
+
+            ImGui::Text("%s", status.c_str());
+        }
     }
 }
 

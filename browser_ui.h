@@ -16,6 +16,7 @@ private:
     void renderContent();
     void renderBucketList();
     void renderFolderContents();
+    void renderStatusBar();
 
     static std::string formatSize(int64_t bytes);
     static std::string buildS3Path(const std::string& bucket, const std::string& prefix);
