@@ -10,6 +10,7 @@ HOMEBREW_PREFIX := $(shell brew --prefix 2>/dev/null || echo /usr/local)
 CXXFLAGS = -std=c++17 -Wall -Wextra -O2
 CXXFLAGS += -I$(HOMEBREW_PREFIX)/include
 CXXFLAGS += -I.
+CXXFLAGS += -Iloguru
 
 # Objective-C++ flags
 OBJCXXFLAGS = $(CXXFLAGS) -fobjc-arc
@@ -37,6 +38,9 @@ IMGUI_SOURCES = $(IMGUI_DIR)/imgui.cpp \
 
 IMGUI_METAL_SOURCES = $(IMGUI_DIR)/imgui_impl_metal.mm
 
+LOGURU_DIR = loguru
+LOGURU_SOURCES = $(LOGURU_DIR)/loguru.cpp
+
 APP_SOURCES = aws_credentials.cpp \
               aws_signer.cpp \
               s3_backend.cpp \
@@ -48,10 +52,11 @@ MAIN_SOURCES = main.mm
 # Object files
 IMGUI_OBJS = $(IMGUI_SOURCES:.cpp=.o)
 IMGUI_METAL_OBJS = $(IMGUI_METAL_SOURCES:.mm=.o)
+LOGURU_OBJS = $(LOGURU_SOURCES:.cpp=.o)
 APP_OBJS = $(APP_SOURCES:.cpp=.o)
 MAIN_OBJS = $(MAIN_SOURCES:.mm=.o)
 
-ALL_OBJS = $(IMGUI_OBJS) $(IMGUI_METAL_OBJS) $(APP_OBJS) $(MAIN_OBJS)
+ALL_OBJS = $(IMGUI_OBJS) $(IMGUI_METAL_OBJS) $(LOGURU_OBJS) $(APP_OBJS) $(MAIN_OBJS)
 
 # Output
 TARGET = s3v

@@ -15,17 +15,39 @@
 #include "browser_model.h"
 #include "browser_ui.h"
 #include "s3_backend.h"
+#include "loguru.hpp"
 
 #include <cstdio>
+#include <cstring>
 #include <memory>
+#include <vector>
 
 static void glfw_error_callback(int error, const char* description)
 {
     fprintf(stderr, "GLFW Error %d: %s\n", error, description);
 }
 
-int main(int, char**)
+int main(int argc, char* argv[])
 {
+    // Check for verbose flag and filter it out before passing to loguru
+    bool verbose = false;
+    std::vector<char*> filtered_argv;
+    filtered_argv.push_back(argv[0]);
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
+            verbose = true;
+        } else {
+            filtered_argv.push_back(argv[i]);
+        }
+    }
+    int filtered_argc = static_cast<int>(filtered_argv.size());
+
+    // Initialize logging - stderr off by default, file always on
+    loguru::g_stderr_verbosity = verbose ? loguru::Verbosity_INFO : loguru::Verbosity_OFF;
+    loguru::init(filtered_argc, filtered_argv.data());
+    loguru::add_file("s3v.log", loguru::Truncate, loguru::Verbosity_INFO);
+    LOG_F(INFO, "S3 Browser starting (verbose=%s)", verbose ? "true" : "false");
+
     // Initialize model and load profiles
     BrowserModel model;
     model.loadProfiles();

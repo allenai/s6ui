@@ -1,5 +1,6 @@
 #include "s3_backend.h"
 #include "aws_signer.h"
+#include "loguru.hpp"
 #include <curl/curl.h>
 #include <sstream>
 #include <cctype>
@@ -33,18 +34,21 @@ static std::string extractError(const std::string& xml) {
 S3Backend::S3Backend(const AWSProfile& profile)
     : m_profile(profile)
 {
+    LOG_F(INFO, "S3Backend: initializing with profile=%s region=%s",
+          profile.name.c_str(), profile.region.c_str());
     curl_global_init(CURL_GLOBAL_DEFAULT);
     m_worker = std::thread(&S3Backend::workerThread, this);
 }
 
 S3Backend::~S3Backend() {
+    LOG_F(INFO, "S3Backend: shutting down");
     cancelAll();
 
     // Signal shutdown
     {
         std::lock_guard<std::mutex> lock(m_workMutex);
         m_shutdown = true;
-        m_workQueue.push({WorkItem::Type::Shutdown, "", "", ""});
+        m_workQueue.push({WorkItem::Type::Shutdown, "", "", "", {}});
     }
     m_workCv.notify_one();
 
@@ -68,11 +72,14 @@ void S3Backend::pushEvent(StateEvent event) {
 }
 
 void S3Backend::setProfile(const AWSProfile& profile) {
+    LOG_F(INFO, "S3Backend: switching profile to %s region=%s",
+          profile.name.c_str(), profile.region.c_str());
     m_profile = profile;
 }
 
 void S3Backend::listBuckets() {
-    enqueue({WorkItem::Type::ListBuckets, "", "", ""});
+    LOG_F(INFO, "S3Backend: queuing listBuckets request");
+    enqueue({WorkItem::Type::ListBuckets, "", "", "", std::chrono::steady_clock::now()});
 }
 
 void S3Backend::listObjects(
@@ -80,7 +87,10 @@ void S3Backend::listObjects(
     const std::string& prefix,
     const std::string& continuation_token
 ) {
-    enqueue({WorkItem::Type::ListObjects, bucket, prefix, continuation_token});
+    LOG_F(INFO, "S3Backend: queuing listObjects bucket=%s prefix=%s token=%s",
+          bucket.c_str(), prefix.c_str(),
+          continuation_token.empty() ? "(none)" : continuation_token.substr(0, 20).c_str());
+    enqueue({WorkItem::Type::ListObjects, bucket, prefix, continuation_token, std::chrono::steady_clock::now()});
 }
 
 void S3Backend::cancelAll() {
@@ -98,6 +108,9 @@ void S3Backend::enqueue(WorkItem item) {
 }
 
 void S3Backend::workerThread() {
+    loguru::set_thread_name("S3Worker");
+    LOG_F(INFO, "S3Backend: worker thread started");
+
     while (true) {
         WorkItem item;
         {
@@ -120,28 +133,50 @@ void S3Backend::workerThread() {
 
         if (item.type == WorkItem::Type::ListBuckets) {
             std::string host = "s3." + m_profile.region + ".amazonaws.com";
+            LOG_F(1, "S3Backend: fetching bucket list from %s", host.c_str());
 
             auto signedReq = aws_sign_request(
                 "GET", host, "/", "", m_profile.region, "s3",
                 m_profile.access_key_id, m_profile.secret_access_key
             );
 
+            auto http_start = std::chrono::steady_clock::now();
             std::string response = httpGet(signedReq.url, signedReq.headers);
+            auto http_end = std::chrono::steady_clock::now();
 
             if (response.find("ERROR:") == 0) {
+                auto now = std::chrono::steady_clock::now();
+                auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - item.queued_at).count();
+                auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
+                LOG_F(WARNING, "S3Backend: listBuckets HTTP error: %s (total=%lldms http=%lldms)",
+                      response.c_str(), total_ms, http_ms);
                 pushEvent(StateEvent::bucketsError(response));
             } else {
                 std::string error = extractError(response);
                 if (!error.empty()) {
+                    auto now = std::chrono::steady_clock::now();
+                    auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - item.queued_at).count();
+                    auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
+                    LOG_F(WARNING, "S3Backend: listBuckets S3 error: %s (total=%lldms http=%lldms)",
+                          error.c_str(), total_ms, http_ms);
                     pushEvent(StateEvent::bucketsError(error));
                 } else {
+                    auto parse_start = std::chrono::steady_clock::now();
                     auto buckets = parseListBucketsXml(response);
+                    auto now = std::chrono::steady_clock::now();
+                    auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - item.queued_at).count();
+                    auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
+                    auto parse_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - parse_start).count();
+                    LOG_F(INFO, "S3Backend: listBuckets success, got %zu buckets (total=%lldms http=%lldms parse=%lldms)",
+                          buckets.size(), total_ms, http_ms, parse_ms);
                     pushEvent(StateEvent::bucketsLoaded(std::move(buckets)));
                 }
             }
         }
         else if (item.type == WorkItem::Type::ListObjects) {
             std::string host = item.bucket + ".s3." + m_profile.region + ".amazonaws.com";
+            LOG_F(1, "S3Backend: fetching objects bucket=%s prefix=%s",
+                  item.bucket.c_str(), item.prefix.c_str());
 
             // Build query string
             std::ostringstream query;
@@ -160,15 +195,33 @@ void S3Backend::workerThread() {
                 m_profile.access_key_id, m_profile.secret_access_key
             );
 
+            auto http_start = std::chrono::steady_clock::now();
             std::string response = httpGet(signedReq.url, signedReq.headers);
+            auto http_end = std::chrono::steady_clock::now();
 
             if (response.find("ERROR:") == 0) {
+                auto now = std::chrono::steady_clock::now();
+                auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - item.queued_at).count();
+                auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
+                LOG_F(WARNING, "S3Backend: listObjects HTTP error: %s (total=%lldms http=%lldms)",
+                      response.c_str(), total_ms, http_ms);
                 pushEvent(StateEvent::objectsError(item.bucket, item.prefix, response));
             } else {
+                auto parse_start = std::chrono::steady_clock::now();
                 auto result = parseListObjectsXml(response);
+                auto now = std::chrono::steady_clock::now();
+                auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - item.queued_at).count();
+                auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
+                auto parse_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - parse_start).count();
+
                 if (!result.error.empty()) {
+                    LOG_F(WARNING, "S3Backend: listObjects S3 error: %s (total=%lldms http=%lldms parse=%lldms)",
+                          result.error.c_str(), total_ms, http_ms, parse_ms);
                     pushEvent(StateEvent::objectsError(item.bucket, item.prefix, result.error));
                 } else {
+                    LOG_F(INFO, "S3Backend: listObjects success bucket=%s prefix=%s count=%zu truncated=%d (total=%lldms http=%lldms parse=%lldms)",
+                          item.bucket.c_str(), item.prefix.c_str(),
+                          result.objects.size(), result.is_truncated, total_ms, http_ms, parse_ms);
                     pushEvent(StateEvent::objectsLoaded(
                         item.bucket,
                         item.prefix,
@@ -181,6 +234,8 @@ void S3Backend::workerThread() {
             }
         }
     }
+
+    LOG_F(INFO, "S3Backend: worker thread exiting");
 }
 
 std::string S3Backend::httpGet(const std::string& url,

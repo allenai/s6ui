@@ -10,6 +10,7 @@
 #include <atomic>
 #include <queue>
 #include <condition_variable>
+#include <chrono>
 
 // S3 data types (moved from s3_client.h)
 struct S3Bucket {
@@ -51,6 +52,7 @@ private:
         std::string bucket;
         std::string prefix;
         std::string continuation_token;
+        std::chrono::steady_clock::time_point queued_at;
     };
 
     void workerThread();
