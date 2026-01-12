@@ -150,6 +150,14 @@ void BrowserUI::renderBucketList() {
         if (ImGui::Selectable(label.c_str())) {
             m_model.navigateInto(bucket.name, "");
         }
+        // Right-click context menu
+        if (ImGui::BeginPopupContextItem()) {
+            if (ImGui::MenuItem("Copy path")) {
+                std::string path = "s3://" + bucket.name + "/";
+                ImGui::SetClipboardText(path.c_str());
+            }
+            ImGui::EndPopup();
+        }
     }
 }
 
@@ -193,6 +201,14 @@ void BrowserUI::renderFolderContents() {
         if (ImGui::Selectable(label.c_str())) {
             m_model.navigateInto(bucket, obj.key);
         }
+        // Right-click context menu
+        if (ImGui::BeginPopupContextItem()) {
+            if (ImGui::MenuItem("Copy path")) {
+                std::string path = "s3://" + bucket + "/" + obj.key;
+                ImGui::SetClipboardText(path.c_str());
+            }
+            ImGui::EndPopup();
+        }
         // Prefetch folder contents on hover for instant navigation
         if (ImGui::IsItemHovered()) {
             m_model.prefetchFolder(bucket, obj.key);
@@ -208,6 +224,14 @@ void BrowserUI::renderFolderContents() {
         bool isSelected = (m_model.selectedBucket() == bucket && m_model.selectedKey() == obj.key);
         if (ImGui::Selectable(label.c_str(), isSelected)) {
             m_model.selectFile(bucket, obj.key);
+        }
+        // Right-click context menu
+        if (ImGui::BeginPopupContextItem()) {
+            if (ImGui::MenuItem("Copy path")) {
+                std::string path = "s3://" + bucket + "/" + obj.key;
+                ImGui::SetClipboardText(path.c_str());
+            }
+            ImGui::EndPopup();
         }
         // Prefetch preview content on hover for instant preview when clicked
         if (ImGui::IsItemHovered()) {
