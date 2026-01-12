@@ -8,7 +8,10 @@
       "Bash(git add:*)",
       "Bash(git commit -m \"$\\(cat <<''EOF''\nFix SignatureMismatch error when listing bucket objects\n\nAWS v4 signing requires query string parameters to be sorted\nalphabetically in the canonical request. The signing code wasn''t\nactually sorting them, causing signature mismatches on requests\nwith multiple query parameters \\(like ListObjectsV2\\).\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
       "WebFetch(domain:raw.githubusercontent.com)",
-      "Bash(curl:*)"
+      "Bash(curl:*)",
+      "Bash(grep:*)",
+      "Bash(tree:*)",
+      "Bash(./s3v:*)"
     ]
   }
 }

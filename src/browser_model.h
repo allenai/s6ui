@@ -1,8 +1,8 @@
 #pragma once
 
 #include "backend.h"
-#include "s3_backend.h"
-#include "aws_credentials.h"
+#include "aws/s3_backend.h"
+#include "aws/aws_credentials.h"
 #include <string>
 #include <vector>
 #include <map>

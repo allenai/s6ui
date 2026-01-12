@@ -14,7 +14,7 @@
 
 #include "browser_model.h"
 #include "browser_ui.h"
-#include "s3_backend.h"
+#include "aws/s3_backend.h"
 #include "loguru.hpp"
 
 #include <cstdio>
@@ -148,26 +148,6 @@ int main(int argc, char* argv[])
 
             // Render browser UI
             ui.render(win_width, win_height);
-
-            // FPS overlay when verbose
-            if (verbose) {
-                ImGuiWindowFlags fps_flags = ImGuiWindowFlags_NoDecoration
-                    | ImGuiWindowFlags_AlwaysAutoResize
-                    | ImGuiWindowFlags_NoSavedSettings
-                    | ImGuiWindowFlags_NoFocusOnAppearing
-                    | ImGuiWindowFlags_NoNav
-                    | ImGuiWindowFlags_NoMove;
-                ImGui::SetNextWindowPos(
-                    ImVec2(win_width - 10, win_height - 10),
-                    ImGuiCond_Always,
-                    ImVec2(1.0f, 1.0f)  // Anchor to bottom-right
-                );
-                ImGui::SetNextWindowBgAlpha(0.5f);
-                if (ImGui::Begin("##FPS", nullptr, fps_flags)) {
-                    ImGui::Text("%.1f FPS (%.2f ms)", ImGui::GetIO().Framerate, 1000.0f / ImGui::GetIO().Framerate);
-                }
-                ImGui::End();
-            }
 
             // Rendering
             ImGui::Render();

@@ -5,8 +5,8 @@ s3v
 # Logs
 s3v.log
 
-# Object files
-*.o
+# Build directory
+build/
 
 # ImGui generated config
 imgui.ini
