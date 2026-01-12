@@ -128,11 +128,13 @@ void S3Backend::listObjects(
 void S3Backend::getObject(
     const std::string& bucket,
     const std::string& key,
-    size_t max_bytes
+    size_t max_bytes,
+    bool lowPriority
 ) {
-    LOG_F(INFO, "S3Backend: queuing getObject bucket=%s key=%s max_bytes=%zu",
-          bucket.c_str(), key.c_str(), max_bytes);
-    enqueue({WorkItem::Type::GetObject, WorkItem::Priority::High, bucket, "", "", key, max_bytes, std::chrono::steady_clock::now()});
+    auto priority = lowPriority ? WorkItem::Priority::Low : WorkItem::Priority::High;
+    LOG_F(INFO, "S3Backend: queuing getObject bucket=%s key=%s max_bytes=%zu priority=%s",
+          bucket.c_str(), key.c_str(), max_bytes, lowPriority ? "low" : "high");
+    enqueue({WorkItem::Type::GetObject, priority, bucket, "", "", key, max_bytes, std::chrono::steady_clock::now()});
 }
 
 void S3Backend::cancelAll() {
@@ -154,19 +156,34 @@ void S3Backend::listObjectsPrefetch(
     enqueue({WorkItem::Type::ListObjects, WorkItem::Priority::Low, bucket, prefix, "", "", 0, std::chrono::steady_clock::now()});
 }
 
-bool S3Backend::prioritizeRequest(
-    const std::string& bucket,
-    const std::string& prefix
-) {
+// Template helpers for queue operations
+template<typename Predicate>
+bool S3Backend::findInQueues(Predicate pred) const {
+    {
+        std::lock_guard<std::mutex> lock(m_highPriorityMutex);
+        for (const auto& item : m_highPriorityQueue) {
+            if (pred(item)) return true;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_lowPriorityMutex);
+        for (const auto& item : m_lowPriorityQueue) {
+            if (pred(item)) return true;
+        }
+    }
+    return false;
+}
+
+template<typename Predicate>
+bool S3Backend::boostFromLowToHigh(Predicate pred) {
     WorkItem foundItem;
     bool found = false;
 
-    // First, look in the low priority queue and extract if found
+    // Extract from low priority queue if found
     {
         std::lock_guard<std::mutex> lock(m_lowPriorityMutex);
         for (auto it = m_lowPriorityQueue.begin(); it != m_lowPriorityQueue.end(); ++it) {
-            if (it->type == WorkItem::Type::ListObjects &&
-                it->bucket == bucket && it->prefix == prefix) {
+            if (pred(*it)) {
                 foundItem = std::move(*it);
                 m_lowPriorityQueue.erase(it);
                 found = true;
@@ -183,52 +200,50 @@ bool S3Backend::prioritizeRequest(
             m_highPriorityQueue.push_front(std::move(foundItem));
         }
         m_highPriorityCv.notify_one();
-        LOG_F(INFO, "S3Backend: prioritized request bucket=%s prefix=%s", bucket.c_str(), prefix.c_str());
         return true;
     }
 
-    // Also check if it's already in the high priority queue
+    // Check if already in high priority queue
     {
         std::lock_guard<std::mutex> lock(m_highPriorityMutex);
         for (const auto& item : m_highPriorityQueue) {
-            if (item.type == WorkItem::Type::ListObjects &&
-                item.bucket == bucket && item.prefix == prefix) {
-                LOG_F(INFO, "S3Backend: request already high priority bucket=%s prefix=%s", bucket.c_str(), prefix.c_str());
-                return true;
-            }
+            if (pred(item)) return true;
         }
     }
 
     return false;
 }
 
-bool S3Backend::hasPendingRequest(
-    const std::string& bucket,
-    const std::string& prefix
-) const {
-    // Check high priority queue
-    {
-        std::lock_guard<std::mutex> lock(m_highPriorityMutex);
-        for (const auto& item : m_highPriorityQueue) {
-            if (item.type == WorkItem::Type::ListObjects &&
-                item.bucket == bucket && item.prefix == prefix) {
-                return true;
-            }
-        }
-    }
+bool S3Backend::prioritizeRequest(const std::string& bucket, const std::string& prefix) {
+    bool result = boostFromLowToHigh([&](const WorkItem& item) {
+        return item.type == WorkItem::Type::ListObjects &&
+               item.bucket == bucket && item.prefix == prefix;
+    });
+    if (result) LOG_F(INFO, "S3Backend: prioritized request bucket=%s prefix=%s", bucket.c_str(), prefix.c_str());
+    return result;
+}
 
-    // Check low priority queue
-    {
-        std::lock_guard<std::mutex> lock(m_lowPriorityMutex);
-        for (const auto& item : m_lowPriorityQueue) {
-            if (item.type == WorkItem::Type::ListObjects &&
-                item.bucket == bucket && item.prefix == prefix) {
-                return true;
-            }
-        }
-    }
+bool S3Backend::hasPendingRequest(const std::string& bucket, const std::string& prefix) const {
+    return findInQueues([&](const WorkItem& item) {
+        return item.type == WorkItem::Type::ListObjects &&
+               item.bucket == bucket && item.prefix == prefix;
+    });
+}
 
-    return false;
+bool S3Backend::hasPendingObjectRequest(const std::string& bucket, const std::string& key) const {
+    return findInQueues([&](const WorkItem& item) {
+        return item.type == WorkItem::Type::GetObject &&
+               item.bucket == bucket && item.key == key;
+    });
+}
+
+bool S3Backend::prioritizeObjectRequest(const std::string& bucket, const std::string& key) {
+    bool result = boostFromLowToHigh([&](const WorkItem& item) {
+        return item.type == WorkItem::Type::GetObject &&
+               item.bucket == bucket && item.key == key;
+    });
+    if (result) LOG_F(INFO, "S3Backend: prioritized object request bucket=%s key=%s", bucket.c_str(), key.c_str());
+    return result;
 }
 
 void S3Backend::enqueue(WorkItem item) {
@@ -241,7 +256,8 @@ void S3Backend::enqueue(WorkItem item) {
     } else {
         {
             std::lock_guard<std::mutex> lock(m_lowPriorityMutex);
-            m_lowPriorityQueue.push_back(std::move(item));
+            // Push to front so most recent prefetch request is fetched first
+            m_lowPriorityQueue.push_front(std::move(item));
         }
         m_lowPriorityCv.notify_one();
     }

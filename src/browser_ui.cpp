@@ -205,6 +205,10 @@ void BrowserUI::renderFolderContents() {
         if (ImGui::Selectable(label.c_str(), isSelected)) {
             m_model.selectFile(bucket, obj.key);
         }
+        // Prefetch preview content on hover for instant preview when clicked
+        if (ImGui::IsItemHovered()) {
+            m_model.prefetchFilePreview(bucket, obj.key);
+        }
     }
 
     // Show inline loading indicator if loading more

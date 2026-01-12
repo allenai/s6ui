@@ -28,10 +28,12 @@ public:
 
     // Request object content (for preview)
     // max_bytes limits download size (0 = no limit)
+    // lowPriority = true for background prefetch, false for user-initiated requests
     virtual void getObject(
         const std::string& bucket,
         const std::string& key,
-        size_t max_bytes = 0
+        size_t max_bytes = 0,
+        bool lowPriority = false
     ) = 0;
 
     // Cancel all pending requests (optional, for cleanup)
@@ -56,4 +58,16 @@ public:
         const std::string& bucket,
         const std::string& prefix
     ) const = 0;
+
+    // Check if there's already a pending object fetch request
+    virtual bool hasPendingObjectRequest(
+        const std::string& bucket,
+        const std::string& key
+    ) const = 0;
+
+    // Boost a pending object request to high priority (returns true if found)
+    virtual bool prioritizeObjectRequest(
+        const std::string& bucket,
+        const std::string& key
+    ) = 0;
 };

@@ -42,7 +42,8 @@ public:
     void getObject(
         const std::string& bucket,
         const std::string& key,
-        size_t max_bytes = 0
+        size_t max_bytes = 0,
+        bool lowPriority = false
     ) override;
     void cancelAll() override;
 
@@ -63,6 +64,18 @@ public:
         const std::string& bucket,
         const std::string& prefix
     ) const override;
+
+    // Check if there's already a pending object fetch request
+    bool hasPendingObjectRequest(
+        const std::string& bucket,
+        const std::string& key
+    ) const override;
+
+    // Boost a pending object request to high priority
+    bool prioritizeObjectRequest(
+        const std::string& bucket,
+        const std::string& key
+    ) override;
 
     // Change the active profile
     void setProfile(const AWSProfile& profile);
@@ -85,6 +98,13 @@ private:
     void workerThread(WorkItem::Priority priority, size_t workerIndex);
     void processWorkItem(WorkItem& item);
     void enqueue(WorkItem item);
+
+    // Helper methods for queue operations with predicates
+    template<typename Predicate>
+    bool findInQueues(Predicate pred) const;
+
+    template<typename Predicate>
+    bool boostFromLowToHigh(Predicate pred);
 
     // HTTP and signing
     std::string httpGet(const std::string& url,

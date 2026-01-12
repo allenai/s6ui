@@ -48,6 +48,9 @@ public:
     void selectFile(const std::string& bucket, const std::string& key);
     void clearSelection();
 
+    // Prefetch file preview on hover (low priority)
+    void prefetchFilePreview(const std::string& bucket, const std::string& key);
+
     // Check if at root (bucket list view)
     bool isAtRoot() const { return m_currentBucket.empty(); }
 
@@ -110,4 +113,9 @@ private:
     bool m_previewSupported = false;
     std::string m_previewContent;
     std::string m_previewError;
+
+    // Cache for prefetched file previews (bucket/key -> content)
+    std::map<std::string, std::string> m_previewCache;
+    static std::string makePreviewCacheKey(const std::string& bucket, const std::string& key);
+    static constexpr size_t PREVIEW_MAX_BYTES = 64 * 1024;  // 64KB
 };

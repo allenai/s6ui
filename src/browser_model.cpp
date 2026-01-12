@@ -181,12 +181,54 @@ void BrowserModel::selectFile(const std::string& bucket, const std::string& key)
     m_previewSupported = isPreviewSupported(key);
 
     if (m_previewSupported && m_backend) {
+        // Check if we have cached content from prefetch
+        std::string cacheKey = makePreviewCacheKey(bucket, key);
+        auto it = m_previewCache.find(cacheKey);
+        if (it != m_previewCache.end()) {
+            LOG_F(INFO, "Using cached preview for bucket=%s key=%s", bucket.c_str(), key.c_str());
+            m_previewContent = it->second;
+            m_previewLoading = false;
+            return;
+        }
+
+        // Check if there's a pending prefetch request we can boost
+        if (m_backend->prioritizeObjectRequest(bucket, key)) {
+            LOG_F(INFO, "Boosted prefetch request for bucket=%s key=%s", bucket.c_str(), key.c_str());
+            m_previewLoading = true;
+            return;
+        }
+
+        // No cache, no pending request - make a new high-priority request
         m_previewLoading = true;
-        // Limit preview to 64KB
-        m_backend->getObject(bucket, key, 64 * 1024);
+        m_backend->getObject(bucket, key, PREVIEW_MAX_BYTES);
     } else {
         m_previewLoading = false;
     }
+}
+
+void BrowserModel::prefetchFilePreview(const std::string& bucket, const std::string& key) {
+    if (!m_backend) return;
+
+    // Only prefetch supported file types
+    if (!isPreviewSupported(key)) return;
+
+    // Skip if already cached
+    std::string cacheKey = makePreviewCacheKey(bucket, key);
+    if (m_previewCache.find(cacheKey) != m_previewCache.end()) return;
+
+    // Skip if already selected (will be fetched high-priority)
+    if (m_selectedBucket == bucket && m_selectedKey == key) return;
+
+    // Skip if already pending
+    if (m_backend->hasPendingObjectRequest(bucket, key)) return;
+
+    // Queue low-priority prefetch
+    LOG_F(INFO, "Prefetching file preview: bucket=%s key=%s", bucket.c_str(), key.c_str());
+    m_backend->getObject(bucket, key, PREVIEW_MAX_BYTES, true /* lowPriority */);
+}
+
+std::string BrowserModel::makePreviewCacheKey(const std::string& bucket, const std::string& key) {
+    return bucket + "/" + key;
 }
 
 void BrowserModel::clearSelection() {
@@ -278,7 +320,12 @@ void BrowserModel::processEvents() {
                 auto& payload = std::get<ObjectContentLoadedPayload>(event.payload);
                 LOG_F(INFO, "Event: ObjectContentLoaded bucket=%s key=%s size=%zu",
                       payload.bucket.c_str(), payload.key.c_str(), payload.content.size());
-                // Only update if this is still the selected file
+
+                // Cache the content for future use
+                std::string cacheKey = makePreviewCacheKey(payload.bucket, payload.key);
+                m_previewCache[cacheKey] = payload.content;
+
+                // Update preview if this is the selected file
                 if (payload.bucket == m_selectedBucket && payload.key == m_selectedKey) {
                     m_previewContent = std::move(payload.content);
                     m_previewLoading = false;
