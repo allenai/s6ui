@@ -11,3 +11,7 @@ License: MIT
 # Loguru
 Source: https://github.com/emilk/loguru
 License: Unlicense (Public Domain)
+
+# nlohmann
+Source: https://github.com/nlohmann/json
+License: MIT
