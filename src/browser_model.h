@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include <memory>
 
 // Node representing a folder's contents
@@ -119,6 +120,7 @@ private:
 
     // Cache for prefetched file previews (bucket/key -> content)
     std::map<std::string, std::string> m_previewCache;
+    std::set<std::string> m_pendingObjectRequests;  // Track requests until event processed
     static std::string makePreviewCacheKey(const std::string& bucket, const std::string& key);
     static constexpr size_t PREVIEW_MAX_BYTES = 64 * 1024;  // 64KB
 };

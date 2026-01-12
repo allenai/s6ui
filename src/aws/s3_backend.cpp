@@ -99,6 +99,7 @@ std::vector<StateEvent> S3Backend::takeEvents() {
 }
 
 void S3Backend::pushEvent(StateEvent event) {
+    if (m_shutdown) return;  // Don't push events during shutdown
     std::lock_guard<std::mutex> lock(m_eventMutex);
     m_events.push_back(std::move(event));
 }

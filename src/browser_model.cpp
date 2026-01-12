@@ -49,6 +49,8 @@ void BrowserModel::refresh() {
     m_bucketsError.clear();
     m_bucketsLoading = true;
     m_nodes.clear();
+    m_previewCache.clear();
+    m_pendingObjectRequests.clear();
 
     if (m_backend) {
         m_backend->listBuckets();
@@ -200,6 +202,7 @@ void BrowserModel::selectFile(const std::string& bucket, const std::string& key)
 
         // No cache, no pending request - make a new high-priority request
         m_previewLoading = true;
+        m_pendingObjectRequests.insert(cacheKey);
         m_backend->getObject(bucket, key, PREVIEW_MAX_BYTES);
     } else {
         m_previewLoading = false;
@@ -219,11 +222,12 @@ void BrowserModel::prefetchFilePreview(const std::string& bucket, const std::str
     // Skip if already selected (will be fetched high-priority)
     if (m_selectedBucket == bucket && m_selectedKey == key) return;
 
-    // Skip if already pending
-    if (m_backend->hasPendingObjectRequest(bucket, key)) return;
+    // Skip if already pending (tracked locally to avoid race with event processing)
+    if (m_pendingObjectRequests.count(cacheKey) > 0) return;
 
     // Queue low-priority prefetch
     LOG_F(INFO, "Prefetching file preview: bucket=%s key=%s", bucket.c_str(), key.c_str());
+    m_pendingObjectRequests.insert(cacheKey);
     m_backend->getObject(bucket, key, PREVIEW_MAX_BYTES, true /* lowPriority */);
 }
 
@@ -339,6 +343,7 @@ void BrowserModel::processEvents() {
                 // Cache the content for future use
                 std::string cacheKey = makePreviewCacheKey(payload.bucket, payload.key);
                 m_previewCache[cacheKey] = payload.content;
+                m_pendingObjectRequests.erase(cacheKey);
 
                 // Update preview if this is the selected file
                 if (payload.bucket == m_selectedBucket && payload.key == m_selectedKey) {
@@ -352,6 +357,11 @@ void BrowserModel::processEvents() {
                 auto& payload = std::get<ObjectContentErrorPayload>(event.payload);
                 LOG_F(WARNING, "Event: ObjectContentLoadError bucket=%s key=%s error=%s",
                       payload.bucket.c_str(), payload.key.c_str(), payload.error_message.c_str());
+
+                // Remove from pending tracking
+                std::string cacheKey = makePreviewCacheKey(payload.bucket, payload.key);
+                m_pendingObjectRequests.erase(cacheKey);
+
                 // Only update if this is still the selected file
                 if (payload.bucket == m_selectedBucket && payload.key == m_selectedKey) {
                     m_previewLoading = false;

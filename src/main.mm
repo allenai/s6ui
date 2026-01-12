@@ -43,7 +43,8 @@ int main(int argc, char* argv[])
             filtered_argv.push_back(argv[i]);
         }
     }
-    int filtered_argc = static_cast<int>(filtered_argv.size());
+    filtered_argv.push_back(nullptr);  // argv must be null-terminated
+    int filtered_argc = static_cast<int>(filtered_argv.size()) - 1;  // Don't count the nullptr
 
     // Initialize logging - stderr off by default, file always on
     loguru::g_stderr_verbosity = verbose ? loguru::Verbosity_INFO : loguru::Verbosity_OFF;

@@ -111,8 +111,29 @@ $(BUILD_DIR)/src/%.o: $(SRC_DIR)/%.mm | $(BUILD_DIR)/src/aws
 clean:
 	rm -rf $(BUILD_DIR) $(TARGET)
 
+# Debug build with symbols and no optimization
+debug: CXXFLAGS = -std=c++17 -Wall -Wextra -g -O0
+debug: CXXFLAGS += -I$(HOMEBREW_PREFIX)/include
+debug: CXXFLAGS += -I$(LIBS_DIR)
+debug: CXXFLAGS += -I$(LIBS_DIR)/imgui
+debug: CXXFLAGS += -I$(LIBS_DIR)/loguru
+debug: CXXFLAGS += -I$(SRC_DIR)
+debug: OBJCXXFLAGS = $(CXXFLAGS) -fobjc-arc
+debug: clean $(TARGET)
+
+# Address Sanitizer build (catches memory errors)
+asan: CXXFLAGS = -std=c++17 -Wall -Wextra -g -O1 -fsanitize=address -fno-omit-frame-pointer
+asan: CXXFLAGS += -I$(HOMEBREW_PREFIX)/include
+asan: CXXFLAGS += -I$(LIBS_DIR)
+asan: CXXFLAGS += -I$(LIBS_DIR)/imgui
+asan: CXXFLAGS += -I$(LIBS_DIR)/loguru
+asan: CXXFLAGS += -I$(SRC_DIR)
+asan: OBJCXXFLAGS = $(CXXFLAGS) -fobjc-arc
+asan: LDFLAGS += -fsanitize=address
+asan: clean $(TARGET)
+
 # Install dependencies (convenience target)
 deps:
 	brew install glfw
 
-.PHONY: all clean deps
+.PHONY: all clean debug asan deps
