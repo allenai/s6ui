@@ -177,6 +177,13 @@ void BrowserModel::selectFile(const std::string& bucket, const std::string& key)
     }
 
     LOG_F(INFO, "Selecting file: bucket=%s key=%s", bucket.c_str(), key.c_str());
+
+    // Cancel any existing streaming download
+    if (m_streamingPreview.active && m_backend) {
+        m_backend->cancelStream(m_streamingPreview.bucket, m_streamingPreview.key);
+    }
+    m_streamingPreview = StreamingPreview{};  // Reset
+
     m_selectedBucket = bucket;
     m_selectedKey = key;
     m_previewContent.clear();
@@ -188,9 +195,37 @@ void BrowserModel::selectFile(const std::string& bucket, const std::string& key)
         std::string cacheKey = makePreviewCacheKey(bucket, key);
         auto it = m_previewCache.find(cacheKey);
         if (it != m_previewCache.end()) {
-            LOG_F(INFO, "Using cached preview for bucket=%s key=%s", bucket.c_str(), key.c_str());
-            m_previewContent = it->second;
-            m_previewLoading = false;
+            const auto& entry = it->second;
+            LOG_F(INFO, "Using cached preview for bucket=%s key=%s (size=%zu total=%lld complete=%d)",
+                  bucket.c_str(), key.c_str(), entry.content.size(),
+                  static_cast<long long>(entry.total_size), entry.is_complete);
+
+            if (entry.is_complete) {
+                // File is fully cached, no need to stream
+                m_previewContent = entry.content;
+                m_previewLoading = false;
+                return;
+            }
+
+            // Partial cache - display cached content immediately, then stream the rest
+            m_previewContent = entry.content;
+            m_previewLoading = true;
+
+            // Start streaming from where we left off
+            m_streamingPreview.active = true;
+            m_streamingPreview.bucket = bucket;
+            m_streamingPreview.key = key;
+            m_streamingPreview.bytes_loaded = entry.content.size();
+            m_streamingPreview.total_size = entry.total_size > 0 ? entry.total_size : 0;
+            m_streamingPreview.initial_content = entry.content;
+
+            m_backend->getObjectStreaming(bucket, key, entry.content.size());
+
+            // Grab the shared_ptr to keep the StreamingFile alive
+            auto* s3backend = dynamic_cast<S3Backend*>(m_backend.get());
+            if (s3backend) {
+                m_streamingPreview.state = s3backend->getStreamingState(bucket, key);
+            }
             return;
         }
 
@@ -201,10 +236,19 @@ void BrowserModel::selectFile(const std::string& bucket, const std::string& key)
             return;
         }
 
-        // No cache, no pending request - make a new high-priority request
+        // No cache, no pending request - start streaming from scratch
         m_previewLoading = true;
-        m_pendingObjectRequests.insert(cacheKey);
-        m_backend->getObject(bucket, key, PREVIEW_MAX_BYTES);
+        m_streamingPreview.active = true;
+        m_streamingPreview.bucket = bucket;
+        m_streamingPreview.key = key;
+
+        m_backend->getObjectStreaming(bucket, key, 0);
+
+        // Grab the shared_ptr to keep the StreamingFile alive
+        auto* s3backend = dynamic_cast<S3Backend*>(m_backend.get());
+        if (s3backend) {
+            m_streamingPreview.state = s3backend->getStreamingState(bucket, key);
+        }
     } else {
         m_previewLoading = false;
     }
@@ -252,12 +296,41 @@ void BrowserModel::prefetchFolder(const std::string& bucket, const std::string& 
 }
 
 void BrowserModel::clearSelection() {
+    // Cancel any active streaming
+    if (m_streamingPreview.active && m_backend) {
+        m_backend->cancelStream(m_streamingPreview.bucket, m_streamingPreview.key);
+    }
+    m_streamingPreview = StreamingPreview{};
+
     m_selectedBucket.clear();
     m_selectedKey.clear();
     m_previewContent.clear();
     m_previewError.clear();
     m_previewLoading = false;
     m_previewSupported = false;
+}
+
+const char* BrowserModel::streamingPreviewData() const {
+    if (!m_streamingPreview.active) {
+        return nullptr;
+    }
+    // Use the stored streaming state (keeps the StreamingFile alive)
+    if (m_streamingPreview.state && m_streamingPreview.state->file.data()) {
+        return m_streamingPreview.state->file.data();
+    }
+    return nullptr;
+}
+
+size_t BrowserModel::streamingPreviewSize() const {
+    if (!m_streamingPreview.active) {
+        return 0;
+    }
+    // Use stored streaming state
+    if (m_streamingPreview.state) {
+        // Add initial content size to file size
+        return m_streamingPreview.initial_content.size() + m_streamingPreview.state->file.size();
+    }
+    return m_streamingPreview.initial_content.size();
 }
 
 bool BrowserModel::isPreviewSupported(const std::string& key) {
@@ -426,12 +499,19 @@ void BrowserModel::processEvents() {
             }
             case EventType::ObjectContentLoaded: {
                 auto& payload = std::get<ObjectContentLoadedPayload>(event.payload);
-                LOG_F(INFO, "Event: ObjectContentLoaded bucket=%s key=%s size=%zu",
-                      payload.bucket.c_str(), payload.key.c_str(), payload.content.size());
+                LOG_F(INFO, "Event: ObjectContentLoaded bucket=%s key=%s size=%zu total=%lld",
+                      payload.bucket.c_str(), payload.key.c_str(), payload.content.size(),
+                      static_cast<long long>(payload.total_size));
 
-                // Cache the content for future use
+                // Cache the content with size info
                 std::string cacheKey = makePreviewCacheKey(payload.bucket, payload.key);
-                m_previewCache[cacheKey] = payload.content;
+                PreviewCacheEntry entry;
+                entry.content = payload.content;
+                entry.total_size = payload.total_size;
+                // If total_size == content.size(), the file is complete; also if we got less than PREVIEW_MAX_BYTES
+                entry.is_complete = (payload.total_size >= 0 && static_cast<size_t>(payload.total_size) == payload.content.size()) ||
+                                    payload.content.size() < PREVIEW_MAX_BYTES;
+                m_previewCache[cacheKey] = std::move(entry);
                 m_pendingObjectRequests.erase(cacheKey);
 
                 // Update preview if this is the selected file
@@ -455,6 +535,61 @@ void BrowserModel::processEvents() {
                 if (payload.bucket == m_selectedBucket && payload.key == m_selectedKey) {
                     m_previewLoading = false;
                     m_previewError = payload.error_message;
+                }
+                break;
+            }
+            case EventType::ObjectStreamStarted: {
+                auto& payload = std::get<ObjectStreamStartedPayload>(event.payload);
+                LOG_F(INFO, "Event: ObjectStreamStarted bucket=%s key=%s total=%lld",
+                      payload.bucket.c_str(), payload.key.c_str(),
+                      static_cast<long long>(payload.total_size));
+
+                if (m_streamingPreview.active &&
+                    payload.bucket == m_streamingPreview.bucket &&
+                    payload.key == m_streamingPreview.key) {
+                    if (payload.total_size > 0) {
+                        m_streamingPreview.total_size = payload.total_size;
+                    }
+                }
+                break;
+            }
+            case EventType::ObjectStreamChunk: {
+                auto& payload = std::get<ObjectStreamChunkPayload>(event.payload);
+                if (m_streamingPreview.active &&
+                    payload.bucket == m_streamingPreview.bucket &&
+                    payload.key == m_streamingPreview.key) {
+                    m_streamingPreview.bytes_loaded = m_streamingPreview.initial_content.size() + payload.bytes_received;
+                }
+                break;
+            }
+            case EventType::ObjectStreamComplete: {
+                auto& payload = std::get<ObjectStreamCompletePayload>(event.payload);
+                LOG_F(INFO, "Event: ObjectStreamComplete bucket=%s key=%s total=%zu",
+                      payload.bucket.c_str(), payload.key.c_str(), payload.total_bytes);
+
+                if (m_streamingPreview.active &&
+                    payload.bucket == m_streamingPreview.bucket &&
+                    payload.key == m_streamingPreview.key) {
+                    m_streamingPreview.bytes_loaded = m_streamingPreview.initial_content.size() + payload.total_bytes;
+                    m_streamingPreview.total_size = m_streamingPreview.bytes_loaded;
+                    m_streamingPreview.is_complete = true;
+                    m_previewLoading = false;
+                }
+                break;
+            }
+            case EventType::ObjectStreamError: {
+                auto& payload = std::get<ObjectStreamErrorPayload>(event.payload);
+                LOG_F(WARNING, "Event: ObjectStreamError bucket=%s key=%s error=%s bytes=%zu",
+                      payload.bucket.c_str(), payload.key.c_str(),
+                      payload.error_message.c_str(), payload.bytes_received);
+
+                if (m_streamingPreview.active &&
+                    payload.bucket == m_streamingPreview.bucket &&
+                    payload.key == m_streamingPreview.key) {
+                    m_streamingPreview.has_error = true;
+                    m_streamingPreview.error_message = payload.error_message;
+                    m_previewLoading = false;
+                    // Keep bytes_loaded as-is so partial content can be displayed
                 }
                 break;
             }

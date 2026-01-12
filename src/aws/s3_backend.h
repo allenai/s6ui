@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../backend.h"
+#include "../streaming_file.h"
 #include "aws_credentials.h"
 #include <string>
 #include <vector>
@@ -11,6 +12,7 @@
 #include <deque>
 #include <condition_variable>
 #include <chrono>
+#include <memory>
 
 // S3 data types (moved from s3_client.h)
 struct S3Bucket {
@@ -44,6 +46,17 @@ public:
         const std::string& key,
         size_t max_bytes = 0,
         bool lowPriority = false
+    ) override;
+    void getObjectStreaming(
+        const std::string& bucket,
+        const std::string& key,
+        size_t startOffset = 0,
+        size_t maxBytes = 0,
+        bool lowPriority = false
+    ) override;
+    void cancelStream(
+        const std::string& bucket,
+        const std::string& key
     ) override;
     void cancelAll() override;
 
@@ -80,10 +93,28 @@ public:
     // Change the active profile
     void setProfile(const AWSProfile& profile);
 
+    // Shared state for streaming downloads (public for callback access)
+    struct StreamingState {
+        StreamingFile file;
+        std::atomic<bool> cancelled{false};
+        std::atomic<size_t> bytes_received{0};
+        std::string bucket;
+        std::string key;
+    };
+
+    // Public for use by streaming callback - emits a chunk event
+    void emitStreamChunk(const std::string& bucket, const std::string& key, size_t bytes_received);
+
+    // Get the streaming file for a given bucket/key (for model to access mmap'd data)
+    StreamingFile* getStreamingFile(const std::string& bucket, const std::string& key);
+
+    // Get the streaming state shared_ptr (so model can keep it alive)
+    std::shared_ptr<StreamingState> getStreamingState(const std::string& bucket, const std::string& key);
+
 private:
     // Work item for the background thread
     struct WorkItem {
-        enum class Type { ListBuckets, ListObjects, GetObject, Shutdown };
+        enum class Type { ListBuckets, ListObjects, GetObject, GetObjectStreaming, Shutdown };
         enum class Priority { High, Low };  // High = user action, Low = prefetch
         Type type;
         Priority priority = Priority::High;
@@ -92,6 +123,8 @@ private:
         std::string continuation_token;
         std::string key;  // For GetObject
         size_t max_bytes = 0;  // For GetObject
+        size_t start_offset = 0;  // For GetObjectStreaming
+        std::shared_ptr<StreamingState> streaming_state;  // For GetObjectStreaming
         std::chrono::steady_clock::time_point queued_at;
     };
 
@@ -142,5 +175,10 @@ private:
     std::mutex m_eventMutex;
     std::vector<StateEvent> m_events;
 
+    // Active streaming downloads
+    mutable std::mutex m_streamsMutex;
+    std::map<std::string, std::shared_ptr<StreamingState>> m_activeStreams;  // key: bucket/key
+
     void pushEvent(StateEvent event);
+    std::string makeStreamKey(const std::string& bucket, const std::string& key) const;
 };

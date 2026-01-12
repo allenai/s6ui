@@ -67,6 +67,15 @@ public:
     const std::string& previewError() const { return m_previewError; }
     bool previewSupported() const { return m_previewSupported; }
 
+    // Streaming preview accessors
+    bool isStreamingPreview() const { return m_streamingPreview.active; }
+    const char* streamingPreviewData() const;
+    size_t streamingPreviewSize() const;
+    size_t streamingPreviewTotalSize() const { return m_streamingPreview.total_size; }
+    bool streamingPreviewComplete() const { return m_streamingPreview.is_complete; }
+    bool streamingPreviewHasError() const { return m_streamingPreview.has_error; }
+    const std::string& streamingPreviewError() const { return m_streamingPreview.error_message; }
+
     // Call once per frame to process pending events from backend
     void processEvents();
 
@@ -118,9 +127,32 @@ private:
     std::string m_previewContent;
     std::string m_previewError;
 
-    // Cache for prefetched file previews (bucket/key -> content)
-    std::map<std::string, std::string> m_previewCache;
+    // Cache entry for prefetched file previews
+    struct PreviewCacheEntry {
+        std::string content;
+        int64_t total_size = -1;  // Total file size, -1 if unknown
+        bool is_complete = false;  // True if content contains entire file
+    };
+
+    // Streaming preview state
+    struct StreamingPreview {
+        bool active = false;
+        std::string bucket;
+        std::string key;
+        size_t bytes_loaded = 0;
+        size_t total_size = 0;       // 0 if unknown
+        bool is_complete = false;
+        bool has_error = false;
+        std::string error_message;
+        std::string initial_content;  // Cached content from prefetch (first 64KB)
+        std::shared_ptr<S3Backend::StreamingState> state;  // Keep StreamingFile alive
+    };
+    StreamingPreview m_streamingPreview;
+
+    // Cache for prefetched file previews (bucket/key -> entry)
+    std::map<std::string, PreviewCacheEntry> m_previewCache;
     std::set<std::string> m_pendingObjectRequests;  // Track requests until event processed
     static std::string makePreviewCacheKey(const std::string& bucket, const std::string& key);
     static constexpr size_t PREVIEW_MAX_BYTES = 64 * 1024;  // 64KB
+    static constexpr size_t STREAMING_DISPLAY_MAX = 10 * 1024 * 1024;  // 10MB max display
 };

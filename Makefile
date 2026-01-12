@@ -69,7 +69,8 @@ AWS_SOURCES = $(AWS_DIR)/aws_credentials.cpp \
               $(AWS_DIR)/s3_backend.cpp
 
 APP_SOURCES = $(SRC_DIR)/browser_model.cpp \
-              $(SRC_DIR)/browser_ui.cpp
+              $(SRC_DIR)/browser_ui.cpp \
+              $(SRC_DIR)/streaming_file.cpp
 
 MAIN_SOURCES = $(SRC_DIR)/main.mm
 

@@ -20,6 +20,7 @@ private:
     void renderFolderContents();
     void renderStatusBar();
     void renderPreviewPane(float width, float height);
+    void renderStreamingPreview(const std::string& filename);
 
     void updateEditorLanguage(const std::string& filename);
 
@@ -34,4 +35,5 @@ private:
     // Text editor for preview with syntax highlighting
     TextEditor m_editor;
     std::string m_editorCurrentKey;  // Track which file is loaded in editor
+    size_t m_editorLoadedBytes = 0;  // Track bytes loaded for streaming refresh
 };

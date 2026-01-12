@@ -11,6 +11,56 @@ static size_t writeCallback(void* contents, size_t size, size_t nmemb, std::stri
     return total;
 }
 
+// Context for streaming downloads
+struct StreamingContext {
+    S3Backend::StreamingState* state;
+    S3Backend* backend;
+    size_t chunk_threshold;         // Emit event every N bytes
+    size_t last_event_at;           // Bytes when last event emitted
+    std::chrono::steady_clock::time_point last_event_time;
+};
+
+static size_t streamingWriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
+    auto* ctx = static_cast<StreamingContext*>(userp);
+    size_t total = size * nmemb;
+
+    // Check for cancellation
+    if (ctx->state->cancelled.load(std::memory_order_relaxed)) {
+        return 0;  // Abort transfer
+    }
+
+    // Append to streaming file
+    ssize_t written = ctx->state->file.append(contents, total);
+    if (written < 0) {
+        return 0;  // Error
+    }
+
+    size_t bytes_now = ctx->state->bytes_received.fetch_add(written, std::memory_order_relaxed) + written;
+
+    // Check if we should emit a chunk event
+    auto now = std::chrono::steady_clock::now();
+    bool should_emit = false;
+
+    // Emit every chunk_threshold bytes or every 100ms
+    if (bytes_now - ctx->last_event_at >= ctx->chunk_threshold ||
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - ctx->last_event_time).count() >= 100) {
+        should_emit = true;
+    }
+
+    if (should_emit) {
+        // Remap to make data visible to UI
+        ctx->state->file.remap();
+
+        // Emit chunk event
+        ctx->backend->emitStreamChunk(ctx->state->bucket, ctx->state->key, bytes_now);
+
+        ctx->last_event_at = bytes_now;
+        ctx->last_event_time = now;
+    }
+
+    return written;
+}
+
 static std::string extractTag(const std::string& xml, const std::string& tag) {
     std::string open = "<" + tag + ">";
     std::string close = "</" + tag + ">";
@@ -53,6 +103,14 @@ S3Backend::~S3Backend() {
     LOG_F(INFO, "S3Backend: shutting down");
     cancelAll();
 
+    // Cancel all active streams
+    {
+        std::lock_guard<std::mutex> lock(m_streamsMutex);
+        for (auto& [key, state] : m_activeStreams) {
+            state->cancelled.store(true, std::memory_order_relaxed);
+        }
+    }
+
     // Signal shutdown
     m_shutdown = true;
 
@@ -60,7 +118,10 @@ S3Backend::~S3Backend() {
     {
         std::lock_guard<std::mutex> lock(m_highPriorityMutex);
         for (size_t i = 0; i < m_numWorkers; ++i) {
-            m_highPriorityQueue.push_back({WorkItem::Type::Shutdown, WorkItem::Priority::High, "", "", "", "", 0, {}});
+            WorkItem item;
+            item.type = WorkItem::Type::Shutdown;
+            item.priority = WorkItem::Priority::High;
+            m_highPriorityQueue.push_back(std::move(item));
         }
     }
     m_highPriorityCv.notify_all();
@@ -69,7 +130,10 @@ S3Backend::~S3Backend() {
     {
         std::lock_guard<std::mutex> lock(m_lowPriorityMutex);
         for (size_t i = 0; i < m_numWorkers; ++i) {
-            m_lowPriorityQueue.push_back({WorkItem::Type::Shutdown, WorkItem::Priority::Low, "", "", "", "", 0, {}});
+            WorkItem item;
+            item.type = WorkItem::Type::Shutdown;
+            item.priority = WorkItem::Priority::Low;
+            m_lowPriorityQueue.push_back(std::move(item));
         }
     }
     m_lowPriorityCv.notify_all();
@@ -112,7 +176,7 @@ void S3Backend::setProfile(const AWSProfile& profile) {
 
 void S3Backend::listBuckets() {
     LOG_F(INFO, "S3Backend: queuing listBuckets request");
-    enqueue({WorkItem::Type::ListBuckets, WorkItem::Priority::High, "", "", "", "", 0, std::chrono::steady_clock::now()});
+    enqueue({WorkItem::Type::ListBuckets, WorkItem::Priority::High, "", "", "", "", 0, 0, nullptr, std::chrono::steady_clock::now()});
 }
 
 void S3Backend::listObjects(
@@ -123,7 +187,7 @@ void S3Backend::listObjects(
     LOG_F(INFO, "S3Backend: queuing listObjects bucket=%s prefix=%s token=%s",
           bucket.c_str(), prefix.c_str(),
           continuation_token.empty() ? "(none)" : continuation_token.substr(0, 20).c_str());
-    enqueue({WorkItem::Type::ListObjects, WorkItem::Priority::High, bucket, prefix, continuation_token, "", 0, std::chrono::steady_clock::now()});
+    enqueue({WorkItem::Type::ListObjects, WorkItem::Priority::High, bucket, prefix, continuation_token, "", 0, 0, nullptr, std::chrono::steady_clock::now()});
 }
 
 void S3Backend::getObject(
@@ -135,7 +199,7 @@ void S3Backend::getObject(
     auto priority = lowPriority ? WorkItem::Priority::Low : WorkItem::Priority::High;
     LOG_F(INFO, "S3Backend: queuing getObject bucket=%s key=%s max_bytes=%zu priority=%s",
           bucket.c_str(), key.c_str(), max_bytes, lowPriority ? "low" : "high");
-    enqueue({WorkItem::Type::GetObject, priority, bucket, "", "", key, max_bytes, std::chrono::steady_clock::now()});
+    enqueue({WorkItem::Type::GetObject, priority, bucket, "", "", key, max_bytes, 0, nullptr, std::chrono::steady_clock::now()});
 }
 
 void S3Backend::cancelAll() {
@@ -147,6 +211,95 @@ void S3Backend::cancelAll() {
         std::lock_guard<std::mutex> lock(m_lowPriorityMutex);
         m_lowPriorityQueue.clear();
     }
+    // Cancel all active streams
+    {
+        std::lock_guard<std::mutex> lock(m_streamsMutex);
+        for (auto& [key, state] : m_activeStreams) {
+            state->cancelled.store(true, std::memory_order_relaxed);
+        }
+        m_activeStreams.clear();
+    }
+}
+
+void S3Backend::getObjectStreaming(
+    const std::string& bucket,
+    const std::string& key,
+    size_t startOffset,
+    size_t maxBytes,
+    bool lowPriority
+) {
+    auto priority = lowPriority ? WorkItem::Priority::Low : WorkItem::Priority::High;
+    LOG_F(INFO, "S3Backend: queuing streaming getObject bucket=%s key=%s offset=%zu max=%zu priority=%s",
+          bucket.c_str(), key.c_str(), startOffset, maxBytes, lowPriority ? "low" : "high");
+
+    // Create streaming state
+    auto state = std::make_shared<StreamingState>();
+    state->bucket = bucket;
+    state->key = key;
+
+    // Register the stream
+    std::string streamKey = makeStreamKey(bucket, key);
+    {
+        std::lock_guard<std::mutex> lock(m_streamsMutex);
+        // Cancel any existing stream for this key
+        auto it = m_activeStreams.find(streamKey);
+        if (it != m_activeStreams.end()) {
+            it->second->cancelled.store(true, std::memory_order_relaxed);
+        }
+        m_activeStreams[streamKey] = state;
+    }
+
+    WorkItem item;
+    item.type = WorkItem::Type::GetObjectStreaming;
+    item.priority = priority;
+    item.bucket = bucket;
+    item.key = key;
+    item.max_bytes = maxBytes;
+    item.start_offset = startOffset;
+    item.streaming_state = state;
+    item.queued_at = std::chrono::steady_clock::now();
+
+    enqueue(std::move(item));
+}
+
+void S3Backend::cancelStream(const std::string& bucket, const std::string& key) {
+    std::string streamKey = makeStreamKey(bucket, key);
+    LOG_F(INFO, "S3Backend: cancelling stream bucket=%s key=%s", bucket.c_str(), key.c_str());
+
+    std::lock_guard<std::mutex> lock(m_streamsMutex);
+    auto it = m_activeStreams.find(streamKey);
+    if (it != m_activeStreams.end()) {
+        it->second->cancelled.store(true, std::memory_order_relaxed);
+        m_activeStreams.erase(it);
+    }
+}
+
+void S3Backend::emitStreamChunk(const std::string& bucket, const std::string& key, size_t bytes_received) {
+    pushEvent(StateEvent::objectStreamChunk(bucket, key, bytes_received));
+}
+
+StreamingFile* S3Backend::getStreamingFile(const std::string& bucket, const std::string& key) {
+    std::string streamKey = makeStreamKey(bucket, key);
+    std::lock_guard<std::mutex> lock(m_streamsMutex);
+    auto it = m_activeStreams.find(streamKey);
+    if (it != m_activeStreams.end()) {
+        return &it->second->file;
+    }
+    return nullptr;
+}
+
+std::shared_ptr<S3Backend::StreamingState> S3Backend::getStreamingState(const std::string& bucket, const std::string& key) {
+    std::string streamKey = makeStreamKey(bucket, key);
+    std::lock_guard<std::mutex> lock(m_streamsMutex);
+    auto it = m_activeStreams.find(streamKey);
+    if (it != m_activeStreams.end()) {
+        return it->second;
+    }
+    return nullptr;
+}
+
+std::string S3Backend::makeStreamKey(const std::string& bucket, const std::string& key) const {
+    return bucket + "/" + key;
 }
 
 void S3Backend::listObjectsPrefetch(
@@ -154,7 +307,7 @@ void S3Backend::listObjectsPrefetch(
     const std::string& prefix
 ) {
     LOG_F(INFO, "S3Backend: queuing prefetch bucket=%s prefix=%s", bucket.c_str(), prefix.c_str());
-    enqueue({WorkItem::Type::ListObjects, WorkItem::Priority::Low, bucket, prefix, "", "", 0, std::chrono::steady_clock::now()});
+    enqueue({WorkItem::Type::ListObjects, WorkItem::Priority::Low, bucket, prefix, "", "", 0, 0, nullptr, std::chrono::steady_clock::now()});
 }
 
 // Template helpers for queue operations
@@ -445,6 +598,112 @@ void S3Backend::processWorkItem(WorkItem& item) {
                       item.bucket.c_str(), item.key.c_str(), response.size(), total_ms, http_ms);
                 pushEvent(StateEvent::objectContentLoaded(item.bucket, item.key, std::move(response)));
             }
+        }
+    }
+    else if (item.type == WorkItem::Type::GetObjectStreaming) {
+        auto& state = *item.streaming_state;
+
+        // Check if already cancelled
+        if (state.cancelled.load(std::memory_order_relaxed)) {
+            LOG_F(INFO, "S3Backend: streaming request already cancelled bucket=%s key=%s",
+                  item.bucket.c_str(), item.key.c_str());
+            return;
+        }
+
+        // Create temp file
+        if (!state.file.create()) {
+            pushEvent(StateEvent::objectStreamError(item.bucket, item.key, "Failed to create temp file", 0));
+            return;
+        }
+
+        std::string host = item.bucket + ".s3." + m_profile.region + ".amazonaws.com";
+        std::string path = "/" + item.key;
+        LOG_F(1, "S3Backend: streaming object bucket=%s key=%s offset=%zu max=%zu",
+              item.bucket.c_str(), item.key.c_str(), item.start_offset, item.max_bytes);
+
+        auto signedReq = aws_sign_request(
+            "GET", host, path, "", m_profile.region, "s3",
+            m_profile.access_key_id, m_profile.secret_access_key
+        );
+
+        // Add Range header for offset/limit
+        if (item.start_offset > 0 || item.max_bytes > 0) {
+            std::string range = "bytes=" + std::to_string(item.start_offset) + "-";
+            if (item.max_bytes > 0) {
+                range += std::to_string(item.start_offset + item.max_bytes - 1);
+            }
+            signedReq.headers["Range"] = range;
+        }
+
+        // Emit stream started event (we don't know total size yet)
+        pushEvent(StateEvent::objectStreamStarted(item.bucket, item.key, -1));
+
+        // Setup streaming CURL request
+        CURL* curl = curl_easy_init();
+        if (!curl) {
+            pushEvent(StateEvent::objectStreamError(item.bucket, item.key, "Failed to init curl", 0));
+            return;
+        }
+
+        StreamingContext ctx;
+        ctx.state = &state;
+        ctx.backend = this;
+        ctx.chunk_threshold = 64 * 1024;  // Emit event every 64KB
+        ctx.last_event_at = 0;
+        ctx.last_event_time = std::chrono::steady_clock::now();
+
+        curl_easy_setopt(curl, CURLOPT_URL, signedReq.url.c_str());
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, streamingWriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 0L);  // No timeout for streaming
+        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
+        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 60L);  // Abort if < 1 byte/sec for 60s
+
+        struct curl_slist* headerList = nullptr;
+        for (const auto& [key, value] : signedReq.headers) {
+            std::string header = key + ": " + value;
+            headerList = curl_slist_append(headerList, header.c_str());
+        }
+        if (headerList) {
+            curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headerList);
+        }
+
+        auto http_start = std::chrono::steady_clock::now();
+        CURLcode res = curl_easy_perform(curl);
+        auto http_end = std::chrono::steady_clock::now();
+
+        if (headerList) curl_slist_free_all(headerList);
+        curl_easy_cleanup(curl);
+
+        // Final remap to make all data visible
+        state.file.remap();
+
+        auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
+        size_t bytes_received = state.bytes_received.load(std::memory_order_relaxed);
+
+        if (state.cancelled.load(std::memory_order_relaxed)) {
+            LOG_F(INFO, "S3Backend: streaming cancelled bucket=%s key=%s bytes=%zu",
+                  item.bucket.c_str(), item.key.c_str(), bytes_received);
+            // Don't emit any event - stream was cancelled
+        } else if (res == CURLE_OK) {
+            LOG_F(INFO, "S3Backend: streaming complete bucket=%s key=%s bytes=%zu (http=%lldms)",
+                  item.bucket.c_str(), item.key.c_str(), bytes_received, total_ms);
+            pushEvent(StateEvent::objectStreamComplete(item.bucket, item.key, bytes_received));
+        } else if (res == CURLE_WRITE_ERROR && state.cancelled.load(std::memory_order_relaxed)) {
+            // Write callback returned 0 due to cancellation
+            LOG_F(INFO, "S3Backend: streaming aborted bucket=%s key=%s bytes=%zu",
+                  item.bucket.c_str(), item.key.c_str(), bytes_received);
+        } else {
+            LOG_F(WARNING, "S3Backend: streaming error bucket=%s key=%s error=%s bytes=%zu",
+                  item.bucket.c_str(), item.key.c_str(), curl_easy_strerror(res), bytes_received);
+            pushEvent(StateEvent::objectStreamError(item.bucket, item.key, curl_easy_strerror(res), bytes_received));
+        }
+
+        // Remove from active streams
+        std::string streamKey = makeStreamKey(item.bucket, item.key);
+        {
+            std::lock_guard<std::mutex> lock(m_streamsMutex);
+            m_activeStreams.erase(streamKey);
         }
     }
 }

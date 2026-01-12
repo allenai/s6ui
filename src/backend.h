@@ -36,6 +36,25 @@ public:
         bool lowPriority = false
     ) = 0;
 
+    // Request streaming object content (for large file preview)
+    // Emits ObjectStreamStarted, then ObjectStreamChunk events as data arrives,
+    // then ObjectStreamComplete or ObjectStreamError
+    // startOffset allows resuming from prefetch (e.g., 65536 to continue after cached 64KB)
+    // maxBytes of 0 = no limit (download entire file)
+    virtual void getObjectStreaming(
+        const std::string& bucket,
+        const std::string& key,
+        size_t startOffset = 0,
+        size_t maxBytes = 0,
+        bool lowPriority = false
+    ) = 0;
+
+    // Cancel a streaming download in progress
+    virtual void cancelStream(
+        const std::string& bucket,
+        const std::string& key
+    ) = 0;
+
     // Cancel all pending requests (optional, for cleanup)
     virtual void cancelAll() {}
 

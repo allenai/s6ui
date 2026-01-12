@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <variant>
+#include <cstdint>
 
 // Forward declarations
 struct S3Bucket;
@@ -16,6 +17,11 @@ enum class EventType {
     ObjectsLoadError,
     ObjectContentLoaded,
     ObjectContentLoadError,
+    // Streaming events
+    ObjectStreamStarted,
+    ObjectStreamChunk,
+    ObjectStreamComplete,
+    ObjectStreamError,
 };
 
 // Event payload types
@@ -42,12 +48,39 @@ struct ObjectContentLoadedPayload {
     std::string bucket;
     std::string key;
     std::string content;
+    int64_t total_size = -1;  // Total file size from Content-Range, -1 if unknown
 };
 
 struct ObjectContentErrorPayload {
     std::string bucket;
     std::string key;
     std::string error_message;
+};
+
+// Streaming event payloads
+struct ObjectStreamStartedPayload {
+    std::string bucket;
+    std::string key;
+    int64_t total_size;      // Total file size, -1 if unknown
+};
+
+struct ObjectStreamChunkPayload {
+    std::string bucket;
+    std::string key;
+    size_t bytes_received;   // Total bytes received so far
+};
+
+struct ObjectStreamCompletePayload {
+    std::string bucket;
+    std::string key;
+    size_t total_bytes;      // Final total size
+};
+
+struct ObjectStreamErrorPayload {
+    std::string bucket;
+    std::string key;
+    std::string error_message;
+    size_t bytes_received;   // How much was downloaded before error
 };
 
 // A state change event from a backend
@@ -58,7 +91,11 @@ struct StateEvent {
         ObjectsLoadedPayload,
         ErrorPayload,
         ObjectContentLoadedPayload,
-        ObjectContentErrorPayload
+        ObjectContentErrorPayload,
+        ObjectStreamStartedPayload,
+        ObjectStreamChunkPayload,
+        ObjectStreamCompletePayload,
+        ObjectStreamErrorPayload
     > payload;
 
     // Helper constructors
@@ -107,11 +144,12 @@ struct StateEvent {
     static StateEvent objectContentLoaded(
         const std::string& bucket,
         const std::string& key,
-        std::string content
+        std::string content,
+        int64_t total_size = -1
     ) {
         StateEvent e;
         e.type = EventType::ObjectContentLoaded;
-        e.payload = ObjectContentLoadedPayload{bucket, key, std::move(content)};
+        e.payload = ObjectContentLoadedPayload{bucket, key, std::move(content), total_size};
         return e;
     }
 
@@ -123,6 +161,52 @@ struct StateEvent {
         StateEvent e;
         e.type = EventType::ObjectContentLoadError;
         e.payload = ObjectContentErrorPayload{bucket, key, error};
+        return e;
+    }
+
+    // Streaming event helpers
+    static StateEvent objectStreamStarted(
+        const std::string& bucket,
+        const std::string& key,
+        int64_t total_size
+    ) {
+        StateEvent e;
+        e.type = EventType::ObjectStreamStarted;
+        e.payload = ObjectStreamStartedPayload{bucket, key, total_size};
+        return e;
+    }
+
+    static StateEvent objectStreamChunk(
+        const std::string& bucket,
+        const std::string& key,
+        size_t bytes_received
+    ) {
+        StateEvent e;
+        e.type = EventType::ObjectStreamChunk;
+        e.payload = ObjectStreamChunkPayload{bucket, key, bytes_received};
+        return e;
+    }
+
+    static StateEvent objectStreamComplete(
+        const std::string& bucket,
+        const std::string& key,
+        size_t total_bytes
+    ) {
+        StateEvent e;
+        e.type = EventType::ObjectStreamComplete;
+        e.payload = ObjectStreamCompletePayload{bucket, key, total_bytes};
+        return e;
+    }
+
+    static StateEvent objectStreamError(
+        const std::string& bucket,
+        const std::string& key,
+        const std::string& error,
+        size_t bytes_received
+    ) {
+        StateEvent e;
+        e.type = EventType::ObjectStreamError;
+        e.payload = ObjectStreamErrorPayload{bucket, key, error, bytes_received};
         return e;
     }
 };

@@ -329,6 +329,7 @@ void BrowserUI::renderPreviewPane(float width, float height) {
 
     if (!m_model.hasSelection()) {
         m_editorCurrentKey.clear();
+        m_editorLoadedBytes = 0;
         ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Select a file to preview");
     } else {
         // Show filename header
@@ -341,14 +342,19 @@ void BrowserUI::renderPreviewPane(float width, float height) {
 
         if (!m_model.previewSupported()) {
             m_editorCurrentKey.clear();
+            m_editorLoadedBytes = 0;
             ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Preview not supported for this file type");
             ImGui::Spacing();
             ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
-                "Supported: .txt, .md, .html, .htm, .json, .jsonl");
+                "Supported: text, code, config, and data files");
+        } else if (m_model.isStreamingPreview()) {
+            // Streaming preview mode
+            renderStreamingPreview(filename);
         } else if (m_model.previewLoading()) {
             ImGui::TextColored(ImVec4(0.5f, 0.5f, 1.0f, 1.0f), "Loading preview...");
         } else if (!m_model.previewError().empty()) {
             m_editorCurrentKey.clear();
+            m_editorLoadedBytes = 0;
             ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
                 "Error: %s", m_model.previewError().c_str());
         } else {
@@ -356,12 +362,14 @@ void BrowserUI::renderPreviewPane(float width, float height) {
             const std::string& content = m_model.previewContent();
             if (content.empty()) {
                 m_editorCurrentKey.clear();
+                m_editorLoadedBytes = 0;
                 ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "(empty file)");
             } else {
                 // Update editor content if file changed
                 std::string fullKey = m_model.selectedBucket() + "/" + key;
                 if (m_editorCurrentKey != fullKey) {
                     m_editorCurrentKey = fullKey;
+                    m_editorLoadedBytes = content.size();
                     m_editor.SetText(content);
                     updateEditorLanguage(filename);
                     // Reset cursor and selection for new file
@@ -377,6 +385,112 @@ void BrowserUI::renderPreviewPane(float width, float height) {
     }
 
     ImGui::EndChild();
+}
+
+void BrowserUI::renderStreamingPreview(const std::string& filename) {
+    size_t loaded = m_model.streamingPreviewSize();
+    size_t total = m_model.streamingPreviewTotalSize();
+    bool complete = m_model.streamingPreviewComplete();
+    bool hasError = m_model.streamingPreviewHasError();
+
+    // Progress indicator
+    if (!complete) {
+        if (total > 0) {
+            float progress = static_cast<float>(loaded) / static_cast<float>(total);
+            char overlay[64];
+            snprintf(overlay, sizeof(overlay), "%zu / %zu KB", loaded / 1024, total / 1024);
+            ImGui::ProgressBar(progress, ImVec2(-1, 0), overlay);
+        } else {
+            ImGui::Text("Loading... %zu KB", loaded / 1024);
+        }
+    } else {
+        ImGui::TextColored(ImVec4(0.4f, 0.8f, 0.4f, 1.0f), "Loaded: %zu KB", loaded / 1024);
+    }
+
+    // Error indicator (but still show content if we have any)
+    if (hasError) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), " (Error: %s)",
+            m_model.streamingPreviewError().c_str());
+    }
+
+    // Get streaming data
+    const char* data = m_model.streamingPreviewData();
+
+    // Check if we should update the editor
+    // Update at thresholds: 64KB, 256KB, 1MB, then every 1MB, and on completion
+    bool shouldRefresh = false;
+    static const size_t thresholds[] = { 64 * 1024, 256 * 1024, 1024 * 1024 };
+
+    std::string fullKey = m_model.selectedBucket() + "/" + m_model.selectedKey();
+    bool isNewFile = (m_editorCurrentKey != fullKey);
+
+    if (isNewFile && loaded > 0) {
+        shouldRefresh = true;
+    } else {
+        for (size_t t : thresholds) {
+            if (m_editorLoadedBytes < t && loaded >= t) {
+                shouldRefresh = true;
+                break;
+            }
+        }
+        // After 1MB, every 1MB
+        if (!shouldRefresh && loaded >= 1024 * 1024) {
+            size_t lastMB = m_editorLoadedBytes / (1024 * 1024);
+            size_t currentMB = loaded / (1024 * 1024);
+            if (currentMB > lastMB) {
+                shouldRefresh = true;
+            }
+        }
+        // Always refresh on completion
+        if (complete && m_editorLoadedBytes < loaded) {
+            shouldRefresh = true;
+        }
+    }
+
+    if (shouldRefresh && data && loaded > 0) {
+        m_editorCurrentKey = fullKey;
+
+        // Cap display at 10MB for performance
+        static constexpr size_t MAX_DISPLAY = 10 * 1024 * 1024;
+        size_t displaySize = std::min(loaded, MAX_DISPLAY);
+
+        std::string content(data, displaySize);
+        if (loaded > MAX_DISPLAY) {
+            content += "\n\n[... truncated - showing first 10MB of " +
+                       std::to_string(loaded / (1024 * 1024)) + "MB ...]";
+        }
+
+        m_editor.SetText(content);
+        updateEditorLanguage(filename);
+
+        if (isNewFile) {
+            m_editor.SetCursorPosition(TextEditor::Coordinates(0, 0));
+            m_editor.SetSelection(TextEditor::Coordinates(0, 0), TextEditor::Coordinates(0, 0));
+        }
+
+        m_editorLoadedBytes = loaded;
+    }
+
+    // Render the editor if we have content
+    if (loaded > 0 || !m_model.previewContent().empty()) {
+        // If streaming just started and we have cached content, show that first
+        if (loaded == 0 && !m_model.previewContent().empty()) {
+            if (isNewFile) {
+                m_editorCurrentKey = fullKey;
+                m_editor.SetText(m_model.previewContent());
+                updateEditorLanguage(filename);
+                m_editor.SetCursorPosition(TextEditor::Coordinates(0, 0));
+                m_editor.SetSelection(TextEditor::Coordinates(0, 0), TextEditor::Coordinates(0, 0));
+                m_editorLoadedBytes = m_model.previewContent().size();
+            }
+        }
+
+        ImVec2 availSize = ImGui::GetContentRegionAvail();
+        m_editor.Render("##preview", availSize, false);
+    } else if (!complete && !hasError) {
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 1.0f, 1.0f), "Starting download...");
+    }
 }
 
 void BrowserUI::updateEditorLanguage(const std::string& filename) {
