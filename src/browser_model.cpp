@@ -1,6 +1,7 @@
 #include "browser_model.h"
 #include "loguru.hpp"
 #include <algorithm>
+#include <unordered_set>
 
 BrowserModel::BrowserModel() = default;
 
@@ -272,8 +273,96 @@ bool BrowserModel::isPreviewSupported(const std::string& key) {
     }
 
     // Supported text extensions
-    return ext == ".txt" || ext == ".md" || ext == ".html" || ext == ".htm" ||
-           ext == ".json" || ext == ".jsonl";
+    static const std::unordered_set<std::string> supportedExtensions = {
+        // Plain text and documentation
+        ".txt", ".md", ".markdown", ".rst", ".rtf", ".tex", ".log", ".readme",
+
+        // Web markup and data
+        ".html", ".htm", ".xhtml", ".xml", ".svg", ".css", ".scss", ".sass", ".less",
+
+        // Data formats
+        ".json", ".jsonl", ".ndjson", ".yaml", ".yml", ".toml", ".csv", ".tsv",
+        ".ini", ".cfg", ".conf", ".properties", ".env",
+
+        // Programming languages - C family
+        ".c", ".h", ".cpp", ".hpp", ".cc", ".hh", ".cxx", ".hxx", ".c++", ".h++",
+        ".m", ".mm",  // Objective-C
+
+        // Programming languages - JVM
+        ".java", ".kt", ".kts", ".scala", ".groovy", ".gradle",
+
+        // Programming languages - Scripting
+        ".py", ".pyw", ".pyi",  // Python
+        ".js", ".mjs", ".cjs", ".jsx",  // JavaScript
+        ".ts", ".tsx", ".mts", ".cts",  // TypeScript
+        ".rb", ".rake", ".gemspec",  // Ruby
+        ".php", ".phtml",  // PHP
+        ".pl", ".pm", ".pod",  // Perl
+        ".lua",
+        ".r", ".rmd",  // R
+
+        // Programming languages - Systems
+        ".go",
+        ".rs",  // Rust
+        ".swift",
+        ".zig",
+        ".nim",
+        ".v",  // V lang
+        ".d",  // D lang
+
+        // Programming languages - Functional
+        ".hs", ".lhs",  // Haskell
+        ".ml", ".mli",  // OCaml
+        ".fs", ".fsi", ".fsx",  // F#
+        ".ex", ".exs",  // Elixir
+        ".erl", ".hrl",  // Erlang
+        ".clj", ".cljs", ".cljc", ".edn",  // Clojure
+        ".lisp", ".cl", ".el",  // Lisp variants
+        ".scm", ".ss",  // Scheme
+
+        // Shell scripts
+        ".sh", ".bash", ".zsh", ".fish", ".ksh", ".csh", ".tcsh",
+        ".ps1", ".psm1", ".psd1",  // PowerShell
+        ".bat", ".cmd",  // Windows batch
+
+        // Database and query
+        ".sql", ".mysql", ".pgsql", ".sqlite",
+        ".graphql", ".gql",
+
+        // DevOps and infrastructure
+        ".dockerfile", ".tf", ".tfvars", ".hcl",
+        ".vagrantfile", ".ansible",
+
+        // Build and config files
+        ".cmake", ".make", ".makefile", ".mk",
+        ".ninja",
+        ".bazel", ".bzl",
+        ".sbt",
+
+        // Version control and editor config
+        ".gitignore", ".gitattributes", ".gitmodules",
+        ".editorconfig", ".prettierrc", ".eslintrc",
+
+        // Serialization and schemas
+        ".proto", ".thrift", ".avsc",
+        ".xsd", ".dtd", ".wsdl",
+
+        // Diff and patches
+        ".diff", ".patch",
+
+        // Assembly
+        ".asm", ".s", ".S",
+
+        // Other
+        ".vim", ".vimrc",
+        ".tmux",
+        ".zshrc", ".bashrc", ".profile",
+        ".htaccess", ".nginx",
+        ".plist",
+        ".reg",  // Windows registry
+    };
+
+    return supportedExtensions.find(ext) != supportedExtensions.end();
 }
 
 void BrowserModel::processEvents() {

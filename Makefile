@@ -15,7 +15,7 @@ SRC_DIR = src
 AWS_DIR = $(SRC_DIR)/aws
 BUILD_DIR = build
 
-# Compiler flags
+# Compiler flags for our source code
 CXXFLAGS = -std=c++17 -Wall -Wextra -O2
 CXXFLAGS += -I$(HOMEBREW_PREFIX)/include
 CXXFLAGS += -I$(LIBS_DIR)
@@ -23,8 +23,17 @@ CXXFLAGS += -I$(LIBS_DIR)/imgui
 CXXFLAGS += -I$(LIBS_DIR)/loguru
 CXXFLAGS += -I$(SRC_DIR)
 
+# Compiler flags for third-party libraries (suppress warnings)
+LIBS_CXXFLAGS = -std=c++17 -O2 -w
+LIBS_CXXFLAGS += -I$(HOMEBREW_PREFIX)/include
+LIBS_CXXFLAGS += -I$(LIBS_DIR)
+LIBS_CXXFLAGS += -I$(LIBS_DIR)/imgui
+LIBS_CXXFLAGS += -I$(LIBS_DIR)/loguru
+LIBS_CXXFLAGS += -I$(SRC_DIR)
+
 # Objective-C++ flags
 OBJCXXFLAGS = $(CXXFLAGS) -fobjc-arc
+LIBS_OBJCXXFLAGS = $(LIBS_CXXFLAGS) -fobjc-arc
 
 # Linker flags
 LDFLAGS = -L$(HOMEBREW_PREFIX)/lib
@@ -88,15 +97,15 @@ $(TARGET): $(ALL_OBJS)
 $(BUILD_DIR)/libs/imgui $(BUILD_DIR)/libs/loguru $(BUILD_DIR)/libs/imguicolortextedit $(BUILD_DIR)/src/aws:
 	mkdir -p $@
 
-# Compile libs C++ files
+# Compile libs C++ files (with warnings suppressed)
 $(BUILD_DIR)/libs/%.o: $(LIBS_DIR)/%.cpp | $(BUILD_DIR)/libs/imgui $(BUILD_DIR)/libs/loguru $(BUILD_DIR)/libs/imguicolortextedit
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(LIBS_CXXFLAGS) -c $< -o $@
 
-# Compile libs Objective-C++ files
+# Compile libs Objective-C++ files (with warnings suppressed)
 $(BUILD_DIR)/libs/%.o: $(LIBS_DIR)/%.mm | $(BUILD_DIR)/libs/imgui
 	@mkdir -p $(dir $@)
-	$(OBJCXX) $(OBJCXXFLAGS) -c $< -o $@
+	$(OBJCXX) $(LIBS_OBJCXXFLAGS) -c $< -o $@
 
 # Compile src C++ files
 $(BUILD_DIR)/src/%.o: $(SRC_DIR)/%.cpp | $(BUILD_DIR)/src/aws
@@ -118,7 +127,14 @@ debug: CXXFLAGS += -I$(LIBS_DIR)
 debug: CXXFLAGS += -I$(LIBS_DIR)/imgui
 debug: CXXFLAGS += -I$(LIBS_DIR)/loguru
 debug: CXXFLAGS += -I$(SRC_DIR)
+debug: LIBS_CXXFLAGS = -std=c++17 -g -O0 -w
+debug: LIBS_CXXFLAGS += -I$(HOMEBREW_PREFIX)/include
+debug: LIBS_CXXFLAGS += -I$(LIBS_DIR)
+debug: LIBS_CXXFLAGS += -I$(LIBS_DIR)/imgui
+debug: LIBS_CXXFLAGS += -I$(LIBS_DIR)/loguru
+debug: LIBS_CXXFLAGS += -I$(SRC_DIR)
 debug: OBJCXXFLAGS = $(CXXFLAGS) -fobjc-arc
+debug: LIBS_OBJCXXFLAGS = $(LIBS_CXXFLAGS) -fobjc-arc
 debug: clean $(TARGET)
 
 # Address Sanitizer build (catches memory errors)
@@ -128,7 +144,14 @@ asan: CXXFLAGS += -I$(LIBS_DIR)
 asan: CXXFLAGS += -I$(LIBS_DIR)/imgui
 asan: CXXFLAGS += -I$(LIBS_DIR)/loguru
 asan: CXXFLAGS += -I$(SRC_DIR)
+asan: LIBS_CXXFLAGS = -std=c++17 -g -O1 -w -fsanitize=address -fno-omit-frame-pointer
+asan: LIBS_CXXFLAGS += -I$(HOMEBREW_PREFIX)/include
+asan: LIBS_CXXFLAGS += -I$(LIBS_DIR)
+asan: LIBS_CXXFLAGS += -I$(LIBS_DIR)/imgui
+asan: LIBS_CXXFLAGS += -I$(LIBS_DIR)/loguru
+asan: LIBS_CXXFLAGS += -I$(SRC_DIR)
 asan: OBJCXXFLAGS = $(CXXFLAGS) -fobjc-arc
+asan: LIBS_OBJCXXFLAGS = $(LIBS_CXXFLAGS) -fobjc-arc
 asan: LDFLAGS += -fsanitize=address
 asan: clean $(TARGET)
 
