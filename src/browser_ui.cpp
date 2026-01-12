@@ -185,6 +185,21 @@ void BrowserUI::renderFolderContents() {
         m_model.navigateUp();
         return;  // Return early to avoid rendering stale content
     }
+    // Prefetch parent folder on hover for instant navigation
+    if (ImGui::IsItemHovered()) {
+        // Calculate parent prefix (same logic as navigateUp)
+        std::string parentPrefix = prefix;
+        if (!parentPrefix.empty() && parentPrefix.back() == '/') {
+            parentPrefix.pop_back();
+        }
+        size_t lastSlash = parentPrefix.rfind('/');
+        if (lastSlash == std::string::npos) {
+            parentPrefix = "";
+        } else {
+            parentPrefix = parentPrefix.substr(0, lastSlash + 1);
+        }
+        m_model.prefetchFolder(bucket, parentPrefix);
+    }
 
     // Show loading indicator
     if (node->loading && node->objects.empty()) {

@@ -43,14 +43,16 @@ public:
         const std::string& bucket,
         const std::string& key,
         size_t max_bytes = 0,
-        bool lowPriority = false
+        bool lowPriority = false,
+        bool cancellable = false
     ) override;
     void cancelAll() override;
 
     // Prefetch support - low priority background requests
     void listObjectsPrefetch(
         const std::string& bucket,
-        const std::string& prefix
+        const std::string& prefix,
+        bool cancellable = false
     ) override;
 
     // Boost a pending request to high priority (returns true if found and boosted)
@@ -80,9 +82,6 @@ public:
     // Change the active profile
     void setProfile(const AWSProfile& profile);
 
-    // Check if a prefetch request should be cancelled (newer request exists)
-    bool shouldCancelPrefetch(uint64_t prefetch_id) const;
-
 private:
     // Work item for the background thread
     struct WorkItem {
@@ -96,7 +95,7 @@ private:
         std::string key;  // For GetObject
         size_t max_bytes = 0;  // For GetObject
         std::chrono::steady_clock::time_point queued_at;
-        uint64_t prefetch_id = 0;  // For cancellation of stale prefetch requests
+        std::shared_ptr<std::atomic<bool>> cancel_flag;  // Shared flag to cancel this request
     };
 
     void workerThread(WorkItem::Priority priority, size_t workerIndex);
@@ -113,7 +112,7 @@ private:
     // HTTP and signing
     std::string httpGet(const std::string& url,
                         const std::map<std::string, std::string>& headers,
-                        uint64_t prefetch_id = 0);
+                        std::shared_ptr<std::atomic<bool>> cancel_flag = nullptr);
     std::string urlEncode(const std::string& value);
 
     // XML parsing
@@ -143,8 +142,10 @@ private:
 
     std::atomic<bool> m_shutdown{false};
 
-    // Prefetch cancellation - newer prefetch requests cancel older in-flight ones
-    std::atomic<uint64_t> m_latestPrefetchId{0};
+    // Hover prefetch cancellation - when a new cancellable prefetch is queued,
+    // the previous one is cancelled via this shared flag
+    std::shared_ptr<std::atomic<bool>> m_currentHoverCancelFlag;
+    std::mutex m_hoverCancelMutex;
 
     // Event queue (results from worker thread)
     std::mutex m_eventMutex;

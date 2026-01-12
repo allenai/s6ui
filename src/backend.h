@@ -29,11 +29,13 @@ public:
     // Request object content (for preview)
     // max_bytes limits download size (0 = no limit)
     // lowPriority = true for background prefetch, false for user-initiated requests
+    // cancellable = true means this request can be cancelled by newer hover prefetches
     virtual void getObject(
         const std::string& bucket,
         const std::string& key,
         size_t max_bytes = 0,
-        bool lowPriority = false
+        bool lowPriority = false,
+        bool cancellable = false
     ) = 0;
 
     // Cancel all pending requests (optional, for cleanup)
@@ -41,9 +43,11 @@ public:
 
     // Prefetch support - queue a low-priority background request
     // Used to preload subfolders for faster navigation
+    // cancellable = true means this request can be cancelled by newer hover prefetches
     virtual void listObjectsPrefetch(
         const std::string& bucket,
-        const std::string& prefix
+        const std::string& prefix,
+        bool cancellable = false
     ) = 0;
 
     // Boost a pending request to high priority (returns true if found and boosted)

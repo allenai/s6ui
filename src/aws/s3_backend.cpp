@@ -31,17 +31,12 @@ static std::string extractError(const std::string& xml) {
     return "";
 }
 
-// Progress callback data for prefetch cancellation
-struct PrefetchProgressData {
-    const S3Backend* backend;
-    uint64_t prefetch_id;
-};
-
-static int prefetchProgressCallback(void* clientp, curl_off_t /*dltotal*/, curl_off_t /*dlnow*/,
-                                    curl_off_t /*ultotal*/, curl_off_t /*ulnow*/) {
-    auto* data = static_cast<PrefetchProgressData*>(clientp);
-    // If a newer prefetch request exists, abort this transfer
-    if (data->backend->shouldCancelPrefetch(data->prefetch_id)) {
+// Progress callback for cancellable requests
+static int cancelCheckProgressCallback(void* clientp, curl_off_t /*dltotal*/, curl_off_t /*dlnow*/,
+                                       curl_off_t /*ultotal*/, curl_off_t /*ulnow*/) {
+    auto* cancel_flag = static_cast<std::atomic<bool>*>(clientp);
+    // If cancelled, abort the transfer
+    if (cancel_flag && cancel_flag->load()) {
         return 1;  // Non-zero aborts the transfer
     }
     return 0;
@@ -76,7 +71,7 @@ S3Backend::~S3Backend() {
     {
         std::lock_guard<std::mutex> lock(m_highPriorityMutex);
         for (size_t i = 0; i < m_numWorkers; ++i) {
-            m_highPriorityQueue.push_back({WorkItem::Type::Shutdown, WorkItem::Priority::High, "", "", "", "", 0, {}});
+            m_highPriorityQueue.push_back({WorkItem::Type::Shutdown, WorkItem::Priority::High, "", "", "", "", 0, {}, nullptr});
         }
     }
     m_highPriorityCv.notify_all();
@@ -85,7 +80,7 @@ S3Backend::~S3Backend() {
     {
         std::lock_guard<std::mutex> lock(m_lowPriorityMutex);
         for (size_t i = 0; i < m_numWorkers; ++i) {
-            m_lowPriorityQueue.push_back({WorkItem::Type::Shutdown, WorkItem::Priority::Low, "", "", "", "", 0, {}});
+            m_lowPriorityQueue.push_back({WorkItem::Type::Shutdown, WorkItem::Priority::Low, "", "", "", "", 0, {}, nullptr});
         }
     }
     m_lowPriorityCv.notify_all();
@@ -128,7 +123,7 @@ void S3Backend::setProfile(const AWSProfile& profile) {
 
 void S3Backend::listBuckets() {
     LOG_F(INFO, "S3Backend: queuing listBuckets request");
-    enqueue({WorkItem::Type::ListBuckets, WorkItem::Priority::High, "", "", "", "", 0, std::chrono::steady_clock::now()});
+    enqueue({WorkItem::Type::ListBuckets, WorkItem::Priority::High, "", "", "", "", 0, std::chrono::steady_clock::now(), nullptr});
 }
 
 void S3Backend::listObjects(
@@ -139,19 +134,39 @@ void S3Backend::listObjects(
     LOG_F(INFO, "S3Backend: queuing listObjects bucket=%s prefix=%s token=%s",
           bucket.c_str(), prefix.c_str(),
           continuation_token.empty() ? "(none)" : continuation_token.substr(0, 20).c_str());
-    enqueue({WorkItem::Type::ListObjects, WorkItem::Priority::High, bucket, prefix, continuation_token, "", 0, std::chrono::steady_clock::now()});
+    enqueue({WorkItem::Type::ListObjects, WorkItem::Priority::High, bucket, prefix, continuation_token, "", 0, std::chrono::steady_clock::now(), nullptr});
 }
 
 void S3Backend::getObject(
     const std::string& bucket,
     const std::string& key,
     size_t max_bytes,
-    bool lowPriority
+    bool lowPriority,
+    bool cancellable
 ) {
     auto priority = lowPriority ? WorkItem::Priority::Low : WorkItem::Priority::High;
-    LOG_F(INFO, "S3Backend: queuing getObject bucket=%s key=%s max_bytes=%zu priority=%s",
-          bucket.c_str(), key.c_str(), max_bytes, lowPriority ? "low" : "high");
-    enqueue({WorkItem::Type::GetObject, priority, bucket, "", "", key, max_bytes, std::chrono::steady_clock::now()});
+    LOG_F(INFO, "S3Backend: queuing getObject bucket=%s key=%s max_bytes=%zu priority=%s cancellable=%d",
+          bucket.c_str(), key.c_str(), max_bytes, lowPriority ? "low" : "high", cancellable);
+
+    WorkItem item;
+    item.type = WorkItem::Type::GetObject;
+    item.priority = priority;
+    item.bucket = bucket;
+    item.key = key;
+    item.max_bytes = max_bytes;
+    item.queued_at = std::chrono::steady_clock::now();
+
+    if (cancellable) {
+        // Cancel any previous hover prefetch and create a new cancel flag for this one
+        std::lock_guard<std::mutex> lock(m_hoverCancelMutex);
+        if (m_currentHoverCancelFlag) {
+            m_currentHoverCancelFlag->store(true);
+        }
+        item.cancel_flag = std::make_shared<std::atomic<bool>>(false);
+        m_currentHoverCancelFlag = item.cancel_flag;
+    }
+
+    enqueue(std::move(item));
 }
 
 void S3Backend::cancelAll() {
@@ -167,10 +182,29 @@ void S3Backend::cancelAll() {
 
 void S3Backend::listObjectsPrefetch(
     const std::string& bucket,
-    const std::string& prefix
+    const std::string& prefix,
+    bool cancellable
 ) {
-    LOG_F(INFO, "S3Backend: queuing prefetch bucket=%s prefix=%s", bucket.c_str(), prefix.c_str());
-    enqueue({WorkItem::Type::ListObjects, WorkItem::Priority::Low, bucket, prefix, "", "", 0, std::chrono::steady_clock::now()});
+    LOG_F(INFO, "S3Backend: queuing prefetch bucket=%s prefix=%s cancellable=%d", bucket.c_str(), prefix.c_str(), cancellable);
+
+    WorkItem item;
+    item.type = WorkItem::Type::ListObjects;
+    item.priority = WorkItem::Priority::Low;
+    item.bucket = bucket;
+    item.prefix = prefix;
+    item.queued_at = std::chrono::steady_clock::now();
+
+    if (cancellable) {
+        // Cancel any previous hover prefetch and create a new cancel flag for this one
+        std::lock_guard<std::mutex> lock(m_hoverCancelMutex);
+        if (m_currentHoverCancelFlag) {
+            m_currentHoverCancelFlag->store(true);
+        }
+        item.cancel_flag = std::make_shared<std::atomic<bool>>(false);
+        m_currentHoverCancelFlag = item.cancel_flag;
+    }
+
+    enqueue(std::move(item));
 }
 
 // Template helpers for queue operations
@@ -271,8 +305,6 @@ void S3Backend::enqueue(WorkItem item) {
         }
         m_highPriorityCv.notify_one();
     } else {
-        // Assign a prefetch ID so we can cancel stale requests
-        item.prefetch_id = ++m_latestPrefetchId;
         {
             std::lock_guard<std::mutex> lock(m_lowPriorityMutex);
             // Push to front so most recent prefetch request is fetched first
@@ -386,7 +418,7 @@ void S3Backend::processWorkItem(WorkItem& item) {
         );
 
         auto http_start = std::chrono::steady_clock::now();
-        std::string response = httpGet(signedReq.url, signedReq.headers, item.prefetch_id);
+        std::string response = httpGet(signedReq.url, signedReq.headers, item.cancel_flag);
         auto http_end = std::chrono::steady_clock::now();
 
         // If cancelled, just return without pushing any event
@@ -447,7 +479,7 @@ void S3Backend::processWorkItem(WorkItem& item) {
         }
 
         auto http_start = std::chrono::steady_clock::now();
-        std::string response = httpGet(signedReq.url, signedReq.headers, item.prefetch_id);
+        std::string response = httpGet(signedReq.url, signedReq.headers, item.cancel_flag);
         auto http_end = std::chrono::steady_clock::now();
 
         // If cancelled, just return without pushing any event
@@ -481,14 +513,9 @@ void S3Backend::processWorkItem(WorkItem& item) {
     }
 }
 
-bool S3Backend::shouldCancelPrefetch(uint64_t prefetch_id) const {
-    // A prefetch should be cancelled if a newer one has been requested
-    return prefetch_id > 0 && prefetch_id < m_latestPrefetchId.load();
-}
-
 std::string S3Backend::httpGet(const std::string& url,
                                const std::map<std::string, std::string>& headers,
-                               uint64_t prefetch_id) {
+                               std::shared_ptr<std::atomic<bool>> cancel_flag) {
     CURL* curl = curl_easy_init();
     if (!curl) return "ERROR: Failed to init curl";
 
@@ -498,12 +525,11 @@ std::string S3Backend::httpGet(const std::string& url,
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
 
-    // For prefetch requests, enable progress callback for cancellation
-    PrefetchProgressData progressData{this, prefetch_id};
-    if (prefetch_id > 0) {
+    // For cancellable requests, enable progress callback to check cancellation
+    if (cancel_flag) {
         curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-        curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, prefetchProgressCallback);
-        curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &progressData);
+        curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, cancelCheckProgressCallback);
+        curl_easy_setopt(curl, CURLOPT_XFERINFODATA, cancel_flag.get());
     }
 
     struct curl_slist* headerList = nullptr;
@@ -521,7 +547,7 @@ std::string S3Backend::httpGet(const std::string& url,
     curl_easy_cleanup(curl);
 
     if (res == CURLE_ABORTED_BY_CALLBACK) {
-        return "CANCELLED";  // Special marker for cancelled prefetch
+        return "CANCELLED";  // Special marker for cancelled request
     }
     if (res != CURLE_OK) {
         return "ERROR: " + std::string(curl_easy_strerror(res));

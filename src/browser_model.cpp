@@ -1,6 +1,5 @@
 #include "browser_model.h"
 #include "loguru.hpp"
-#include <algorithm>
 #include <unordered_set>
 
 BrowserModel::BrowserModel() = default;
@@ -230,9 +229,10 @@ void BrowserModel::prefetchFilePreview(const std::string& bucket, const std::str
 
     // Queue low-priority prefetch - the backend handles cancellation of stale requests.
     // Tracking the hover target ensures we only queue when it changes, not every frame.
+    // cancellable=true so newer hover targets cancel this request.
     m_lastHoveredFile = cacheKey;
     LOG_F(INFO, "Prefetching file preview: bucket=%s key=%s", bucket.c_str(), key.c_str());
-    m_backend->getObject(bucket, key, PREVIEW_MAX_BYTES, true /* lowPriority */);
+    m_backend->getObject(bucket, key, PREVIEW_MAX_BYTES, true /* lowPriority */, true /* cancellable */);
 }
 
 std::string BrowserModel::makePreviewCacheKey(const std::string& bucket, const std::string& key) {
@@ -252,9 +252,10 @@ void BrowserModel::prefetchFolder(const std::string& bucket, const std::string& 
 
     // Queue low-priority prefetch - the backend handles cancellation of stale requests.
     // Tracking the hover target ensures we only queue when it changes, not every frame.
+    // cancellable=true so newer hover targets cancel this request.
     m_lastHoveredFolder = folderKey;
     LOG_F(INFO, "Prefetching folder on hover: bucket=%s prefix=%s", bucket.c_str(), prefix.c_str());
-    m_backend->listObjectsPrefetch(bucket, prefix);
+    m_backend->listObjectsPrefetch(bucket, prefix, true /* cancellable */);
 }
 
 void BrowserModel::clearSelection() {
