@@ -329,8 +329,10 @@ void BrowserUI::renderStatusBar() {
                 status = "Empty folder";
             }
 
-            // Add truncation indicator
-            if (node->is_truncated) {
+            // Add loading/truncation indicator
+            if (node->loading) {
+                status += "  Loading...";
+            } else if (node->is_truncated) {
                 status += "  [more available]";
             }
 

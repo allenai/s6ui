@@ -8,6 +8,7 @@
 #include <map>
 #include <set>
 #include <memory>
+#include <atomic>
 
 // Node representing a folder's contents
 struct FolderNode {
@@ -128,4 +129,9 @@ private:
     // Track current hover targets to avoid re-queueing the same request every frame
     std::string m_lastHoveredFile;    // bucket/key of last hovered file
     std::string m_lastHoveredFolder;  // bucket/prefix of last hovered folder
+
+    // Auto-pagination: cancel flag for current folder's pagination requests
+    // All continuation requests for the current folder share this flag
+    // When navigating away, we set the flag to cancel pending requests
+    std::shared_ptr<std::atomic<bool>> m_paginationCancelFlag;
 };

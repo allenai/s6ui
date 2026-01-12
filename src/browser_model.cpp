@@ -54,6 +54,12 @@ void BrowserModel::refresh() {
     m_lastHoveredFile.clear();
     m_lastHoveredFolder.clear();
 
+    // Cancel any pending pagination requests
+    if (m_paginationCancelFlag) {
+        m_paginationCancelFlag->store(true);
+    }
+    m_paginationCancelFlag.reset();
+
     if (m_backend) {
         m_backend->listBuckets();
     }
@@ -84,11 +90,14 @@ void BrowserModel::loadMore(const std::string& bucket, const std::string& prefix
     auto* node = getNode(bucket, prefix);
     if (!node || !node->is_truncated || node->loading) return;
 
-    LOG_F(INFO, "Loading more objects: bucket=%s prefix=%s", bucket.c_str(), prefix.c_str());
+    LOG_F(INFO, "Loading more objects: bucket=%s prefix=%s token=%s",
+          bucket.c_str(), prefix.c_str(),
+          node->next_continuation_token.empty() ? "(none)" : node->next_continuation_token.substr(0, 20).c_str());
     node->loading = true;
 
     if (m_backend) {
-        m_backend->listObjects(bucket, prefix, node->next_continuation_token);
+        // Use the shared cancel flag so all pagination requests can be cancelled together
+        m_backend->listObjects(bucket, prefix, node->next_continuation_token, m_paginationCancelFlag);
     }
 }
 
@@ -153,11 +162,18 @@ void BrowserModel::navigateInto(const std::string& bucket, const std::string& pr
     setCurrentPath(bucket, prefix);
     loadFolder(bucket, prefix);
 
-    // If folder is already loaded (e.g. from prefetch), trigger prefetch for subfolders now
-    // (since no ObjectsLoaded event will fire)
+    // If folder is already loaded (e.g. from prefetch or returning to a previous folder)
     const auto* node = getNode(bucket, prefix);
     if (node && node->loaded) {
+        // Trigger prefetch for subfolders (since no ObjectsLoaded event will fire)
         triggerPrefetch(bucket, node->objects);
+
+        // Resume pagination if the folder was truncated (we navigated away mid-load)
+        if (node->is_truncated && !node->loading) {
+            LOG_F(INFO, "Resuming pagination for folder: bucket=%s prefix=%s",
+                  bucket.c_str(), prefix.c_str());
+            loadMore(bucket, prefix);
+        }
     }
 }
 
@@ -396,9 +412,11 @@ void BrowserModel::processEvents() {
             }
             case EventType::ObjectsLoaded: {
                 auto& payload = std::get<ObjectsLoadedPayload>(event.payload);
-                LOG_F(INFO, "Event: ObjectsLoaded bucket=%s prefix=%s count=%zu truncated=%d",
+                LOG_F(INFO, "Event: ObjectsLoaded bucket=%s prefix=%s count=%zu truncated=%d total=%zu",
                       payload.bucket.c_str(), payload.prefix.c_str(),
-                      payload.objects.size(), payload.is_truncated);
+                      payload.objects.size(), payload.is_truncated,
+                      getNode(payload.bucket, payload.prefix) ?
+                          getNode(payload.bucket, payload.prefix)->objects.size() + payload.objects.size() : payload.objects.size());
                 auto& node = getOrCreateNode(payload.bucket, payload.prefix);
 
                 // If this is a continuation, append; otherwise replace
@@ -416,8 +434,16 @@ void BrowserModel::processEvents() {
                 node.loaded = true;
                 node.error.clear();
 
-                // Trigger prefetch for subfolders if this is the currently viewed folder
+                // If this is the currently viewed folder, handle auto-pagination and prefetch
                 if (payload.bucket == m_currentBucket && payload.prefix == m_currentPrefix) {
+                    // Auto-continue pagination if there are more results
+                    if (node.is_truncated) {
+                        LOG_F(INFO, "Auto-continuing pagination for current folder: %s/%s",
+                              payload.bucket.c_str(), payload.prefix.c_str());
+                        loadMore(payload.bucket, payload.prefix);
+                    }
+
+                    // Trigger prefetch for subfolders
                     triggerPrefetch(payload.bucket, node.objects);
                 }
                 break;
@@ -496,6 +522,23 @@ std::string BrowserModel::makeNodeKey(const std::string& bucket, const std::stri
 }
 
 void BrowserModel::setCurrentPath(const std::string& bucket, const std::string& prefix) {
+    // If changing folders, cancel any pending pagination requests for the old folder
+    if (bucket != m_currentBucket || prefix != m_currentPrefix) {
+        if (m_paginationCancelFlag) {
+            LOG_F(INFO, "Cancelling pagination for old folder: %s/%s",
+                  m_currentBucket.c_str(), m_currentPrefix.c_str());
+            m_paginationCancelFlag->store(true);
+
+            // Reset loading state for the old folder since we cancelled its requests
+            auto* oldNode = getNode(m_currentBucket, m_currentPrefix);
+            if (oldNode) {
+                oldNode->loading = false;
+            }
+        }
+        // Create a new cancel flag for the new folder's pagination
+        m_paginationCancelFlag = std::make_shared<std::atomic<bool>>(false);
+    }
+
     m_currentBucket = bucket;
     m_currentPrefix = prefix;
 }

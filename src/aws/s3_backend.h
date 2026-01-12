@@ -37,7 +37,8 @@ public:
     void listObjects(
         const std::string& bucket,
         const std::string& prefix,
-        const std::string& continuation_token = ""
+        const std::string& continuation_token = "",
+        std::shared_ptr<std::atomic<bool>> cancel_flag = nullptr
     ) override;
     void getObject(
         const std::string& bucket,

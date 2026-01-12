@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <atomic>
 
 // Abstract backend interface
 // Implementations handle async execution and queue events for the model to poll
@@ -20,10 +21,12 @@ public:
 
     // Request objects in a bucket/prefix
     // continuation_token is empty for first request, or the token from previous response
+    // cancel_flag can be used to cancel in-flight requests (for pagination)
     virtual void listObjects(
         const std::string& bucket,
         const std::string& prefix,
-        const std::string& continuation_token = ""
+        const std::string& continuation_token = "",
+        std::shared_ptr<std::atomic<bool>> cancel_flag = nullptr
     ) = 0;
 
     // Request object content (for preview)

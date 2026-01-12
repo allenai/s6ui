@@ -155,12 +155,14 @@ void S3Backend::listBuckets() {
 void S3Backend::listObjects(
     const std::string& bucket,
     const std::string& prefix,
-    const std::string& continuation_token
+    const std::string& continuation_token,
+    std::shared_ptr<std::atomic<bool>> cancel_flag
 ) {
-    LOG_F(INFO, "S3Backend: queuing listObjects bucket=%s prefix=%s token=%s",
+    LOG_F(INFO, "S3Backend: queuing listObjects bucket=%s prefix=%s token=%s cancellable=%d",
           bucket.c_str(), prefix.c_str(),
-          continuation_token.empty() ? "(none)" : continuation_token.substr(0, 20).c_str());
-    enqueue({WorkItem::Type::ListObjects, WorkItem::Priority::High, bucket, prefix, continuation_token, "", 0, std::chrono::steady_clock::now(), nullptr});
+          continuation_token.empty() ? "(none)" : continuation_token.substr(0, 20).c_str(),
+          cancel_flag != nullptr);
+    enqueue({WorkItem::Type::ListObjects, WorkItem::Priority::High, bucket, prefix, continuation_token, "", 0, std::chrono::steady_clock::now(), cancel_flag});
 }
 
 void S3Backend::getObject(
