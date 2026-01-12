@@ -13,8 +13,9 @@ public:
 
 private:
     void renderTopBar();
-    void renderBucketTree();
-    void renderFolder(const std::string& bucket, const std::string& prefix);
+    void renderContent();
+    void renderBucketList();
+    void renderFolderContents();
 
     static std::string formatSize(int64_t bytes);
     static std::string buildS3Path(const std::string& bucket, const std::string& prefix);

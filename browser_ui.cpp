@@ -1,7 +1,6 @@
 #include "browser_ui.h"
 #include "imgui/imgui.h"
 #include <cstring>
-#include <sstream>
 
 BrowserUI::BrowserUI(BrowserModel& model)
     : m_model(model)
@@ -32,7 +31,7 @@ void BrowserUI::render(int windowWidth, int windowHeight) {
         ImGuiWindowFlags_HorizontalScrollbar |
         ImGuiWindowFlags_AlwaysVerticalScrollbar);
 
-    renderBucketTree();
+    renderContent();
 
     ImGui::EndChild();
 
@@ -94,7 +93,15 @@ void BrowserUI::renderTopBar() {
     }
 }
 
-void BrowserUI::renderBucketTree() {
+void BrowserUI::renderContent() {
+    if (m_model.isAtRoot()) {
+        renderBucketList();
+    } else {
+        renderFolderContents();
+    }
+}
+
+void BrowserUI::renderBucketList() {
     if (m_model.bucketsLoading()) {
         ImGui::TextColored(ImVec4(0.5f, 0.5f, 1.0f, 1.0f), "Loading buckets...");
         return;
@@ -108,92 +115,59 @@ void BrowserUI::renderBucketTree() {
 
     const auto& buckets = m_model.buckets();
 
-    for (const auto& bucket : buckets) {
-        ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow |
-                                   ImGuiTreeNodeFlags_OpenOnDoubleClick;
-
-        // Check for pending expansion
-        auto* bucketNode = m_model.getNode(bucket.name, "");
-        if (bucketNode && bucketNode->pending_expand) {
-            ImGui::SetNextItemOpen(true, ImGuiCond_Always);
-            bucketNode->pending_expand = false;
-        }
-
-        std::string nodeId = "bucket##" + bucket.name;
-        bool bucketOpen = ImGui::TreeNodeEx(nodeId.c_str(), flags,
-            "[B] %s", bucket.name.c_str());
-
-        // Scroll to this bucket if it's the target
-        if (m_model.hasScrollTarget() &&
-            bucket.name == m_model.scrollTargetBucket() &&
-            m_model.scrollTargetPrefix().empty()) {
-            ImGui::SetScrollHereY(0.5f);
-            m_model.clearScrollTarget();
-        }
-
-        if (bucketOpen) {
-            auto* node = m_model.getNode(bucket.name, "");
-            bool needsLoad = !node || (node->objects.empty() && !node->loading && node->error.empty());
-            bool wasExpanded = node && node->expanded;
-
-            if (!wasExpanded) {
-                m_model.expandNode(bucket.name, "");
-            } else if (needsLoad && node && !node->loading) {
-                m_model.expandNode(bucket.name, "");
-            }
-
-            renderFolder(bucket.name, "");
-            ImGui::TreePop();
-        } else {
-            m_model.collapseNode(bucket.name, "");
-        }
-    }
-
     if (buckets.empty()) {
         ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "No buckets found");
+        return;
+    }
+
+    // Render each bucket as a selectable item
+    for (const auto& bucket : buckets) {
+        std::string label = "[B] " + bucket.name;
+        if (ImGui::Selectable(label.c_str())) {
+            m_model.navigateInto(bucket.name, "");
+        }
     }
 }
 
-void BrowserUI::renderFolder(const std::string& bucket, const std::string& prefix) {
+void BrowserUI::renderFolderContents() {
+    const std::string& bucket = m_model.currentBucket();
+    const std::string& prefix = m_model.currentPrefix();
+
+    // Get or load the current folder node
     auto* node = m_model.getNode(bucket, prefix);
-    if (!node) return;
+    if (!node) {
+        // Node doesn't exist yet, trigger load
+        m_model.loadFolder(bucket, prefix);
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 1.0f, 1.0f), "Loading...");
+        return;
+    }
+
+    // Show [..] to navigate up
+    if (ImGui::Selectable("[..]")) {
+        m_model.navigateUp();
+        return;  // Return early to avoid rendering stale content
+    }
+
+    // Show loading indicator
+    if (node->loading && node->objects.empty()) {
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 1.0f, 1.0f), "Loading...");
+        return;
+    }
+
+    // Show error if any
+    if (!node->error.empty()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
+            "Error: %s", node->error.c_str());
+        return;
+    }
 
     // Render folders first
     for (const auto& obj : node->objects) {
         if (!obj.is_folder) continue;
 
-        // Check for pending expansion
-        auto* childNode = m_model.getNode(bucket, obj.key);
-        if (childNode && childNode->pending_expand) {
-            ImGui::SetNextItemOpen(true, ImGuiCond_Always);
-            childNode->pending_expand = false;
-        }
-
-        ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow |
-                                   ImGuiTreeNodeFlags_OpenOnDoubleClick;
-
-        std::string nodeId = "folder##" + bucket + "/" + obj.key;
-        bool nodeOpen = ImGui::TreeNodeEx(nodeId.c_str(), flags,
-            "[D] %s", obj.display_name.c_str());
-
-        // Scroll to this folder if it's the target
-        if (m_model.hasScrollTarget() &&
-            bucket == m_model.scrollTargetBucket() &&
-            obj.key == m_model.scrollTargetPrefix()) {
-            ImGui::SetScrollHereY(0.5f);
-            m_model.clearScrollTarget();
-        }
-
-        if (nodeOpen) {
-            bool wasExpanded = childNode && childNode->expanded;
-            if (!wasExpanded) {
-                m_model.expandNode(bucket, obj.key);
-            }
-
-            renderFolder(bucket, obj.key);
-            ImGui::TreePop();
-        } else {
-            m_model.collapseNode(bucket, obj.key);
+        std::string label = "[D] " + obj.display_name;
+        if (ImGui::Selectable(label.c_str())) {
+            m_model.navigateInto(bucket, obj.key);
         }
     }
 
@@ -201,34 +175,25 @@ void BrowserUI::renderFolder(const std::string& bucket, const std::string& prefi
     for (const auto& obj : node->objects) {
         if (obj.is_folder) continue;
 
-        std::string nodeId = "file##" + bucket + "/" + obj.key;
-        ImGui::TreeNodeEx(nodeId.c_str(),
-            ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen,
-            "    %s  (%s)", obj.display_name.c_str(), formatSize(obj.size).c_str());
+        std::string label = "    " + obj.display_name + "  (" + formatSize(obj.size) + ")";
+        // Files are just displayed, not clickable for navigation
+        ImGui::Selectable(label.c_str(), false, ImGuiSelectableFlags_Disabled);
     }
 
-    // Show loading indicator
+    // Show inline loading indicator if loading more
     if (node->loading) {
-        ImGui::TextColored(ImVec4(0.5f, 0.5f, 1.0f, 1.0f), "  Loading...");
-    }
-
-    // Show error
-    if (!node->error.empty()) {
-        ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
-            "  Error: %s", node->error.c_str());
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 1.0f, 1.0f), "Loading more...");
     }
 
     // Show "Load more" button if truncated
     if (node->is_truncated && !node->loading && !node->next_continuation_token.empty()) {
-        ImGui::Indent();
-        std::string buttonId = "Load more##" + bucket + prefix;
-        if (ImGui::SmallButton(buttonId.c_str())) {
+        ImGui::Spacing();
+        if (ImGui::Button("Load more")) {
             m_model.loadMore(bucket, prefix);
         }
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
             "(%zu items loaded)", node->objects.size());
-        ImGui::Unindent();
     }
 }
 

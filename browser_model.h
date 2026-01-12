@@ -8,7 +8,7 @@
 #include <map>
 #include <memory>
 
-// Node representing a folder in the tree
+// Node representing a folder's contents
 struct FolderNode {
     std::string bucket;
     std::string prefix;
@@ -16,11 +16,8 @@ struct FolderNode {
     std::string next_continuation_token;
     bool is_truncated = false;
     bool loading = false;
+    bool loaded = false;  // True if we've fetched this folder at least once
     std::string error;
-
-    // UI state
-    bool expanded = false;
-    bool pending_expand = false;  // One-shot flag for programmatic expansion
 };
 
 // The browser model - owns state and processes commands
@@ -40,11 +37,15 @@ public:
 
     // Commands (call from UI thread)
     void refresh();
-    void expandNode(const std::string& bucket, const std::string& prefix);
-    void collapseNode(const std::string& bucket, const std::string& prefix);
+    void loadFolder(const std::string& bucket, const std::string& prefix);
     void loadMore(const std::string& bucket, const std::string& prefix);
     void navigateTo(const std::string& s3_path);
+    void navigateUp();
+    void navigateInto(const std::string& bucket, const std::string& prefix);
     void addManualBucket(const std::string& bucket_name);
+
+    // Check if at root (bucket list view)
+    bool isAtRoot() const { return m_currentBucket.empty(); }
 
     // Call once per frame to process pending events from backend
     void processEvents();
@@ -61,12 +62,6 @@ public:
     const std::string& currentBucket() const { return m_currentBucket; }
     const std::string& currentPrefix() const { return m_currentPrefix; }
     void setCurrentPath(const std::string& bucket, const std::string& prefix);
-
-    // Scroll target (for navigation)
-    bool hasScrollTarget() const { return m_scrollToTarget; }
-    const std::string& scrollTargetBucket() const { return m_scrollTargetBucket; }
-    const std::string& scrollTargetPrefix() const { return m_scrollTargetPrefix; }
-    void clearScrollTarget() { m_scrollToTarget = false; }
 
 private:
     FolderNode& getOrCreateNode(const std::string& bucket, const std::string& prefix);
@@ -90,9 +85,4 @@ private:
     // Current navigation path
     std::string m_currentBucket;
     std::string m_currentPrefix;
-
-    // Scroll target
-    bool m_scrollToTarget = false;
-    std::string m_scrollTargetBucket;
-    std::string m_scrollTargetPrefix;
 };

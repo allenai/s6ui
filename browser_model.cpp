@@ -55,28 +55,19 @@ void BrowserModel::refresh() {
     }
 }
 
-void BrowserModel::expandNode(const std::string& bucket, const std::string& prefix) {
+void BrowserModel::loadFolder(const std::string& bucket, const std::string& prefix) {
     auto& node = getOrCreateNode(bucket, prefix);
 
-    if (node.expanded) return;
+    // If already loaded or loading, don't reload
+    if (node.loaded || node.loading) return;
 
-    LOG_F(INFO, "Expanding node: bucket=%s prefix=%s", bucket.c_str(), prefix.c_str());
-    node.expanded = true;
+    LOG_F(INFO, "Loading folder: bucket=%s prefix=%s", bucket.c_str(), prefix.c_str());
     node.objects.clear();
     node.error.clear();
     node.loading = true;
 
-    setCurrentPath(bucket, prefix);
-
     if (m_backend) {
         m_backend->listObjects(bucket, prefix);
-    }
-}
-
-void BrowserModel::collapseNode(const std::string& bucket, const std::string& prefix) {
-    auto* node = getNode(bucket, prefix);
-    if (node) {
-        node->expanded = false;
     }
 }
 
@@ -96,55 +87,59 @@ void BrowserModel::navigateTo(const std::string& s3_path) {
     LOG_F(INFO, "Navigating to: %s", s3_path.c_str());
     std::string bucket, prefix;
     if (!parseS3Path(s3_path, bucket, prefix)) return;
-    if (bucket.empty()) return;
+
+    if (bucket.empty()) {
+        // Navigate to root (bucket list)
+        setCurrentPath("", "");
+        return;
+    }
 
     // Add bucket if not in list
     addManualBucket(bucket);
 
-    // Expand bucket root
-    {
-        auto& node = getOrCreateNode(bucket, "");
-        node.pending_expand = true;
-        node.expanded = true;
-        node.objects.clear();
-        node.loading = true;
+    // Navigate to the specified location
+    navigateInto(bucket, prefix);
+}
+
+void BrowserModel::navigateUp() {
+    if (m_currentBucket.empty()) {
+        // Already at root
+        return;
     }
 
-    // Expand each prefix component
-    if (!prefix.empty()) {
-        std::string currentPrefix;
-        size_t pos = 0;
-        while (pos < prefix.size()) {
-            size_t nextSlash = prefix.find('/', pos);
-            if (nextSlash == std::string::npos) {
-                currentPrefix = prefix;
-                pos = prefix.size();
-            } else {
-                currentPrefix = prefix.substr(0, nextSlash + 1);
-                pos = nextSlash + 1;
-            }
-
-            auto& node = getOrCreateNode(bucket, currentPrefix);
-            node.pending_expand = true;
-            node.expanded = true;
-            node.objects.clear();
-        }
+    if (m_currentPrefix.empty()) {
+        // In a bucket root, go back to bucket list
+        LOG_F(INFO, "Navigating up to bucket list");
+        setCurrentPath("", "");
+        return;
     }
 
+    // Go up one level in the prefix
+    // e.g., "foo/bar/baz/" -> "foo/bar/"
+    std::string newPrefix = m_currentPrefix;
+
+    // Remove trailing slash if present
+    if (!newPrefix.empty() && newPrefix.back() == '/') {
+        newPrefix.pop_back();
+    }
+
+    // Find the last slash
+    size_t lastSlash = newPrefix.rfind('/');
+    if (lastSlash == std::string::npos) {
+        // No more slashes, go to bucket root
+        newPrefix = "";
+    } else {
+        newPrefix = newPrefix.substr(0, lastSlash + 1);
+    }
+
+    LOG_F(INFO, "Navigating up from %s to %s", m_currentPrefix.c_str(), newPrefix.c_str());
+    navigateInto(m_currentBucket, newPrefix);
+}
+
+void BrowserModel::navigateInto(const std::string& bucket, const std::string& prefix) {
+    LOG_F(INFO, "Navigating into: bucket=%s prefix=%s", bucket.c_str(), prefix.c_str());
     setCurrentPath(bucket, prefix);
-
-    // Set scroll target
-    m_scrollToTarget = true;
-    m_scrollTargetBucket = bucket;
-    m_scrollTargetPrefix = prefix;
-
-    // Load bucket root
-    if (m_backend) {
-        m_backend->listObjects(bucket, "");
-        if (!prefix.empty()) {
-            m_backend->listObjects(bucket, prefix);
-        }
-    }
+    loadFolder(bucket, prefix);
 }
 
 void BrowserModel::addManualBucket(const std::string& bucket_name) {
@@ -198,6 +193,7 @@ void BrowserModel::processEvents() {
                 node.next_continuation_token = payload.next_continuation_token;
                 node.is_truncated = payload.is_truncated;
                 node.loading = false;
+                node.loaded = true;
                 node.error.clear();
                 break;
             }
