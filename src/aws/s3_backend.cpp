@@ -724,6 +724,14 @@ void S3Backend::processWorkItem(WorkItem& item) {
                     }
                 }
 
+                // InvalidRange means the file is 0 bytes - return empty content
+                if (errorCode == "InvalidRange") {
+                    LOG_F(INFO, "S3Backend: getObject empty file (InvalidRange) bucket=%s key=%s (total=%lldms http=%lldms)",
+                          item.bucket.c_str(), item.key.c_str(), total_ms, http_ms);
+                    pushEvent(StateEvent::objectContentLoaded(item.bucket, item.key, ""));
+                    return;
+                }
+
                 LOG_F(WARNING, "S3Backend: getObject S3 error: %s (total=%lldms http=%lldms)",
                       error.c_str(), total_ms, http_ms);
                 pushEvent(StateEvent::objectContentError(item.bucket, item.key, error));
