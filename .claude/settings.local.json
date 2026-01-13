@@ -12,7 +12,8 @@
       "Bash(grep:*)",
       "Bash(tree:*)",
       "Bash(./s6ui:*)",
-      "Bash(make:*)"
+      "Bash(make:*)",
+      "Bash(ls:*)"
     ]
   }
 }
