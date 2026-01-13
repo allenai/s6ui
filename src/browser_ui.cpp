@@ -19,7 +19,7 @@ void BrowserUI::render(int windowWidth, int windowHeight) {
     ImGui::SetNextWindowPos(ImVec2(0, 0));
     ImGui::SetNextWindowSize(ImVec2(static_cast<float>(windowWidth),
                                      static_cast<float>(windowHeight)));
-    ImGui::Begin("S3 Browser", nullptr,
+    ImGui::Begin("S6 UI", nullptr,
         ImGuiWindowFlags_NoTitleBar |
         ImGuiWindowFlags_NoResize |
         ImGuiWindowFlags_NoMove |
@@ -514,7 +514,7 @@ bool BrowserUI::isJsonlFile(const std::string& key) {
     return ext == ".json" || ext == ".jsonl" || ext == ".ndjson";
 }
 
-void BrowserUI::renderJsonlViewer(float width, float height) {
+void BrowserUI::renderJsonlViewer(float /*width*/, float /*height*/) {
     auto* sp = m_model.streamingPreview();
     if (!sp) return;
 

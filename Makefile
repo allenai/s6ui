@@ -98,7 +98,7 @@ MAIN_OBJS = $(patsubst $(SRC_DIR)/%.mm,$(BUILD_DIR)/src/%.o,$(MAIN_SOURCES))
 ALL_OBJS = $(IMGUI_OBJS) $(IMGUI_METAL_OBJS) $(LOGURU_OBJS) $(TEXTEDIT_OBJS) $(ZSTD_OBJS) $(AWS_OBJS) $(APP_OBJS) $(MAIN_OBJS)
 
 # Output
-TARGET = s3v
+TARGET = s6ui
 
 # Rules
 all: $(TARGET)

@@ -222,7 +222,7 @@ StreamingFilePreview::StreamingFilePreview(
     const char* tmpdir = std::getenv("TMPDIR");
     if (!tmpdir) tmpdir = "/tmp";
 
-    m_tempFilePath = std::string(tmpdir) + "/s3v_preview_XXXXXX";
+    m_tempFilePath = std::string(tmpdir) + "/s6ui_preview_XXXXXX";
 
     // mkstemp modifies the string in place
     std::vector<char> pathBuf(m_tempFilePath.begin(), m_tempFilePath.end());

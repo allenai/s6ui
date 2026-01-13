@@ -1,9 +1,9 @@
 # Compiled binaries
 imgui_demo
-s3v
+s6ui
 
 # Logs
-s3v.log
+s6ui.log
 
 # Build directory
 build/
