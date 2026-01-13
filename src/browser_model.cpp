@@ -442,10 +442,11 @@ bool BrowserModel::isPreviewSupported(const std::string& key) {
     return supportedExtensions.find(ext) != supportedExtensions.end();
 }
 
-void BrowserModel::processEvents() {
-    if (!m_backend) return;
+bool BrowserModel::processEvents() {
+    if (!m_backend) return false;
 
     auto events = m_backend->takeEvents();
+    if (events.empty()) return false;
 
     for (auto& event : events) {
         switch (event.type) {
@@ -594,6 +595,7 @@ void BrowserModel::processEvents() {
             }
         }
     }
+    return true;
 }
 
 FolderNode* BrowserModel::getNode(const std::string& bucket, const std::string& prefix) {

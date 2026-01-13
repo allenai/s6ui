@@ -78,7 +78,8 @@ public:
     int64_t selectedFileSize() const { return m_selectedFileSize; }
 
     // Call once per frame to process pending events from backend
-    void processEvents();
+    // Returns true if any events were processed (UI should redraw)
+    bool processEvents();
 
     // State accessors (call from UI thread after processEvents)
     const std::vector<S3Bucket>& buckets() const { return m_buckets; }

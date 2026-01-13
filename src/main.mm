@@ -121,15 +121,19 @@ int main(int argc, char* argv[])
 
     ImVec4 clear_color = ImVec4(0.1f, 0.1f, 0.1f, 1.0f);
 
-    // Main loop
+    // Main loop - adaptive frame rate to save CPU
+    bool hadActivity = true;  // Start active to ensure initial render
     while (!glfwWindowShouldClose(window))
     {
         @autoreleasepool
         {
-            glfwPollEvents();
+            // Use adaptive timeout: short when active, longer when idle
+            // This dramatically reduces CPU usage when nothing is happening
+            double timeout = hadActivity ? 0.016 : 0.5;  // 60fps when active, 10fps when idle
+            glfwWaitEventsTimeout(timeout);
 
             // Process any pending events from backend
-            model.processEvents();
+            bool hasBackendEvents = model.processEvents();
 
             // Get framebuffer size for Metal (in pixels)
             int fb_width, fb_height;
@@ -161,6 +165,8 @@ int main(int argc, char* argv[])
             // Render browser UI
             ui.render(win_width, win_height);
 
+            LOG_F(INFO, "Frame");
+
             // Rendering
             ImGui::Render();
             ImDrawData* draw_data = ImGui::GetDrawData();
@@ -174,6 +180,14 @@ int main(int argc, char* argv[])
 
             [commandBuffer presentDrawable:drawable];
             [commandBuffer commit];
+
+            // Track activity for next frame's timeout decision
+            // Stay in fast mode if: backend events, mouse moving/clicking, or keyboard input
+            hadActivity = hasBackendEvents ||
+                          io.WantCaptureMouse ||
+                          io.WantCaptureKeyboard ||
+                          io.MouseDelta.x != 0 || io.MouseDelta.y != 0 ||
+                          io.MouseClicked[0] || io.MouseClicked[1];
         }
     }
 
