@@ -18,5 +18,6 @@ AWSSignedRequest aws_sign_request(
     const std::string& service,
     const std::string& access_key,
     const std::string& secret_key,
-    const std::string& payload = ""
+    const std::string& payload = "",
+    const std::string& session_token = ""
 );

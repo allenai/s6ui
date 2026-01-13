@@ -470,7 +470,8 @@ void S3Backend::processWorkItem(WorkItem& item) {
 
         auto signedReq = aws_sign_request(
             "GET", host, "/", "", m_profile.region, "s3",
-            m_profile.access_key_id, m_profile.secret_access_key
+            m_profile.access_key_id, m_profile.secret_access_key, "",
+            m_profile.session_token
         );
 
         auto http_start = std::chrono::steady_clock::now();
@@ -481,7 +482,7 @@ void S3Backend::processWorkItem(WorkItem& item) {
             auto now = std::chrono::steady_clock::now();
             auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - item.queued_at).count();
             auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
-            LOG_F(WARNING, "S3Backend: listBuckets HTTP error: %s (total=%lldms http=%lldms)",
+            LOG_F(WARNING, "S3Backend: listBuckets HTTP error: %s (total=%ldms http=%ldms)",
                   response.c_str(), total_ms, http_ms);
             pushEvent(StateEvent::bucketsError(response));
         } else {
@@ -490,7 +491,7 @@ void S3Backend::processWorkItem(WorkItem& item) {
                 auto now = std::chrono::steady_clock::now();
                 auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - item.queued_at).count();
                 auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
-                LOG_F(WARNING, "S3Backend: listBuckets S3 error: %s (total=%lldms http=%lldms)",
+                LOG_F(WARNING, "S3Backend: listBuckets S3 error: %s (total=%ldms http=%ldms)",
                       error.c_str(), total_ms, http_ms);
                 pushEvent(StateEvent::bucketsError(error));
             } else {
@@ -500,7 +501,7 @@ void S3Backend::processWorkItem(WorkItem& item) {
                 auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - item.queued_at).count();
                 auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
                 auto parse_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - parse_start).count();
-                LOG_F(INFO, "S3Backend: listBuckets success, got %zu buckets (total=%lldms http=%lldms parse=%lldms)",
+                LOG_F(INFO, "S3Backend: listBuckets success, got %zu buckets (total=%ldms http=%ldms parse=%ldms)",
                       buckets.size(), total_ms, http_ms, parse_ms);
                 pushEvent(StateEvent::bucketsLoaded(std::move(buckets)));
             }
@@ -535,7 +536,8 @@ void S3Backend::processWorkItem(WorkItem& item) {
 
         auto signedReq = aws_sign_request(
             "GET", host, path, query.str(), m_profile.region, "s3",
-            m_profile.access_key_id, m_profile.secret_access_key
+            m_profile.access_key_id, m_profile.secret_access_key, "",
+            m_profile.session_token
         );
 
         auto http_start = std::chrono::steady_clock::now();
@@ -553,7 +555,7 @@ void S3Backend::processWorkItem(WorkItem& item) {
             auto now = std::chrono::steady_clock::now();
             auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - item.queued_at).count();
             auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
-            LOG_F(WARNING, "S3Backend: listObjects HTTP error: %s (total=%lldms http=%lldms)",
+            LOG_F(WARNING, "S3Backend: listObjects HTTP error: %s (total=%ldms http=%ldms)",
                   response.c_str(), total_ms, http_ms);
             pushEvent(StateEvent::objectsError(item.bucket, item.prefix, response));
         } else {
@@ -565,11 +567,11 @@ void S3Backend::processWorkItem(WorkItem& item) {
             auto parse_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - parse_start).count();
 
             if (!result.error.empty()) {
-                LOG_F(WARNING, "S3Backend: listObjects S3 error: %s (total=%lldms http=%lldms parse=%lldms)",
+                LOG_F(WARNING, "S3Backend: listObjects S3 error: %s (total=%ldms http=%ldms parse=%ldms)",
                       result.error.c_str(), total_ms, http_ms, parse_ms);
                 pushEvent(StateEvent::objectsError(item.bucket, item.prefix, result.error));
             } else {
-                LOG_F(INFO, "S3Backend: listObjects success bucket=%s prefix=%s count=%zu truncated=%d (total=%lldms http=%lldms parse=%lldms)",
+                LOG_F(INFO, "S3Backend: listObjects success bucket=%s prefix=%s count=%zu truncated=%d (total=%ldms http=%ldms parse=%ldms)",
                       item.bucket.c_str(), item.prefix.c_str(),
                       result.objects.size(), result.is_truncated, total_ms, http_ms, parse_ms);
                 pushEvent(StateEvent::objectsLoaded(
@@ -600,7 +602,8 @@ void S3Backend::processWorkItem(WorkItem& item) {
 
         auto signedReq = aws_sign_request(
             "GET", host, path, "", m_profile.region, "s3",
-            m_profile.access_key_id, m_profile.secret_access_key
+            m_profile.access_key_id, m_profile.secret_access_key, "",
+            m_profile.session_token
         );
 
         // Add Range header if max_bytes is set (doesn't need to be signed)
@@ -624,18 +627,18 @@ void S3Backend::processWorkItem(WorkItem& item) {
         auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
 
         if (response.find("ERROR:") == 0) {
-            LOG_F(WARNING, "S3Backend: getObject HTTP error: %s (total=%lldms http=%lldms)",
+            LOG_F(WARNING, "S3Backend: getObject HTTP error: %s (total=%ldms http=%ldms)",
                   response.c_str(), total_ms, http_ms);
             pushEvent(StateEvent::objectContentError(item.bucket, item.key, response));
         } else {
             // Check for S3 error in XML response
             std::string error = extractError(response);
             if (!error.empty()) {
-                LOG_F(WARNING, "S3Backend: getObject S3 error: %s (total=%lldms http=%lldms)",
+                LOG_F(WARNING, "S3Backend: getObject S3 error: %s (total=%ldms http=%ldms)",
                       error.c_str(), total_ms, http_ms);
                 pushEvent(StateEvent::objectContentError(item.bucket, item.key, error));
             } else {
-                LOG_F(INFO, "S3Backend: getObject success bucket=%s key=%s size=%zu (total=%lldms http=%lldms)",
+                LOG_F(INFO, "S3Backend: getObject success bucket=%s key=%s size=%zu (total=%ldms http=%ldms)",
                       item.bucket.c_str(), item.key.c_str(), response.size(), total_ms, http_ms);
                 pushEvent(StateEvent::objectContentLoaded(item.bucket, item.key, std::move(response)));
             }
@@ -656,7 +659,8 @@ void S3Backend::processWorkItem(WorkItem& item) {
 
         auto signedReq = aws_sign_request(
             "GET", host, path, "", m_profile.region, "s3",
-            m_profile.access_key_id, m_profile.secret_access_key
+            m_profile.access_key_id, m_profile.secret_access_key, "",
+            m_profile.session_token
         );
 
         // Add Range header
@@ -712,7 +716,7 @@ void S3Backend::processWorkItem(WorkItem& item) {
         auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
 
         if (res != CURLE_OK) {
-            LOG_F(WARNING, "S3Backend: getObjectRange HTTP error: %s (total=%lldms http=%lldms)",
+            LOG_F(WARNING, "S3Backend: getObjectRange HTTP error: %s (total=%ldms http=%ldms)",
                   curl_easy_strerror(res), total_ms, http_ms);
             pushEvent(StateEvent::objectRangeError(item.bucket, item.key, item.start_byte,
                 "ERROR: " + std::string(curl_easy_strerror(res))));
@@ -720,11 +724,11 @@ void S3Backend::processWorkItem(WorkItem& item) {
             // Check for S3 error in XML response
             std::string error = extractError(ctx.body);
             if (!error.empty()) {
-                LOG_F(WARNING, "S3Backend: getObjectRange S3 error: %s (total=%lldms http=%lldms)",
+                LOG_F(WARNING, "S3Backend: getObjectRange S3 error: %s (total=%ldms http=%ldms)",
                       error.c_str(), total_ms, http_ms);
                 pushEvent(StateEvent::objectRangeError(item.bucket, item.key, item.start_byte, error));
             } else {
-                LOG_F(INFO, "S3Backend: getObjectRange success bucket=%s key=%s range=%zu-%zu got=%zu total=%zu (total=%lldms http=%lldms)",
+                LOG_F(INFO, "S3Backend: getObjectRange success bucket=%s key=%s range=%zu-%zu got=%zu total=%zu (total=%ldms http=%ldms)",
                       item.bucket.c_str(), item.key.c_str(), item.start_byte, item.end_byte,
                       ctx.body.size(), ctx.contentRangeTotal, total_ms, http_ms);
                 pushEvent(StateEvent::objectRangeLoaded(item.bucket, item.key, item.start_byte,

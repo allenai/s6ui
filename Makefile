@@ -30,6 +30,7 @@ BUILD_DIR = build
 # Compiler flags for our source code
 CXXFLAGS = -std=c++17 -Wall -Wextra -O2
 CXXFLAGS += -I$(HOMEBREW_PREFIX)/include
+CXXFLAGS += -Iinclude
 CXXFLAGS += -I$(LIBS_DIR)
 CXXFLAGS += -I$(LIBS_DIR)/imgui
 CXXFLAGS += -I$(LIBS_DIR)/loguru
@@ -190,6 +191,7 @@ clean:
 # Debug build with symbols and no optimization
 debug: CXXFLAGS = -std=c++17 -Wall -Wextra -g -O0
 debug: CXXFLAGS += -I$(HOMEBREW_PREFIX)/include
+debug: CXXFLAGS += -Iinclude
 debug: CXXFLAGS += -I$(LIBS_DIR)
 debug: CXXFLAGS += -I$(LIBS_DIR)/imgui
 debug: CXXFLAGS += -I$(LIBS_DIR)/loguru
@@ -209,6 +211,7 @@ debug: clean $(TARGET)
 # Address Sanitizer build (catches memory errors)
 asan: CXXFLAGS = -std=c++17 -Wall -Wextra -g -O1 -fsanitize=address -fno-omit-frame-pointer
 asan: CXXFLAGS += -I$(HOMEBREW_PREFIX)/include
+asan: CXXFLAGS += -Iinclude
 asan: CXXFLAGS += -I$(LIBS_DIR)
 asan: CXXFLAGS += -I$(LIBS_DIR)/imgui
 asan: CXXFLAGS += -I$(LIBS_DIR)/loguru
