@@ -1,6 +1,6 @@
 #include "aws_credentials.h"
 #include "loguru.hpp"
-#include <json.hpp>
+#include "nlohmann/json.hpp"
 #include <fstream>
 #include <sstream>
 #include <cstdlib>
