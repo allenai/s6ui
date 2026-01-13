@@ -184,10 +184,9 @@ int main(int argc, char* argv[])
             // Track activity for next frame's timeout decision
             // Stay in fast mode if: backend events, mouse moving/clicking, or keyboard input
             hadActivity = hasBackendEvents ||
-                          io.WantCaptureMouse ||
-                          io.WantCaptureKeyboard ||
                           io.MouseDelta.x != 0 || io.MouseDelta.y != 0 ||
-                          io.MouseClicked[0] || io.MouseClicked[1];
+                          io.MouseClicked[0] || io.MouseReleased[0] ||
+                          io.MouseClicked[1] || io.MouseReleased[1];
         }
     }
 
