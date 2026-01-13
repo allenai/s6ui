@@ -23,6 +23,56 @@ Just type `./s6ui` to launch it.
 
 You can specify `./s6ui s3://my_bucket/path` to immediately jump to that path.
 
+### AWS Authentication
+
+s6ui supports multiple methods for AWS authentication:
+
+#### Option 1: Static Credentials File
+
+Create or edit `~/.aws/credentials` with your AWS access keys:
+
+```
+[default]
+aws_access_key_id = YOUR_ACCESS_KEY_ID
+aws_secret_access_key = YOUR_SECRET_ACCESS_KEY
+```
+
+You can also define multiple profiles:
+
+```
+[default]
+aws_access_key_id = YOUR_ACCESS_KEY_ID
+aws_secret_access_key = YOUR_SECRET_ACCESS_KEY
+
+[work]
+aws_access_key_id = WORK_ACCESS_KEY_ID
+aws_secret_access_key = WORK_SECRET_ACCESS_KEY
+```
+
+To use a specific profile, set the `AWS_PROFILE` environment variable:
+
+```bash
+AWS_PROFILE=work ./s6ui
+```
+
+#### Option 2: AWS SSO Configuration
+
+Configure AWS SSO using the AWS CLI:
+
+```bash
+aws configure sso
+```
+
+Follow the prompts to set up your SSO profile. This will create configuration in `~/.aws/config`.
+
+To use an SSO profile, set the `AWS_PROFILE` environment variable:
+
+```bash
+AWS_PROFILE=my-sso-profile ./s6ui
+```
+
+s6ui will automatically handle SSO authentication and token refresh as needed.
+
 <!-- start team -->
 
 **s6ui** is developed and maintained by the AllenNLP team, backed by [the Allen Institute for Artificial Intelligence (AI2)](https://allenai.org/).

@@ -66,9 +66,9 @@ int main(int argc, char* argv[])
         LOG_F(INFO, "Using custom endpoint URL: %s", endpointUrl.c_str());
     }
 
-    // Create backend with first profile (if available)
+    // Create backend with selected profile (respects AWS_PROFILE env var)
     if (!model.profiles().empty()) {
-        auto backend = std::make_unique<S3Backend>(model.profiles()[0]);
+        auto backend = std::make_unique<S3Backend>(model.profiles()[model.selectedProfileIndex()]);
         model.setBackend(std::move(backend));
         model.refresh();
     }

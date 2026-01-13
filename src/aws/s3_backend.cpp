@@ -94,6 +94,30 @@ static std::string extractError(const std::string& xml) {
     return "";
 }
 
+// Helper to extract region from an S3 endpoint like "bucket.s3.us-west-2.amazonaws.com"
+static std::string extractRegionFromEndpoint(const std::string& endpoint) {
+    // Expected format: bucket.s3.region.amazonaws.com or bucket.s3-region.amazonaws.com
+    // Find "s3." or "s3-" and extract the region part
+    size_t s3Pos = endpoint.find(".s3.");
+    if (s3Pos == std::string::npos) {
+        s3Pos = endpoint.find(".s3-");
+    }
+    if (s3Pos == std::string::npos) {
+        return "";  // Can't parse
+    }
+
+    // Start after ".s3." or ".s3-"
+    size_t regionStart = s3Pos + 4;
+
+    // Find the next dot (before amazonaws.com)
+    size_t regionEnd = endpoint.find('.', regionStart);
+    if (regionEnd == std::string::npos) {
+        return "";
+    }
+
+    return endpoint.substr(regionStart, regionEnd - regionStart);
+}
+
 // Progress callback for cancellable requests
 static int cancelCheckProgressCallback(void* clientp, curl_off_t /*dltotal*/, curl_off_t /*dlnow*/,
                                        curl_off_t /*ultotal*/, curl_off_t /*ulnow*/) {
@@ -187,7 +211,21 @@ void S3Backend::pushEvent(StateEvent event) {
 void S3Backend::setProfile(const AWSProfile& profile) {
     LOG_F(INFO, "S3Backend: switching profile to %s region=%s",
           profile.name.c_str(), profile.region.c_str());
+
+    // Cancel all pending requests to ensure clean state
+    cancelAll();
+
+    // Copy the profile and refresh credentials from disk
     m_profile = profile;
+    if (!refresh_profile_credentials(m_profile)) {
+        LOG_F(WARNING, "S3Backend: failed to refresh credentials for profile %s, using cached credentials",
+              profile.name.c_str());
+        // Fall back to using the provided profile as-is
+        m_profile = profile;
+    }
+
+    LOG_F(INFO, "S3Backend: profile switched to %s region=%s",
+          m_profile.name.c_str(), m_profile.region.c_str());
 }
 
 void S3Backend::listBuckets() {
@@ -470,7 +508,8 @@ void S3Backend::processWorkItem(WorkItem& item) {
 
         auto signedReq = aws_sign_request(
             "GET", host, "/", "", m_profile.region, "s3",
-            m_profile.access_key_id, m_profile.secret_access_key
+            m_profile.access_key_id, m_profile.secret_access_key, "",
+            m_profile.session_token
         );
 
         auto http_start = std::chrono::steady_clock::now();
@@ -507,56 +546,65 @@ void S3Backend::processWorkItem(WorkItem& item) {
         }
     }
     else if (item.type == WorkItem::Type::ListObjects) {
-        std::string host;
-        std::string path;
-        if (!m_profile.endpoint_url.empty()) {
-            // Path-style: endpoint/bucket
-            host = parseEndpointHost(m_profile.endpoint_url);
-            path = "/" + item.bucket;
-        } else {
-            // Virtual-host style: bucket.s3.region.amazonaws.com
-            host = item.bucket + ".s3." + m_profile.region + ".amazonaws.com";
-            path = "/";
-        }
-        LOG_F(1, "S3Backend: fetching objects bucket=%s prefix=%s host=%s path=%s",
-              item.bucket.c_str(), item.prefix.c_str(), host.c_str(), path.c_str());
+        std::string region = m_profile.region;
+        bool retried = false;
 
-        // Build query string
-        std::ostringstream query;
-        query << "list-type=2";
-        query << "&delimiter=" << urlEncode("/");
-        query << "&max-keys=1000";
-        if (!item.prefix.empty()) {
-            query << "&prefix=" << urlEncode(item.prefix);
-        }
-        if (!item.continuation_token.empty()) {
-            query << "&continuation-token=" << urlEncode(item.continuation_token);
-        }
+        // Retry loop for handling PermanentRedirect
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            std::string host;
+            std::string path;
+            if (!m_profile.endpoint_url.empty()) {
+                // Path-style: endpoint/bucket
+                host = parseEndpointHost(m_profile.endpoint_url);
+                path = "/" + item.bucket;
+            } else {
+                // Virtual-host style: bucket.s3.region.amazonaws.com
+                host = item.bucket + ".s3." + region + ".amazonaws.com";
+                path = "/";
+            }
+            LOG_F(1, "S3Backend: fetching objects bucket=%s prefix=%s host=%s path=%s region=%s%s",
+                  item.bucket.c_str(), item.prefix.c_str(), host.c_str(), path.c_str(), region.c_str(),
+                  retried ? " (retry)" : "");
 
-        auto signedReq = aws_sign_request(
-            "GET", host, path, query.str(), m_profile.region, "s3",
-            m_profile.access_key_id, m_profile.secret_access_key
-        );
+            // Build query string
+            std::ostringstream query;
+            query << "list-type=2";
+            query << "&delimiter=" << urlEncode("/");
+            query << "&max-keys=1000";
+            if (!item.prefix.empty()) {
+                query << "&prefix=" << urlEncode(item.prefix);
+            }
+            if (!item.continuation_token.empty()) {
+                query << "&continuation-token=" << urlEncode(item.continuation_token);
+            }
 
-        auto http_start = std::chrono::steady_clock::now();
-        std::string response = httpGet(signedReq.url, signedReq.headers, item.cancel_flag);
-        auto http_end = std::chrono::steady_clock::now();
+            auto signedReq = aws_sign_request(
+                "GET", host, path, query.str(), region, "s3",
+                m_profile.access_key_id, m_profile.secret_access_key, "",
+                m_profile.session_token
+            );
 
-        // If cancelled, just return without pushing any event
-        if (response == "CANCELLED") {
-            LOG_F(INFO, "S3Backend: listObjects cancelled bucket=%s prefix=%s (superseded by newer request)",
-                  item.bucket.c_str(), item.prefix.c_str());
-            return;
-        }
+            auto http_start = std::chrono::steady_clock::now();
+            std::string response = httpGet(signedReq.url, signedReq.headers, item.cancel_flag);
+            auto http_end = std::chrono::steady_clock::now();
 
-        if (response.find("ERROR:") == 0) {
-            auto now = std::chrono::steady_clock::now();
-            auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - item.queued_at).count();
-            auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
-            LOG_F(WARNING, "S3Backend: listObjects HTTP error: %s (total=%lldms http=%lldms)",
-                  response.c_str(), total_ms, http_ms);
-            pushEvent(StateEvent::objectsError(item.bucket, item.prefix, response));
-        } else {
+            // If cancelled, just return without pushing any event
+            if (response == "CANCELLED") {
+                LOG_F(INFO, "S3Backend: listObjects cancelled bucket=%s prefix=%s (superseded by newer request)",
+                      item.bucket.c_str(), item.prefix.c_str());
+                return;
+            }
+
+            if (response.find("ERROR:") == 0) {
+                auto now = std::chrono::steady_clock::now();
+                auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - item.queued_at).count();
+                auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
+                LOG_F(WARNING, "S3Backend: listObjects HTTP error: %s (total=%lldms http=%lldms)",
+                      response.c_str(), total_ms, http_ms);
+                pushEvent(StateEvent::objectsError(item.bucket, item.prefix, response));
+                return;
+            }
+
             auto parse_start = std::chrono::steady_clock::now();
             auto result = parseListObjectsXml(response);
             auto now = std::chrono::steady_clock::now();
@@ -565,171 +613,246 @@ void S3Backend::processWorkItem(WorkItem& item) {
             auto parse_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - parse_start).count();
 
             if (!result.error.empty()) {
+                // Check for PermanentRedirect error
+                std::string errorCode = extractTag(response, "Code");
+                if (errorCode == "PermanentRedirect" && attempt == 0) {
+                    // Extract the correct endpoint and retry
+                    std::string correctEndpoint = extractTag(response, "Endpoint");
+                    if (!correctEndpoint.empty()) {
+                        std::string correctRegion = extractRegionFromEndpoint(correctEndpoint);
+                        if (!correctRegion.empty()) {
+                            LOG_F(INFO, "S3Backend: detected PermanentRedirect, retrying with region=%s (was %s)",
+                                  correctRegion.c_str(), region.c_str());
+                            region = correctRegion;
+                            retried = true;
+                            continue;  // Retry with corrected region
+                        }
+                    }
+                }
+
                 LOG_F(WARNING, "S3Backend: listObjects S3 error: %s (total=%lldms http=%lldms parse=%lldms)",
                       result.error.c_str(), total_ms, http_ms, parse_ms);
                 pushEvent(StateEvent::objectsError(item.bucket, item.prefix, result.error));
-            } else {
-                LOG_F(INFO, "S3Backend: listObjects success bucket=%s prefix=%s count=%zu truncated=%d (total=%lldms http=%lldms parse=%lldms)",
-                      item.bucket.c_str(), item.prefix.c_str(),
-                      result.objects.size(), result.is_truncated, total_ms, http_ms, parse_ms);
-                pushEvent(StateEvent::objectsLoaded(
-                    item.bucket,
-                    item.prefix,
-                    item.continuation_token,
-                    std::move(result.objects),
-                    result.next_continuation_token,
-                    result.is_truncated
-                ));
+                return;
             }
+
+            LOG_F(INFO, "S3Backend: listObjects success bucket=%s prefix=%s count=%zu truncated=%d (total=%lldms http=%lldms parse=%lldms)",
+                  item.bucket.c_str(), item.prefix.c_str(),
+                  result.objects.size(), result.is_truncated, total_ms, http_ms, parse_ms);
+            pushEvent(StateEvent::objectsLoaded(
+                item.bucket,
+                item.prefix,
+                item.continuation_token,
+                std::move(result.objects),
+                result.next_continuation_token,
+                result.is_truncated
+            ));
+            return;  // Success
         }
     }
     else if (item.type == WorkItem::Type::GetObject) {
-        std::string host;
-        std::string path;
-        if (!m_profile.endpoint_url.empty()) {
-            // Path-style: endpoint/bucket/key
-            host = parseEndpointHost(m_profile.endpoint_url);
-            path = "/" + item.bucket + "/" + item.key;
-        } else {
-            // Virtual-host style: bucket.s3.region.amazonaws.com/key
-            host = item.bucket + ".s3." + m_profile.region + ".amazonaws.com";
-            path = "/" + item.key;
-        }
-        LOG_F(1, "S3Backend: fetching object bucket=%s key=%s max_bytes=%zu host=%s path=%s",
-              item.bucket.c_str(), item.key.c_str(), item.max_bytes, host.c_str(), path.c_str());
+        std::string region = m_profile.region;
+        bool retried = false;
 
-        auto signedReq = aws_sign_request(
-            "GET", host, path, "", m_profile.region, "s3",
-            m_profile.access_key_id, m_profile.secret_access_key
-        );
+        // Retry loop for handling PermanentRedirect
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            std::string host;
+            std::string path;
+            if (!m_profile.endpoint_url.empty()) {
+                // Path-style: endpoint/bucket/key
+                host = parseEndpointHost(m_profile.endpoint_url);
+                path = "/" + item.bucket + "/" + item.key;
+            } else {
+                // Virtual-host style: bucket.s3.region.amazonaws.com/key
+                host = item.bucket + ".s3." + region + ".amazonaws.com";
+                path = "/" + item.key;
+            }
+            LOG_F(1, "S3Backend: fetching object bucket=%s key=%s max_bytes=%zu host=%s path=%s region=%s%s",
+                  item.bucket.c_str(), item.key.c_str(), item.max_bytes, host.c_str(), path.c_str(), region.c_str(),
+                  retried ? " (retry)" : "");
 
-        // Add Range header if max_bytes is set (doesn't need to be signed)
-        if (item.max_bytes > 0) {
-            signedReq.headers["Range"] = "bytes=0-" + std::to_string(item.max_bytes - 1);
-        }
+            auto signedReq = aws_sign_request(
+                "GET", host, path, "", region, "s3",
+                m_profile.access_key_id, m_profile.secret_access_key, "",
+                m_profile.session_token
+            );
 
-        auto http_start = std::chrono::steady_clock::now();
-        std::string response = httpGet(signedReq.url, signedReq.headers, item.cancel_flag);
-        auto http_end = std::chrono::steady_clock::now();
+            // Add Range header if max_bytes is set (doesn't need to be signed)
+            if (item.max_bytes > 0) {
+                signedReq.headers["Range"] = "bytes=0-" + std::to_string(item.max_bytes - 1);
+            }
 
-        // If cancelled, just return without pushing any event
-        if (response == "CANCELLED") {
-            LOG_F(INFO, "S3Backend: getObject cancelled bucket=%s key=%s (superseded by newer request)",
-                  item.bucket.c_str(), item.key.c_str());
-            return;
-        }
+            auto http_start = std::chrono::steady_clock::now();
+            std::string response = httpGet(signedReq.url, signedReq.headers, item.cancel_flag);
+            auto http_end = std::chrono::steady_clock::now();
 
-        auto now = std::chrono::steady_clock::now();
-        auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - item.queued_at).count();
-        auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
+            // If cancelled, just return without pushing any event
+            if (response == "CANCELLED") {
+                LOG_F(INFO, "S3Backend: getObject cancelled bucket=%s key=%s (superseded by newer request)",
+                      item.bucket.c_str(), item.key.c_str());
+                return;
+            }
 
-        if (response.find("ERROR:") == 0) {
-            LOG_F(WARNING, "S3Backend: getObject HTTP error: %s (total=%lldms http=%lldms)",
-                  response.c_str(), total_ms, http_ms);
-            pushEvent(StateEvent::objectContentError(item.bucket, item.key, response));
-        } else {
+            auto now = std::chrono::steady_clock::now();
+            auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - item.queued_at).count();
+            auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
+
+            if (response.find("ERROR:") == 0) {
+                LOG_F(WARNING, "S3Backend: getObject HTTP error: %s (total=%lldms http=%lldms)",
+                      response.c_str(), total_ms, http_ms);
+                pushEvent(StateEvent::objectContentError(item.bucket, item.key, response));
+                return;
+            }
+
             // Check for S3 error in XML response
             std::string error = extractError(response);
             if (!error.empty()) {
+                // Check for PermanentRedirect error
+                std::string errorCode = extractTag(response, "Code");
+                if (errorCode == "PermanentRedirect" && attempt == 0) {
+                    // Extract the correct endpoint and retry
+                    std::string correctEndpoint = extractTag(response, "Endpoint");
+                    if (!correctEndpoint.empty()) {
+                        std::string correctRegion = extractRegionFromEndpoint(correctEndpoint);
+                        if (!correctRegion.empty()) {
+                            LOG_F(INFO, "S3Backend: detected PermanentRedirect, retrying with region=%s (was %s)",
+                                  correctRegion.c_str(), region.c_str());
+                            region = correctRegion;
+                            retried = true;
+                            continue;  // Retry with corrected region
+                        }
+                    }
+                }
+
                 LOG_F(WARNING, "S3Backend: getObject S3 error: %s (total=%lldms http=%lldms)",
                       error.c_str(), total_ms, http_ms);
                 pushEvent(StateEvent::objectContentError(item.bucket, item.key, error));
-            } else {
-                LOG_F(INFO, "S3Backend: getObject success bucket=%s key=%s size=%zu (total=%lldms http=%lldms)",
-                      item.bucket.c_str(), item.key.c_str(), response.size(), total_ms, http_ms);
-                pushEvent(StateEvent::objectContentLoaded(item.bucket, item.key, std::move(response)));
+                return;
             }
+
+            LOG_F(INFO, "S3Backend: getObject success bucket=%s key=%s size=%zu (total=%lldms http=%lldms)",
+                  item.bucket.c_str(), item.key.c_str(), response.size(), total_ms, http_ms);
+            pushEvent(StateEvent::objectContentLoaded(item.bucket, item.key, std::move(response)));
+            return;  // Success
         }
     }
     else if (item.type == WorkItem::Type::GetObjectRange) {
-        std::string host;
-        std::string path;
-        if (!m_profile.endpoint_url.empty()) {
-            host = parseEndpointHost(m_profile.endpoint_url);
-            path = "/" + item.bucket + "/" + item.key;
-        } else {
-            host = item.bucket + ".s3." + m_profile.region + ".amazonaws.com";
-            path = "/" + item.key;
-        }
-        LOG_F(1, "S3Backend: fetching object range bucket=%s key=%s range=%zu-%zu host=%s path=%s",
-              item.bucket.c_str(), item.key.c_str(), item.start_byte, item.end_byte, host.c_str(), path.c_str());
+        std::string region = m_profile.region;
+        bool retried = false;
 
-        auto signedReq = aws_sign_request(
-            "GET", host, path, "", m_profile.region, "s3",
-            m_profile.access_key_id, m_profile.secret_access_key
-        );
+        // Retry loop for handling PermanentRedirect
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            std::string host;
+            std::string path;
+            if (!m_profile.endpoint_url.empty()) {
+                host = parseEndpointHost(m_profile.endpoint_url);
+                path = "/" + item.bucket + "/" + item.key;
+            } else {
+                host = item.bucket + ".s3." + region + ".amazonaws.com";
+                path = "/" + item.key;
+            }
+            LOG_F(1, "S3Backend: fetching object range bucket=%s key=%s range=%zu-%zu host=%s path=%s region=%s%s",
+                  item.bucket.c_str(), item.key.c_str(), item.start_byte, item.end_byte, host.c_str(), path.c_str(), region.c_str(),
+                  retried ? " (retry)" : "");
 
-        // Add Range header
-        signedReq.headers["Range"] = "bytes=" + std::to_string(item.start_byte) + "-" + std::to_string(item.end_byte);
+            auto signedReq = aws_sign_request(
+                "GET", host, path, "", region, "s3",
+                m_profile.access_key_id, m_profile.secret_access_key, "",
+                m_profile.session_token
+            );
 
-        // Use httpGetWithContext to capture Content-Range header
-        auto http_start = std::chrono::steady_clock::now();
+            // Add Range header
+            signedReq.headers["Range"] = "bytes=" + std::to_string(item.start_byte) + "-" + std::to_string(item.end_byte);
 
-        CURL* curl = curl_easy_init();
-        if (!curl) {
-            pushEvent(StateEvent::objectRangeError(item.bucket, item.key, item.start_byte, "ERROR: Failed to init curl"));
-            return;
-        }
+            // Use httpGetWithContext to capture Content-Range header
+            auto http_start = std::chrono::steady_clock::now();
 
-        HttpResponseContext ctx;
-        curl_easy_setopt(curl, CURLOPT_URL, signedReq.url.c_str());
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallbackCtx);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
-        curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, headerCallback);
-        curl_easy_setopt(curl, CURLOPT_HEADERDATA, &ctx);
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);  // Longer timeout for larger chunks
+            CURL* curl = curl_easy_init();
+            if (!curl) {
+                pushEvent(StateEvent::objectRangeError(item.bucket, item.key, item.start_byte, "ERROR: Failed to init curl"));
+                return;
+            }
 
-        if (item.cancel_flag) {
-            curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-            curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, cancelCheckProgressCallback);
-            curl_easy_setopt(curl, CURLOPT_XFERINFODATA, item.cancel_flag.get());
-        }
+            HttpResponseContext ctx;
+            curl_easy_setopt(curl, CURLOPT_URL, signedReq.url.c_str());
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallbackCtx);
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
+            curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, headerCallback);
+            curl_easy_setopt(curl, CURLOPT_HEADERDATA, &ctx);
+            curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);  // Longer timeout for larger chunks
 
-        struct curl_slist* headerList = nullptr;
-        for (const auto& [key, value] : signedReq.headers) {
-            std::string header = key + ": " + value;
-            headerList = curl_slist_append(headerList, header.c_str());
-        }
-        if (headerList) {
-            curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headerList);
-        }
+            if (item.cancel_flag) {
+                curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+                curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, cancelCheckProgressCallback);
+                curl_easy_setopt(curl, CURLOPT_XFERINFODATA, item.cancel_flag.get());
+            }
 
-        CURLcode res = curl_easy_perform(curl);
+            struct curl_slist* headerList = nullptr;
+            for (const auto& [key, value] : signedReq.headers) {
+                std::string header = key + ": " + value;
+                headerList = curl_slist_append(headerList, header.c_str());
+            }
+            if (headerList) {
+                curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headerList);
+            }
 
-        if (headerList) curl_slist_free_all(headerList);
-        curl_easy_cleanup(curl);
+            CURLcode res = curl_easy_perform(curl);
 
-        auto http_end = std::chrono::steady_clock::now();
+            if (headerList) curl_slist_free_all(headerList);
+            curl_easy_cleanup(curl);
 
-        if (res == CURLE_ABORTED_BY_CALLBACK) {
-            LOG_F(INFO, "S3Backend: getObjectRange cancelled bucket=%s key=%s",
-                  item.bucket.c_str(), item.key.c_str());
-            return;
-        }
+            auto http_end = std::chrono::steady_clock::now();
 
-        auto now = std::chrono::steady_clock::now();
-        auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - item.queued_at).count();
-        auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
+            if (res == CURLE_ABORTED_BY_CALLBACK) {
+                LOG_F(INFO, "S3Backend: getObjectRange cancelled bucket=%s key=%s",
+                      item.bucket.c_str(), item.key.c_str());
+                return;
+            }
 
-        if (res != CURLE_OK) {
-            LOG_F(WARNING, "S3Backend: getObjectRange HTTP error: %s (total=%lldms http=%lldms)",
-                  curl_easy_strerror(res), total_ms, http_ms);
-            pushEvent(StateEvent::objectRangeError(item.bucket, item.key, item.start_byte,
-                "ERROR: " + std::string(curl_easy_strerror(res))));
-        } else {
+            auto now = std::chrono::steady_clock::now();
+            auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - item.queued_at).count();
+            auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
+
+            if (res != CURLE_OK) {
+                LOG_F(WARNING, "S3Backend: getObjectRange HTTP error: %s (total=%lldms http=%lldms)",
+                      curl_easy_strerror(res), total_ms, http_ms);
+                pushEvent(StateEvent::objectRangeError(item.bucket, item.key, item.start_byte,
+                    "ERROR: " + std::string(curl_easy_strerror(res))));
+                return;
+            }
+
             // Check for S3 error in XML response
             std::string error = extractError(ctx.body);
             if (!error.empty()) {
+                // Check for PermanentRedirect error
+                std::string errorCode = extractTag(ctx.body, "Code");
+                if (errorCode == "PermanentRedirect" && attempt == 0) {
+                    // Extract the correct endpoint and retry
+                    std::string correctEndpoint = extractTag(ctx.body, "Endpoint");
+                    if (!correctEndpoint.empty()) {
+                        std::string correctRegion = extractRegionFromEndpoint(correctEndpoint);
+                        if (!correctRegion.empty()) {
+                            LOG_F(INFO, "S3Backend: detected PermanentRedirect, retrying with region=%s (was %s)",
+                                  correctRegion.c_str(), region.c_str());
+                            region = correctRegion;
+                            retried = true;
+                            continue;  // Retry with corrected region
+                        }
+                    }
+                }
+
                 LOG_F(WARNING, "S3Backend: getObjectRange S3 error: %s (total=%lldms http=%lldms)",
                       error.c_str(), total_ms, http_ms);
                 pushEvent(StateEvent::objectRangeError(item.bucket, item.key, item.start_byte, error));
-            } else {
-                LOG_F(INFO, "S3Backend: getObjectRange success bucket=%s key=%s range=%zu-%zu got=%zu total=%zu (total=%lldms http=%lldms)",
-                      item.bucket.c_str(), item.key.c_str(), item.start_byte, item.end_byte,
-                      ctx.body.size(), ctx.contentRangeTotal, total_ms, http_ms);
-                pushEvent(StateEvent::objectRangeLoaded(item.bucket, item.key, item.start_byte,
-                    ctx.contentRangeTotal, std::move(ctx.body)));
+                return;
             }
+
+            LOG_F(INFO, "S3Backend: getObjectRange success bucket=%s key=%s range=%zu-%zu got=%zu total=%zu (total=%lldms http=%lldms)",
+                  item.bucket.c_str(), item.key.c_str(), item.start_byte, item.end_byte,
+                  ctx.body.size(), ctx.contentRangeTotal, total_ms, http_ms);
+            pushEvent(StateEvent::objectRangeLoaded(item.bucket, item.key, item.start_byte,
+                ctx.contentRangeTotal, std::move(ctx.body)));
+            return;  // Success
         }
     }
 }

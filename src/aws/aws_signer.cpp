@@ -93,7 +93,8 @@ AWSSignedRequest aws_sign_request(
     const std::string& service,
     const std::string& access_key,
     const std::string& secret_key,
-    const std::string& payload
+    const std::string& payload,
+    const std::string& session_token
 ) {
     std::string timestamp = get_timestamp();
     std::string date = get_date(timestamp);
@@ -112,9 +113,15 @@ AWSSignedRequest aws_sign_request(
     canonical_headers_ss << "host:" << host << "\n";
     canonical_headers_ss << "x-amz-content-sha256:" << payload_hash << "\n";
     canonical_headers_ss << "x-amz-date:" << timestamp << "\n";
+    if (!session_token.empty()) {
+        canonical_headers_ss << "x-amz-security-token:" << session_token << "\n";
+    }
     std::string canonical_headers = canonical_headers_ss.str();
 
     std::string signed_headers = "host;x-amz-content-sha256;x-amz-date";
+    if (!session_token.empty()) {
+        signed_headers += ";x-amz-security-token";
+    }
 
     // Canonical request
     std::ostringstream canonical_request_ss;
@@ -167,6 +174,9 @@ AWSSignedRequest aws_sign_request(
     result.headers["x-amz-date"] = timestamp;
     result.headers["x-amz-content-sha256"] = payload_hash;
     result.headers["Authorization"] = authorization;
+    if (!session_token.empty()) {
+        result.headers["x-amz-security-token"] = session_token;
+    }
 
     return result;
 }
