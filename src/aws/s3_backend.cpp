@@ -29,10 +29,33 @@ static size_t streamingWriteCallback(void* contents, size_t size, size_t nmemb, 
         return 0;  // Abort transfer
     }
 
-    // Append to streaming file
-    ssize_t written = ctx->state->file.append(contents, total);
-    if (written < 0) {
-        return 0;  // Error
+    // Track compressed bytes received from network
+    ctx->state->compressed_received.fetch_add(total, std::memory_order_relaxed);
+
+    ssize_t written = 0;
+
+    if (ctx->state->is_gzipped) {
+        // Decompress the data before writing
+        auto decompressed = ctx->state->decompressor.decompress(contents, total);
+
+        if (ctx->state->decompressor.hasError()) {
+            LOG_F(ERROR, "Gzip decompression error: %s",
+                  ctx->state->decompressor.errorMessage().c_str());
+            return 0;  // Error - abort transfer
+        }
+
+        if (!decompressed.empty()) {
+            written = ctx->state->file.append(decompressed.data(), decompressed.size());
+            if (written < 0) {
+                return 0;  // Error
+            }
+        }
+    } else {
+        // Append raw data to streaming file
+        written = ctx->state->file.append(contents, total);
+        if (written < 0) {
+            return 0;  // Error
+        }
     }
 
     size_t bytes_now = ctx->state->bytes_received.fetch_add(written, std::memory_order_relaxed) + written;
@@ -58,7 +81,8 @@ static size_t streamingWriteCallback(void* contents, size_t size, size_t nmemb, 
         ctx->last_event_time = now;
     }
 
-    return written;
+    // Return total to indicate we consumed all input bytes (even if decompressed to more/less)
+    return total;
 }
 
 static std::string extractTag(const std::string& xml, const std::string& tag) {
@@ -614,6 +638,22 @@ void S3Backend::processWorkItem(WorkItem& item) {
         if (!state.file.create()) {
             pushEvent(StateEvent::objectStreamError(item.bucket, item.key, "Failed to create temp file", 0));
             return;
+        }
+
+        // Check if file is gzip compressed (has .gz extension with valid base extension)
+        if (item.key.size() > 3) {
+            std::string ext = item.key.substr(item.key.size() - 3);
+            for (char& c : ext) c = std::tolower(static_cast<unsigned char>(c));
+            if (ext == ".gz") {
+                state.is_gzipped = true;
+                if (!state.decompressor.init()) {
+                    pushEvent(StateEvent::objectStreamError(item.bucket, item.key,
+                        "Failed to init gzip decompressor", 0));
+                    return;
+                }
+                LOG_F(INFO, "S3Backend: streaming gzip-compressed file bucket=%s key=%s",
+                      item.bucket.c_str(), item.key.c_str());
+            }
         }
 
         std::string host = item.bucket + ".s3." + m_profile.region + ".amazonaws.com";

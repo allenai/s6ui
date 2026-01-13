@@ -395,7 +395,6 @@ void BrowserUI::renderStreamingPreview(const std::string& filename) {
 
     // Get the two data sources
     const std::string& initialContent = m_model.streamingPreviewInitialContent();
-    const char* streamingData = m_model.streamingPreviewData();
     size_t streamingSize = m_model.streamingPreviewFileSize();
 
     // Progress indicator
@@ -467,11 +466,14 @@ void BrowserUI::renderStreamingPreview(const std::string& filename) {
             content.append(initialContent, 0, initialToUse);
         }
 
-        // Add streaming data (the rest of the file)
+        // Add streaming data (the rest of the file) - use thread-safe copy
         size_t remainingSpace = displaySize - content.size();
-        if (remainingSpace > 0 && streamingData && streamingSize > 0) {
+        if (remainingSpace > 0 && streamingSize > 0) {
             size_t streamingToUse = std::min(streamingSize, remainingSpace);
-            content.append(streamingData, streamingToUse);
+            size_t oldSize = content.size();
+            content.resize(oldSize + streamingToUse);
+            size_t copied = m_model.copyStreamingPreviewData(content.data() + oldSize, streamingToUse);
+            content.resize(oldSize + copied);  // Adjust if less was copied
         }
 
         if (loaded > MAX_DISPLAY) {

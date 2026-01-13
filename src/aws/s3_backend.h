@@ -2,6 +2,7 @@
 
 #include "../backend.h"
 #include "../streaming_file.h"
+#include "../gzip_decompressor.h"
 #include "aws_credentials.h"
 #include <string>
 #include <vector>
@@ -97,9 +98,12 @@ public:
     struct StreamingState {
         StreamingFile file;
         std::atomic<bool> cancelled{false};
-        std::atomic<size_t> bytes_received{0};
+        std::atomic<size_t> bytes_received{0};        // Decompressed bytes written
+        std::atomic<size_t> compressed_received{0};   // Compressed bytes from network
         std::string bucket;
         std::string key;
+        bool is_gzipped = false;                      // True if file needs decompression
+        GzipDecompressor decompressor;                // Decompressor (only used if is_gzipped)
     };
 
     // Public for use by streaming callback - emits a chunk event

@@ -35,10 +35,16 @@ public:
     size_t mappedSize() const { return std::min(m_mapped_size, m_size.load(std::memory_order_acquire)); }
 
     // Get read-only pointer to mapped data
-    // Safe to call from UI thread while backend is still appending
+    // WARNING: This pointer can become invalid if remap() is called!
+    // For thread-safe access, use copyData() instead.
     // Returns nullptr if not mapped or empty
     // IMPORTANT: Only read up to mappedSize() bytes, not size() bytes!
     const char* data() const { return m_mapped_data; }
+
+    // Thread-safe copy of mapped data
+    // Copies up to maxBytes from the mapped region into dest
+    // Returns number of bytes actually copied
+    size_t copyData(char* dest, size_t maxBytes) const;
 
     // Update the memory mapping to include newly written data
     // Must be called after append() to make new data visible to readers

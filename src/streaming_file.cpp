@@ -168,6 +168,23 @@ bool StreamingFile::remap() {
     return true;
 }
 
+size_t StreamingFile::copyData(char* dest, size_t maxBytes) const {
+    std::lock_guard<std::mutex> lock(m_remap_mutex);
+
+    if (!m_mapped_data || maxBytes == 0) {
+        return 0;
+    }
+
+    size_t available = mappedSize();
+    size_t toCopy = std::min(available, maxBytes);
+
+    if (toCopy > 0) {
+        std::memcpy(dest, m_mapped_data, toCopy);
+    }
+
+    return toCopy;
+}
+
 void StreamingFile::close() {
     // Unmap first
     if (m_mapped_data) {

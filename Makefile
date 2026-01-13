@@ -39,6 +39,7 @@ LIBS_OBJCXXFLAGS = $(LIBS_CXXFLAGS) -fobjc-arc
 LDFLAGS = -L$(HOMEBREW_PREFIX)/lib
 LDFLAGS += -lglfw
 LDFLAGS += -lcurl
+LDFLAGS += -lz
 LDFLAGS += -framework Metal
 LDFLAGS += -framework MetalKit
 LDFLAGS += -framework Cocoa
@@ -70,7 +71,8 @@ AWS_SOURCES = $(AWS_DIR)/aws_credentials.cpp \
 
 APP_SOURCES = $(SRC_DIR)/browser_model.cpp \
               $(SRC_DIR)/browser_ui.cpp \
-              $(SRC_DIR)/streaming_file.cpp
+              $(SRC_DIR)/streaming_file.cpp \
+              $(SRC_DIR)/gzip_decompressor.cpp
 
 MAIN_SOURCES = $(SRC_DIR)/main.mm
 

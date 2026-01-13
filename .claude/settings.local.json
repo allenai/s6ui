@@ -11,7 +11,8 @@
       "Bash(curl:*)",
       "Bash(grep:*)",
       "Bash(tree:*)",
-      "Bash(./s3v:*)"
+      "Bash(./s3v:*)",
+      "Bash(make asan:*)"
     ]
   }
 }

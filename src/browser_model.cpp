@@ -194,7 +194,16 @@ void BrowserModel::selectFile(const std::string& bucket, const std::string& key)
         // Check if we have cached content from prefetch
         std::string cacheKey = makePreviewCacheKey(bucket, key);
         auto it = m_previewCache.find(cacheKey);
-        if (it != m_previewCache.end()) {
+        bool useCache = (it != m_previewCache.end());
+
+        // For gzip files, the cache contains compressed data which can't be displayed directly.
+        // We need to stream from the beginning to decompress properly.
+        if (useCache && isGzipFile(key)) {
+            LOG_F(INFO, "Gzip file detected, ignoring cache and streaming from beginning: %s", key.c_str());
+            useCache = false;
+        }
+
+        if (useCache) {
             const auto& entry = it->second;
             LOG_F(INFO, "Using cached preview for bucket=%s key=%s (size=%zu total=%lld complete=%d)",
                   bucket.c_str(), key.c_str(), entry.content.size(),
@@ -260,6 +269,10 @@ void BrowserModel::prefetchFilePreview(const std::string& bucket, const std::str
     // Only prefetch supported file types
     if (!isPreviewSupported(key)) return;
 
+    // Skip gzip files - the compressed data can't be used for preview
+    // (gzip files need to be streamed from the beginning for decompression)
+    if (isGzipFile(key)) return;
+
     // Skip if already cached
     std::string cacheKey = makePreviewCacheKey(bucket, key);
     if (m_previewCache.find(cacheKey) != m_previewCache.end()) return;
@@ -310,15 +323,12 @@ void BrowserModel::clearSelection() {
     m_previewSupported = false;
 }
 
-const char* BrowserModel::streamingPreviewData() const {
-    if (!m_streamingPreview.active) {
-        return nullptr;
+size_t BrowserModel::copyStreamingPreviewData(char* dest, size_t maxBytes) const {
+    if (!m_streamingPreview.active || !m_streamingPreview.state) {
+        return 0;
     }
-    // Use the stored streaming state (keeps the StreamingFile alive)
-    if (m_streamingPreview.state && m_streamingPreview.state->file.data()) {
-        return m_streamingPreview.state->file.data();
-    }
-    return nullptr;
+    // Thread-safe copy from the streaming file
+    return m_streamingPreview.state->file.copyData(dest, maxBytes);
 }
 
 size_t BrowserModel::streamingPreviewFileSize() const {
@@ -350,6 +360,21 @@ bool BrowserModel::isPreviewSupported(const std::string& key) {
     // Convert to lowercase
     for (char& c : ext) {
         c = std::tolower(static_cast<unsigned char>(c));
+    }
+
+    // Handle .gz compressed files - check if base extension is supported
+    if (ext == ".gz" && dotPos > 0) {
+        // Find the extension before .gz
+        size_t prevDotPos = key.rfind('.', dotPos - 1);
+        if (prevDotPos != std::string::npos) {
+            std::string baseExt = key.substr(prevDotPos, dotPos - prevDotPos);
+            for (char& c : baseExt) {
+                c = std::tolower(static_cast<unsigned char>(c));
+            }
+            ext = baseExt;  // Use the base extension for lookup
+        } else {
+            return false;  // No base extension (e.g., "file.gz")
+        }
     }
 
     // Supported text extensions
@@ -443,6 +468,13 @@ bool BrowserModel::isPreviewSupported(const std::string& key) {
     };
 
     return supportedExtensions.find(ext) != supportedExtensions.end();
+}
+
+bool BrowserModel::isGzipFile(const std::string& key) {
+    if (key.size() <= 3) return false;
+    std::string ext = key.substr(key.size() - 3);
+    for (char& c : ext) c = std::tolower(static_cast<unsigned char>(c));
+    return ext == ".gz";
 }
 
 void BrowserModel::processEvents() {
