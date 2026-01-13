@@ -66,7 +66,7 @@ public:
     const std::string& selectedBucket() const { return m_selectedBucket; }
     const std::string& selectedKey() const { return m_selectedKey; }
     bool previewLoading() const { return m_previewLoading; }
-    const std::string& previewContent() const { return m_previewContent; }
+    std::string previewContent() const;  // Returns from StreamingFilePreview if available
     const std::string& previewError() const { return m_previewError; }
     bool previewSupported() const { return m_previewSupported; }
 
@@ -144,6 +144,9 @@ private:
     std::set<std::string> m_pendingObjectRequests;  // Track requests until event processed
     static std::string makePreviewCacheKey(const std::string& bucket, const std::string& key);
     static constexpr size_t PREVIEW_MAX_BYTES = 64 * 1024;  // 64KB
+
+    // Gzip helper
+    static bool isGzipped(const std::string& key);
 
     // Track current hover targets to avoid re-queueing the same request every frame
     std::string m_lastHoveredFile;    // bucket/key of last hovered file

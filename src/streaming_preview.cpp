@@ -6,15 +6,141 @@
 #include <cstdlib>
 #include <cstring>
 
+// ============================================================================
+// GzipTransform implementation
+// ============================================================================
+
+GzipTransform::GzipTransform() {
+    memset(&m_zstream, 0, sizeof(m_zstream));
+
+    // 16 + MAX_WBITS tells zlib to detect gzip or zlib format automatically
+    int ret = inflateInit2(&m_zstream, 16 + MAX_WBITS);
+    if (ret != Z_OK) {
+        LOG_F(ERROR, "GzipTransform: inflateInit2 failed with code %d", ret);
+        m_error = true;
+        return;
+    }
+
+    m_initialized = true;
+    LOG_F(INFO, "GzipTransform: initialized successfully");
+}
+
+GzipTransform::~GzipTransform() {
+    if (m_initialized) {
+        inflateEnd(&m_zstream);
+        m_initialized = false;
+    }
+}
+
+std::string GzipTransform::transform(const char* data, size_t len) {
+    if (!m_initialized || m_error || len == 0) {
+        return "";
+    }
+
+    std::string output;
+    output.reserve(len * 2);  // Guess: decompressed is ~2x compressed
+
+    // Set up input
+    m_zstream.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(data));
+    m_zstream.avail_in = static_cast<uInt>(len);
+
+    // Decompress in chunks
+    char outbuf[32768];  // 32KB output buffer
+
+    do {
+        m_zstream.next_out = reinterpret_cast<Bytef*>(outbuf);
+        m_zstream.avail_out = sizeof(outbuf);
+
+        int ret = inflate(&m_zstream, Z_NO_FLUSH);
+
+        if (ret == Z_STREAM_ERROR) {
+            LOG_F(ERROR, "GzipTransform: Z_STREAM_ERROR");
+            m_error = true;
+            return output;
+        }
+
+        switch (ret) {
+            case Z_NEED_DICT:
+            case Z_DATA_ERROR:
+            case Z_MEM_ERROR:
+                LOG_F(ERROR, "GzipTransform: inflate error %d: %s",
+                      ret, m_zstream.msg ? m_zstream.msg : "unknown");
+                m_error = true;
+                return output;
+        }
+
+        size_t have = sizeof(outbuf) - m_zstream.avail_out;
+        output.append(outbuf, have);
+
+        // Z_STREAM_END means we've finished decompressing
+        if (ret == Z_STREAM_END) {
+            LOG_F(INFO, "GzipTransform: reached end of compressed stream");
+            break;
+        }
+
+    } while (m_zstream.avail_out == 0);
+
+    return output;
+}
+
+std::string GzipTransform::flush() {
+    if (!m_initialized || m_error) {
+        return "";
+    }
+
+    std::string output;
+    char outbuf[32768];
+
+    // Try to flush any remaining data
+    m_zstream.next_in = nullptr;
+    m_zstream.avail_in = 0;
+
+    do {
+        m_zstream.next_out = reinterpret_cast<Bytef*>(outbuf);
+        m_zstream.avail_out = sizeof(outbuf);
+
+        int ret = inflate(&m_zstream, Z_FINISH);
+
+        if (ret == Z_STREAM_ERROR) {
+            LOG_F(ERROR, "GzipTransform::flush: Z_STREAM_ERROR");
+            m_error = true;
+            break;
+        }
+
+        size_t have = sizeof(outbuf) - m_zstream.avail_out;
+        if (have > 0) {
+            output.append(outbuf, have);
+        }
+
+        if (ret == Z_STREAM_END) {
+            break;
+        }
+
+        // Z_BUF_ERROR is OK here - just means no more output available
+        if (ret == Z_BUF_ERROR) {
+            break;
+        }
+
+    } while (m_zstream.avail_out == 0);
+
+    LOG_F(INFO, "GzipTransform::flush: produced %zu bytes", output.size());
+    return output;
+}
+
+// ============================================================================
+// StreamingFilePreview implementation
+// ============================================================================
+
 StreamingFilePreview::StreamingFilePreview(
     const std::string& bucket,
     const std::string& key,
     const std::string& initialData,
-    size_t totalFileSize)
+    size_t totalFileSize,
+    std::unique_ptr<IStreamTransform> transform)
     : m_bucket(bucket)
     , m_key(key)
     , m_totalSourceSize(totalFileSize)
-    , m_transform(std::make_unique<PassThroughTransform>())
+    , m_transform(transform ? std::move(transform) : std::make_unique<PassThroughTransform>())
 {
     // Create temp file
     const char* tmpdir = std::getenv("TMPDIR");
@@ -246,4 +372,23 @@ bool StreamingFilePreview::isLineComplete(size_t lineIndex) const {
 
     // This is the last known line - it's only complete if file is fully downloaded
     return m_complete;
+}
+
+std::string StreamingFilePreview::getAllContent() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    if (m_fd < 0 || m_bytesWritten == 0) {
+        return "";
+    }
+
+    std::string content(m_bytesWritten, '\0');
+
+    ssize_t bytesRead = pread(m_fd, content.data(), m_bytesWritten, 0);
+    if (bytesRead < 0) {
+        LOG_F(ERROR, "StreamingFilePreview::getAllContent: pread failed: %s", strerror(errno));
+        return "";
+    }
+
+    content.resize(static_cast<size_t>(bytesRead));
+    return content;
 }

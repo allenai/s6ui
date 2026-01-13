@@ -39,6 +39,7 @@ LIBS_OBJCXXFLAGS = $(LIBS_CXXFLAGS) -fobjc-arc
 LDFLAGS = -L$(HOMEBREW_PREFIX)/lib
 LDFLAGS += -lglfw
 LDFLAGS += -lcurl
+LDFLAGS += -lz
 LDFLAGS += -framework Metal
 LDFLAGS += -framework MetalKit
 LDFLAGS += -framework Cocoa

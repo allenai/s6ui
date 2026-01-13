@@ -491,13 +491,24 @@ std::string BrowserUI::buildS3Path(const std::string& bucket, const std::string&
 }
 
 bool BrowserUI::isJsonlFile(const std::string& key) {
-    // Check for .jsonl or .ndjson extension
+    // Check for .jsonl or .ndjson extension (also handles .jsonl.gz, .ndjson.gz)
     size_t dotPos = key.rfind('.');
     if (dotPos == std::string::npos) return false;
 
     std::string ext = key.substr(dotPos);
     for (char& c : ext) {
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+
+    // If it's a .gz file, check the inner extension
+    if (ext == ".gz" && dotPos > 0) {
+        std::string withoutGz = key.substr(0, dotPos);
+        size_t innerDotPos = withoutGz.rfind('.');
+        if (innerDotPos == std::string::npos) return false;
+        ext = withoutGz.substr(innerDotPos);
+        for (char& c : ext) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
     }
 
     return ext == ".jsonl" || ext == ".ndjson";

@@ -4,6 +4,7 @@
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <zlib.h>
 
 // Abstract interface for data transformation (decompression, etc.)
 // Data flows: S3 chunks -> IStreamTransform -> temp file
@@ -28,13 +29,36 @@ public:
     std::string flush() override { return ""; }
 };
 
+// Gzip decompression transform
+class GzipTransform : public IStreamTransform {
+public:
+    GzipTransform();
+    ~GzipTransform();
+
+    // Non-copyable
+    GzipTransform(const GzipTransform&) = delete;
+    GzipTransform& operator=(const GzipTransform&) = delete;
+
+    std::string transform(const char* data, size_t len) override;
+    std::string flush() override;
+
+    bool hasError() const { return m_error; }
+
+private:
+    z_stream m_zstream;
+    bool m_initialized = false;
+    bool m_error = false;
+};
+
 // Manages streaming download of a file to a temp file with newline indexing
 class StreamingFilePreview {
 public:
     // Initialize with the first chunk (typically 64KB preview)
     // totalFileSize is the size of the compressed/raw file on S3
+    // Optionally pass a transform (e.g., GzipTransform) to decompress data
     StreamingFilePreview(const std::string& bucket, const std::string& key,
-                         const std::string& initialData, size_t totalFileSize);
+                         const std::string& initialData, size_t totalFileSize,
+                         std::unique_ptr<IStreamTransform> transform = nullptr);
     ~StreamingFilePreview();
 
     // Non-copyable
@@ -66,6 +90,9 @@ public:
 
     // Get the raw content of a line (before any JSON formatting)
     std::string getRawLine(size_t lineIndex) const { return getLine(lineIndex); }
+
+    // Get all content written so far (for non-line-based viewers)
+    std::string getAllContent() const;
 
     // Check if a line is complete (has a terminating newline or is at end of completed file)
     bool isLineComplete(size_t lineIndex) const;

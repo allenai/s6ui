@@ -187,6 +187,15 @@ void BrowserModel::addManualBucket(const std::string& bucket_name) {
     m_buckets.push_back(std::move(newBucket));
 }
 
+std::string BrowserModel::previewContent() const {
+    // If we have a streaming preview, return its decompressed content
+    if (m_streamingPreview) {
+        return m_streamingPreview->getAllContent();
+    }
+    // Otherwise return the raw preview content
+    return m_previewContent;
+}
+
 void BrowserModel::selectFile(const std::string& bucket, const std::string& key) {
     // If same file is already selected, do nothing
     if (m_selectedBucket == bucket && m_selectedKey == key) {
@@ -224,8 +233,10 @@ void BrowserModel::selectFile(const std::string& bucket, const std::string& key)
             m_previewContent = it->second;
             m_previewLoading = false;
 
-            // If file is larger than preview, start streaming
-            if (static_cast<size_t>(m_selectedFileSize) > STREAMING_THRESHOLD) {
+            // Start streaming for gzipped files or large files
+            bool needsStreaming = isGzipped(key) ||
+                static_cast<size_t>(m_selectedFileSize) > STREAMING_THRESHOLD;
+            if (needsStreaming) {
                 startStreamingDownload(static_cast<size_t>(m_selectedFileSize));
             }
             return;
@@ -275,6 +286,13 @@ std::string BrowserModel::makePreviewCacheKey(const std::string& bucket, const s
     return bucket + "/" + key;
 }
 
+bool BrowserModel::isGzipped(const std::string& key) {
+    if (key.size() < 3) return false;
+    std::string ext = key.substr(key.size() - 3);
+    for (char& c : ext) c = std::tolower(static_cast<unsigned char>(c));
+    return ext == ".gz";
+}
+
 void BrowserModel::prefetchFolder(const std::string& bucket, const std::string& prefix) {
     if (!m_backend) return;
 
@@ -315,6 +333,20 @@ bool BrowserModel::isPreviewSupported(const std::string& key) {
     // Convert to lowercase
     for (char& c : ext) {
         c = std::tolower(static_cast<unsigned char>(c));
+    }
+
+    // If it's a .gz file, check the underlying extension
+    if (ext == ".gz" && dotPos > 0) {
+        // Strip .gz and find the real extension
+        std::string withoutGz = key.substr(0, dotPos);
+        size_t innerDotPos = withoutGz.rfind('.');
+        if (innerDotPos == std::string::npos) {
+            return false;  // No inner extension (e.g., just "file.gz")
+        }
+        ext = withoutGz.substr(innerDotPos);
+        for (char& c : ext) {
+            c = std::tolower(static_cast<unsigned char>(c));
+        }
     }
 
     // Supported text extensions
@@ -484,7 +516,7 @@ void BrowserModel::processEvents() {
                 LOG_F(INFO, "Event: ObjectContentLoaded bucket=%s key=%s size=%zu",
                       payload.bucket.c_str(), payload.key.c_str(), payload.content.size());
 
-                // Cache the content for future use
+                // Cache the raw content for future use
                 std::string cacheKey = makePreviewCacheKey(payload.bucket, payload.key);
                 m_previewCache[cacheKey] = payload.content;
                 m_pendingObjectRequests.erase(cacheKey);
@@ -495,9 +527,14 @@ void BrowserModel::processEvents() {
                     m_previewLoading = false;
                     m_previewError.clear();
 
-                    // If file is larger than the preview we got, start streaming
-                    if (static_cast<size_t>(m_selectedFileSize) > STREAMING_THRESHOLD &&
-                        static_cast<size_t>(m_selectedFileSize) > payload.content.size()) {
+                    // Start streaming for:
+                    // 1. Gzipped files (always, for transparent decompression)
+                    // 2. Large files that need more data
+                    bool needsStreaming = isGzipped(payload.key) ||
+                        (static_cast<size_t>(m_selectedFileSize) > STREAMING_THRESHOLD &&
+                         static_cast<size_t>(m_selectedFileSize) > payload.content.size());
+
+                    if (needsStreaming) {
                         startStreamingDownload(static_cast<size_t>(m_selectedFileSize));
                     }
                 }
@@ -681,9 +718,20 @@ void BrowserModel::startStreamingDownload(size_t totalFileSize) {
     LOG_F(INFO, "Starting streaming download: bucket=%s key=%s totalSize=%zu",
           m_selectedBucket.c_str(), m_selectedKey.c_str(), totalFileSize);
 
+    // Check if the file is gzipped and needs decompression
+    std::unique_ptr<IStreamTransform> transform;
+    if (m_selectedKey.size() >= 3) {
+        std::string ext = m_selectedKey.substr(m_selectedKey.size() - 3);
+        for (char& c : ext) c = std::tolower(static_cast<unsigned char>(c));
+        if (ext == ".gz") {
+            LOG_F(INFO, "Using GzipTransform for gzipped file: %s", m_selectedKey.c_str());
+            transform = std::make_unique<GzipTransform>();
+        }
+    }
+
     // Create streaming preview with the initial preview content
     m_streamingPreview = std::make_unique<StreamingFilePreview>(
-        m_selectedBucket, m_selectedKey, m_previewContent, totalFileSize);
+        m_selectedBucket, m_selectedKey, m_previewContent, totalFileSize, std::move(transform));
 
     m_streamingEnabled = true;
     m_streamingCancelFlag = std::make_shared<std::atomic<bool>>(false);
