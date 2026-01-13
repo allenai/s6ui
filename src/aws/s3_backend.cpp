@@ -390,6 +390,9 @@ bool S3Backend::boostFromLowToHigh(Predicate pred) {
     if (found) {
         // Move to high priority queue
         foundItem.priority = WorkItem::Priority::High;
+        // Clear cancel flag - once user explicitly navigates/selects, don't allow
+        // cancellation by subsequent hover prefetches
+        foundItem.cancel_flag.reset();
         {
             std::lock_guard<std::mutex> lock(m_highPriorityMutex);
             m_highPriorityQueue.push_front(std::move(foundItem));
