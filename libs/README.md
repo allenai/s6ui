@@ -15,3 +15,7 @@ License: Unlicense (Public Domain)
 # nlohmann
 Source: https://github.com/nlohmann/json
 License: MIT
+
+# zstd
+Source: https://github.com/facebook/zstd/tree/v1.5.7/build/single_file_libs
+License: BSD

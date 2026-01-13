@@ -335,15 +335,15 @@ bool BrowserModel::isPreviewSupported(const std::string& key) {
         c = std::tolower(static_cast<unsigned char>(c));
     }
 
-    // If it's a .gz file, check the underlying extension
-    if (ext == ".gz" && dotPos > 0) {
-        // Strip .gz and find the real extension
-        std::string withoutGz = key.substr(0, dotPos);
-        size_t innerDotPos = withoutGz.rfind('.');
+    // If it's a compressed file (.gz, .zst, .zstd), check the underlying extension
+    if ((ext == ".gz" || ext == ".zst" || ext == ".zstd") && dotPos > 0) {
+        // Strip compression extension and find the real extension
+        std::string withoutCompression = key.substr(0, dotPos);
+        size_t innerDotPos = withoutCompression.rfind('.');
         if (innerDotPos == std::string::npos) {
             return false;  // No inner extension (e.g., just "file.gz")
         }
-        ext = withoutGz.substr(innerDotPos);
+        ext = withoutCompression.substr(innerDotPos);
         for (char& c : ext) {
             c = std::tolower(static_cast<unsigned char>(c));
         }
@@ -718,14 +718,19 @@ void BrowserModel::startStreamingDownload(size_t totalFileSize) {
     LOG_F(INFO, "Starting streaming download: bucket=%s key=%s totalSize=%zu",
           m_selectedBucket.c_str(), m_selectedKey.c_str(), totalFileSize);
 
-    // Check if the file is gzipped and needs decompression
+    // Check if the file is compressed and needs decompression
     std::unique_ptr<IStreamTransform> transform;
-    if (m_selectedKey.size() >= 3) {
-        std::string ext = m_selectedKey.substr(m_selectedKey.size() - 3);
+    size_t dotPos = m_selectedKey.rfind('.');
+    if (dotPos != std::string::npos) {
+        std::string ext = m_selectedKey.substr(dotPos);
         for (char& c : ext) c = std::tolower(static_cast<unsigned char>(c));
+
         if (ext == ".gz") {
             LOG_F(INFO, "Using GzipTransform for gzipped file: %s", m_selectedKey.c_str());
             transform = std::make_unique<GzipTransform>();
+        } else if (ext == ".zst" || ext == ".zstd") {
+            LOG_F(INFO, "Using ZstdTransform for zstd file: %s", m_selectedKey.c_str());
+            transform = std::make_unique<ZstdTransform>();
         }
     }
 

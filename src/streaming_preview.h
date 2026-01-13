@@ -5,6 +5,7 @@
 #include <memory>
 #include <mutex>
 #include <zlib.h>
+#include <zstd.h>
 
 // Abstract interface for data transformation (decompression, etc.)
 // Data flows: S3 chunks -> IStreamTransform -> temp file
@@ -47,6 +48,26 @@ public:
 private:
     z_stream m_zstream;
     bool m_initialized = false;
+    bool m_error = false;
+};
+
+// Zstd decompression transform
+class ZstdTransform : public IStreamTransform {
+public:
+    ZstdTransform();
+    ~ZstdTransform();
+
+    // Non-copyable
+    ZstdTransform(const ZstdTransform&) = delete;
+    ZstdTransform& operator=(const ZstdTransform&) = delete;
+
+    std::string transform(const char* data, size_t len) override;
+    std::string flush() override;
+
+    bool hasError() const { return m_error; }
+
+private:
+    ZSTD_DStream* m_dstream = nullptr;
     bool m_error = false;
 };
 

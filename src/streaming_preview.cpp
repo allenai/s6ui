@@ -128,6 +128,82 @@ std::string GzipTransform::flush() {
 }
 
 // ============================================================================
+// ZstdTransform implementation
+// ============================================================================
+
+ZstdTransform::ZstdTransform() {
+    m_dstream = ZSTD_createDStream();
+    if (!m_dstream) {
+        LOG_F(ERROR, "ZstdTransform: ZSTD_createDStream failed");
+        m_error = true;
+        return;
+    }
+
+    size_t ret = ZSTD_initDStream(m_dstream);
+    if (ZSTD_isError(ret)) {
+        LOG_F(ERROR, "ZstdTransform: ZSTD_initDStream failed: %s", ZSTD_getErrorName(ret));
+        m_error = true;
+        return;
+    }
+
+    LOG_F(INFO, "ZstdTransform: initialized successfully");
+}
+
+ZstdTransform::~ZstdTransform() {
+    if (m_dstream) {
+        ZSTD_freeDStream(m_dstream);
+        m_dstream = nullptr;
+    }
+}
+
+std::string ZstdTransform::transform(const char* data, size_t len) {
+    if (!m_dstream || m_error || len == 0) {
+        return "";
+    }
+
+    std::string output;
+    output.reserve(len * 4);  // Guess: decompressed is ~4x compressed
+
+    ZSTD_inBuffer input = { data, len, 0 };
+
+    // Decompress in chunks
+    const size_t outBufSize = ZSTD_DStreamOutSize();
+    std::vector<char> outbuf(outBufSize);
+
+    while (input.pos < input.size) {
+        ZSTD_outBuffer outBuffer = { outbuf.data(), outbuf.size(), 0 };
+
+        size_t ret = ZSTD_decompressStream(m_dstream, &outBuffer, &input);
+
+        if (ZSTD_isError(ret)) {
+            LOG_F(ERROR, "ZstdTransform: ZSTD_decompressStream error: %s", ZSTD_getErrorName(ret));
+            m_error = true;
+            return output;
+        }
+
+        if (outBuffer.pos > 0) {
+            output.append(outbuf.data(), outBuffer.pos);
+        }
+
+        // ret == 0 means end of frame, but there might be more frames
+        // Continue processing input
+    }
+
+    return output;
+}
+
+std::string ZstdTransform::flush() {
+    // For zstd streaming, all data should be flushed during transform()
+    // This is called when stream completes, nothing special needed
+    if (!m_dstream || m_error) {
+        return "";
+    }
+
+    LOG_F(INFO, "ZstdTransform::flush: stream complete");
+    return "";
+}
+
+// ============================================================================
 // StreamingFilePreview implementation
 // ============================================================================
 

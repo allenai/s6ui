@@ -491,7 +491,7 @@ std::string BrowserUI::buildS3Path(const std::string& bucket, const std::string&
 }
 
 bool BrowserUI::isJsonlFile(const std::string& key) {
-    // Check for .jsonl or .ndjson extension (also handles .jsonl.gz, .ndjson.gz)
+    // Check for .jsonl or .ndjson extension (also handles compressed variants)
     size_t dotPos = key.rfind('.');
     if (dotPos == std::string::npos) return false;
 
@@ -500,18 +500,18 @@ bool BrowserUI::isJsonlFile(const std::string& key) {
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     }
 
-    // If it's a .gz file, check the inner extension
-    if (ext == ".gz" && dotPos > 0) {
-        std::string withoutGz = key.substr(0, dotPos);
-        size_t innerDotPos = withoutGz.rfind('.');
+    // If it's a compressed file (.gz, .zst, .zstd), check the inner extension
+    if ((ext == ".gz" || ext == ".zst" || ext == ".zstd") && dotPos > 0) {
+        std::string withoutCompression = key.substr(0, dotPos);
+        size_t innerDotPos = withoutCompression.rfind('.');
         if (innerDotPos == std::string::npos) return false;
-        ext = withoutGz.substr(innerDotPos);
+        ext = withoutCompression.substr(innerDotPos);
         for (char& c : ext) {
             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         }
     }
 
-    return ext == ".jsonl" || ext == ".ndjson";
+    return ext == ".json" || ext == ".jsonl" || ext == ".ndjson";
 }
 
 void BrowserUI::renderJsonlViewer(float width, float height) {
