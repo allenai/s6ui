@@ -193,12 +193,27 @@ void BrowserModel::selectFile(const std::string& bucket, const std::string& key)
         return;
     }
 
+    // Cancel any existing streaming download
+    cancelStreamingDownload();
+
     LOG_F(INFO, "Selecting file: bucket=%s key=%s", bucket.c_str(), key.c_str());
     m_selectedBucket = bucket;
     m_selectedKey = key;
     m_previewContent.clear();
     m_previewError.clear();
     m_previewSupported = isPreviewSupported(key);
+
+    // Find the file size from the folder node
+    m_selectedFileSize = 0;
+    const auto* node = getNode(m_currentBucket, m_currentPrefix);
+    if (node) {
+        for (const auto& obj : node->objects) {
+            if (!obj.is_folder && obj.key == key) {
+                m_selectedFileSize = obj.size;
+                break;
+            }
+        }
+    }
 
     if (m_previewSupported && m_backend) {
         // Check if we have cached content from prefetch
@@ -208,6 +223,11 @@ void BrowserModel::selectFile(const std::string& bucket, const std::string& key)
             LOG_F(INFO, "Using cached preview for bucket=%s key=%s", bucket.c_str(), key.c_str());
             m_previewContent = it->second;
             m_previewLoading = false;
+
+            // If file is larger than preview, start streaming
+            if (static_cast<size_t>(m_selectedFileSize) > STREAMING_THRESHOLD) {
+                startStreamingDownload(static_cast<size_t>(m_selectedFileSize));
+            }
             return;
         }
 
@@ -275,8 +295,10 @@ void BrowserModel::prefetchFolder(const std::string& bucket, const std::string& 
 }
 
 void BrowserModel::clearSelection() {
+    cancelStreamingDownload();
     m_selectedBucket.clear();
     m_selectedKey.clear();
+    m_selectedFileSize = 0;
     m_previewContent.clear();
     m_previewError.clear();
     m_previewLoading = false;
@@ -469,9 +491,15 @@ void BrowserModel::processEvents() {
 
                 // Update preview if this is the selected file
                 if (payload.bucket == m_selectedBucket && payload.key == m_selectedKey) {
-                    m_previewContent = std::move(payload.content);
+                    m_previewContent = payload.content;
                     m_previewLoading = false;
                     m_previewError.clear();
+
+                    // If file is larger than the preview we got, start streaming
+                    if (static_cast<size_t>(m_selectedFileSize) > STREAMING_THRESHOLD &&
+                        static_cast<size_t>(m_selectedFileSize) > payload.content.size()) {
+                        startStreamingDownload(static_cast<size_t>(m_selectedFileSize));
+                    }
                 }
                 break;
             }
@@ -488,6 +516,42 @@ void BrowserModel::processEvents() {
                 if (payload.bucket == m_selectedBucket && payload.key == m_selectedKey) {
                     m_previewLoading = false;
                     m_previewError = payload.error_message;
+                }
+                break;
+            }
+            case EventType::ObjectRangeLoaded: {
+                auto& payload = std::get<ObjectRangeLoadedPayload>(event.payload);
+                LOG_F(INFO, "Event: ObjectRangeLoaded bucket=%s key=%s offset=%zu size=%zu total=%zu",
+                      payload.bucket.c_str(), payload.key.c_str(),
+                      payload.startByte, payload.data.size(), payload.totalSize);
+
+                // Only process if this is for the current streaming preview
+                if (m_streamingPreview &&
+                    payload.bucket == m_streamingPreview->bucket() &&
+                    payload.key == m_streamingPreview->key()) {
+
+                    m_streamingPreview->appendChunk(payload.data, payload.startByte);
+
+                    // Request next chunk if not complete
+                    if (!m_streamingPreview->isComplete()) {
+                        requestNextStreamingChunk();
+                    }
+                }
+                break;
+            }
+            case EventType::ObjectRangeLoadError: {
+                auto& payload = std::get<ObjectRangeErrorPayload>(event.payload);
+                LOG_F(WARNING, "Event: ObjectRangeLoadError bucket=%s key=%s offset=%zu error=%s",
+                      payload.bucket.c_str(), payload.key.c_str(),
+                      payload.startByte, payload.error_message.c_str());
+
+                // Only process if this is for the current streaming preview
+                if (m_streamingPreview &&
+                    payload.bucket == m_streamingPreview->bucket() &&
+                    payload.key == m_streamingPreview->key()) {
+                    // Log error but don't stop streaming - the partial data is still usable
+                    LOG_F(WARNING, "Streaming error at offset %zu, partial data available",
+                          payload.startByte);
                 }
                 break;
             }
@@ -604,4 +668,67 @@ void BrowserModel::triggerPrefetch(const std::string& bucket, const std::vector<
     if (prefetch_count > 0) {
         LOG_F(INFO, "Queued %zu prefetch requests for bucket=%s", prefetch_count, bucket.c_str());
     }
+}
+
+void BrowserModel::startStreamingDownload(size_t totalFileSize) {
+    if (!m_backend || m_selectedBucket.empty() || m_selectedKey.empty()) {
+        return;
+    }
+
+    // Cancel any existing streaming
+    cancelStreamingDownload();
+
+    LOG_F(INFO, "Starting streaming download: bucket=%s key=%s totalSize=%zu",
+          m_selectedBucket.c_str(), m_selectedKey.c_str(), totalFileSize);
+
+    // Create streaming preview with the initial preview content
+    m_streamingPreview = std::make_unique<StreamingFilePreview>(
+        m_selectedBucket, m_selectedKey, m_previewContent, totalFileSize);
+
+    m_streamingEnabled = true;
+    m_streamingCancelFlag = std::make_shared<std::atomic<bool>>(false);
+
+    // Request the next chunk (starting after what we already have)
+    requestNextStreamingChunk();
+}
+
+void BrowserModel::requestNextStreamingChunk() {
+    if (!m_backend || !m_streamingPreview || !m_streamingEnabled) {
+        return;
+    }
+
+    if (m_streamingPreview->isComplete()) {
+        LOG_F(INFO, "Streaming complete for bucket=%s key=%s",
+              m_streamingPreview->bucket().c_str(), m_streamingPreview->key().c_str());
+        return;
+    }
+
+    size_t startByte = m_streamingPreview->nextByteNeeded();
+    size_t endByte = startByte + STREAMING_CHUNK_SIZE - 1;
+
+    // Cap to file size
+    size_t totalSize = m_streamingPreview->totalSourceBytes();
+    if (endByte >= totalSize) {
+        endByte = totalSize - 1;
+    }
+
+    LOG_F(1, "Requesting streaming chunk: bucket=%s key=%s range=%zu-%zu",
+          m_streamingPreview->bucket().c_str(), m_streamingPreview->key().c_str(),
+          startByte, endByte);
+
+    m_backend->getObjectRange(
+        m_streamingPreview->bucket(),
+        m_streamingPreview->key(),
+        startByte,
+        endByte,
+        m_streamingCancelFlag);
+}
+
+void BrowserModel::cancelStreamingDownload() {
+    if (m_streamingCancelFlag) {
+        m_streamingCancelFlag->store(true);
+    }
+    m_streamingCancelFlag.reset();
+    m_streamingPreview.reset();
+    m_streamingEnabled = false;
 }

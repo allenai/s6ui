@@ -1,5 +1,6 @@
 #include "browser_ui.h"
 #include "imgui/imgui.h"
+#include "nlohmann/json.hpp"
 #include <cstring>
 #include <cctype>
 
@@ -346,6 +347,7 @@ void BrowserUI::renderPreviewPane(float width, float height) {
 
     if (!m_model.hasSelection()) {
         m_editorCurrentKey.clear();
+        m_jsonlCurrentKey.clear();
         ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Select a file to preview");
     } else {
         // Show filename header
@@ -353,42 +355,72 @@ void BrowserUI::renderPreviewPane(float width, float height) {
         const std::string& key = m_model.selectedKey();
         size_t lastSlash = key.rfind('/');
         std::string filename = (lastSlash != std::string::npos) ? key.substr(lastSlash + 1) : key;
-        ImGui::Text("Preview: %s", filename.c_str());
-        ImGui::Separator();
 
         if (!m_model.previewSupported()) {
             m_editorCurrentKey.clear();
+            m_jsonlCurrentKey.clear();
+            ImGui::Text("Preview: %s", filename.c_str());
+            ImGui::Separator();
             ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Preview not supported for this file type");
             ImGui::Spacing();
             ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
                 "Supported: .txt, .md, .html, .htm, .json, .jsonl");
         } else if (m_model.previewLoading()) {
+            ImGui::Text("Preview: %s", filename.c_str());
+            ImGui::Separator();
             ImGui::TextColored(ImVec4(0.5f, 0.5f, 1.0f, 1.0f), "Loading preview...");
         } else if (!m_model.previewError().empty()) {
             m_editorCurrentKey.clear();
+            m_jsonlCurrentKey.clear();
+            ImGui::Text("Preview: %s", filename.c_str());
+            ImGui::Separator();
             ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
                 "Error: %s", m_model.previewError().c_str());
         } else {
-            // Show preview content using the syntax-highlighted editor
-            const std::string& content = m_model.previewContent();
-            if (content.empty()) {
+            // Check if this is a JSONL file with streaming preview
+            bool useJsonlViewer = isJsonlFile(key) && m_model.hasStreamingPreview();
+
+            if (useJsonlViewer) {
+                // Use JSONL viewer for streaming JSONL files
                 m_editorCurrentKey.clear();
-                ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "(empty file)");
+                ImVec2 availSize = ImGui::GetContentRegionAvail();
+                renderJsonlViewer(availSize.x, availSize.y);
             } else {
-                // Update editor content if file changed
-                std::string fullKey = m_model.selectedBucket() + "/" + key;
-                if (m_editorCurrentKey != fullKey) {
-                    m_editorCurrentKey = fullKey;
-                    m_editor.SetText(content);
-                    updateEditorLanguage(filename);
-                    // Reset cursor and selection for new file
-                    m_editor.SetCursorPosition(TextEditor::Coordinates(0, 0));
-                    m_editor.SetSelection(TextEditor::Coordinates(0, 0), TextEditor::Coordinates(0, 0));
+                // Show preview content using the syntax-highlighted editor
+                m_jsonlCurrentKey.clear();
+                ImGui::Text("Preview: %s", filename.c_str());
+
+                // Show streaming progress if active
+                if (m_model.hasStreamingPreview()) {
+                    auto* sp = m_model.streamingPreview();
+                    float progress = static_cast<float>(sp->bytesDownloaded()) /
+                                     static_cast<float>(sp->totalSourceBytes());
+                    ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(0.5f, 0.5f, 1.0f, 1.0f), " (%.0f%%)", progress * 100.0f);
                 }
 
-                // Render the editor (read-only, with syntax highlighting)
-                ImVec2 availSize = ImGui::GetContentRegionAvail();
-                m_editor.Render("##preview", availSize, false);
+                ImGui::Separator();
+
+                const std::string& content = m_model.previewContent();
+                if (content.empty()) {
+                    m_editorCurrentKey.clear();
+                    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "(empty file)");
+                } else {
+                    // Update editor content if file changed
+                    std::string fullKey = m_model.selectedBucket() + "/" + key;
+                    if (m_editorCurrentKey != fullKey) {
+                        m_editorCurrentKey = fullKey;
+                        m_editor.SetText(content);
+                        updateEditorLanguage(filename);
+                        // Reset cursor and selection for new file
+                        m_editor.SetCursorPosition(TextEditor::Coordinates(0, 0));
+                        m_editor.SetSelection(TextEditor::Coordinates(0, 0), TextEditor::Coordinates(0, 0));
+                    }
+
+                    // Render the editor (read-only, with syntax highlighting)
+                    ImVec2 availSize = ImGui::GetContentRegionAvail();
+                    m_editor.Render("##preview", availSize, false);
+                }
             }
         }
     }
@@ -456,4 +488,146 @@ std::string BrowserUI::buildS3Path(const std::string& bucket, const std::string&
         return "s3://" + bucket + "/";
     }
     return "s3://" + bucket + "/" + prefix;
+}
+
+bool BrowserUI::isJsonlFile(const std::string& key) {
+    // Check for .jsonl or .ndjson extension
+    size_t dotPos = key.rfind('.');
+    if (dotPos == std::string::npos) return false;
+
+    std::string ext = key.substr(dotPos);
+    for (char& c : ext) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+
+    return ext == ".jsonl" || ext == ".ndjson";
+}
+
+void BrowserUI::renderJsonlViewer(float width, float height) {
+    auto* sp = m_model.streamingPreview();
+    if (!sp) return;
+
+    const std::string& key = m_model.selectedKey();
+    size_t lastSlash = key.rfind('/');
+    std::string filename = (lastSlash != std::string::npos) ? key.substr(lastSlash + 1) : key;
+
+    // Check if file changed - reset state
+    std::string fullKey = m_model.selectedBucket() + "/" + key;
+    if (m_jsonlCurrentKey != fullKey) {
+        m_jsonlCurrentKey = fullKey;
+        m_currentJsonlLine = 0;
+        m_formattedJsonLineIndex = SIZE_MAX;
+        m_formattedJsonCache.clear();
+    }
+
+    // Header with filename
+    ImGui::Text("Preview: %s", filename.c_str());
+    ImGui::Separator();
+
+    // Navigation bar
+    size_t lineCount = sp->lineCount();
+    size_t totalBytes = sp->totalSourceBytes();
+    size_t downloadedBytes = sp->bytesDownloaded();
+    float progress = totalBytes > 0 ? static_cast<float>(downloadedBytes) / static_cast<float>(totalBytes) : 0.0f;
+
+    // Clamp current line to valid range
+    if (m_currentJsonlLine >= lineCount && lineCount > 0) {
+        m_currentJsonlLine = lineCount - 1;
+    }
+
+    // Navigation controls
+    ImGui::BeginGroup();
+
+    // Left arrow button
+    if (ImGui::Button("<") || (ImGui::IsKeyPressed(ImGuiKey_LeftArrow) && !ImGui::GetIO().WantTextInput)) {
+        navigateJsonlLine(-1);
+    }
+    ImGui::SameLine();
+
+    // Line counter
+    ImGui::Text("Line %zu / %zu", m_currentJsonlLine + 1, lineCount);
+    ImGui::SameLine();
+
+    // Right arrow button
+    if (ImGui::Button(">") || (ImGui::IsKeyPressed(ImGuiKey_RightArrow) && !ImGui::GetIO().WantTextInput)) {
+        navigateJsonlLine(1);
+    }
+    ImGui::SameLine();
+
+    // Progress bar
+    ImGui::SetNextItemWidth(100);
+    ImGui::ProgressBar(progress, ImVec2(0, 0), sp->isComplete() ? "Done" : "");
+    ImGui::SameLine();
+
+    // Toggle raw/formatted
+    if (ImGui::Checkbox("Raw", &m_jsonlRawMode)) {
+        m_formattedJsonLineIndex = SIZE_MAX;  // Force refresh
+    }
+
+    ImGui::EndGroup();
+    ImGui::Separator();
+
+    // Get current line content
+    if (lineCount > 0) {
+        std::string lineContent = sp->getLine(m_currentJsonlLine);
+
+        if (lineContent.empty()) {
+            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "(empty line)");
+        } else if (m_jsonlRawMode) {
+            // Raw mode - show unformatted line in scrollable region
+            ImVec2 availSize = ImGui::GetContentRegionAvail();
+            ImGui::BeginChild("RawContent", availSize, false,
+                ImGuiWindowFlags_HorizontalScrollbar);
+            ImGui::TextUnformatted(lineContent.c_str());
+            ImGui::EndChild();
+        } else {
+            // Formatted mode - show pretty-printed JSON
+            if (m_formattedJsonLineIndex != m_currentJsonlLine) {
+                m_formattedJsonCache = formatJson(lineContent);
+                m_formattedJsonLineIndex = m_currentJsonlLine;
+            }
+
+            ImVec2 availSize = ImGui::GetContentRegionAvail();
+            ImGui::BeginChild("FormattedContent", availSize, false,
+                ImGuiWindowFlags_HorizontalScrollbar);
+            ImGui::TextUnformatted(m_formattedJsonCache.c_str());
+            ImGui::EndChild();
+        }
+    } else {
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "No lines loaded yet...");
+    }
+}
+
+void BrowserUI::navigateJsonlLine(int delta) {
+    auto* sp = m_model.streamingPreview();
+    if (!sp) return;
+
+    size_t lineCount = sp->lineCount();
+    if (lineCount == 0) return;
+
+    if (delta < 0) {
+        size_t absDelta = static_cast<size_t>(-delta);
+        if (m_currentJsonlLine >= absDelta) {
+            m_currentJsonlLine -= absDelta;
+        } else {
+            m_currentJsonlLine = 0;
+        }
+    } else if (delta > 0) {
+        size_t newLine = m_currentJsonlLine + static_cast<size_t>(delta);
+        if (newLine < lineCount) {
+            m_currentJsonlLine = newLine;
+        } else {
+            m_currentJsonlLine = lineCount - 1;
+        }
+    }
+}
+
+std::string BrowserUI::formatJson(const std::string& json) {
+    try {
+        auto parsed = nlohmann::json::parse(json);
+        return parsed.dump(2);  // Pretty-print with 2-space indent
+    } catch (const nlohmann::json::parse_error& e) {
+        // Not valid JSON - return original with error message
+        return std::string("(Invalid JSON: ") + e.what() + ")\n\n" + json;
+    }
 }

@@ -3,6 +3,7 @@
 #include "backend.h"
 #include "aws/s3_backend.h"
 #include "aws/aws_credentials.h"
+#include "streaming_preview.h"
 #include <string>
 #include <vector>
 #include <map>
@@ -69,6 +70,13 @@ public:
     const std::string& previewError() const { return m_previewError; }
     bool previewSupported() const { return m_previewSupported; }
 
+    // Streaming preview accessors
+    bool hasStreamingPreview() const { return m_streamingPreview != nullptr; }
+    StreamingFilePreview* streamingPreview() { return m_streamingPreview.get(); }
+    const StreamingFilePreview* streamingPreview() const { return m_streamingPreview.get(); }
+    bool isStreamingEnabled() const { return m_streamingEnabled; }
+    int64_t selectedFileSize() const { return m_selectedFileSize; }
+
     // Call once per frame to process pending events from backend
     void processEvents();
 
@@ -115,10 +123,21 @@ private:
     // File selection and preview
     std::string m_selectedBucket;
     std::string m_selectedKey;
+    int64_t m_selectedFileSize = 0;
     bool m_previewLoading = false;
     bool m_previewSupported = false;
     std::string m_previewContent;
     std::string m_previewError;
+
+    // Streaming preview for large files
+    std::unique_ptr<StreamingFilePreview> m_streamingPreview;
+    std::shared_ptr<std::atomic<bool>> m_streamingCancelFlag;
+    bool m_streamingEnabled = false;  // Whether we're in streaming mode
+    void startStreamingDownload(size_t totalFileSize);
+    void requestNextStreamingChunk();
+    void cancelStreamingDownload();
+    static constexpr size_t STREAMING_CHUNK_SIZE = 1024 * 1024;  // 1MB chunks
+    static constexpr size_t STREAMING_THRESHOLD = 64 * 1024;     // Stream files > 64KB
 
     // Cache for prefetched file previews (bucket/key -> content)
     std::map<std::string, std::string> m_previewCache;

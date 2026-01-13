@@ -47,6 +47,13 @@ public:
         bool lowPriority = false,
         bool cancellable = false
     ) override;
+    void getObjectRange(
+        const std::string& bucket,
+        const std::string& key,
+        size_t startByte,
+        size_t endByte,
+        std::shared_ptr<std::atomic<bool>> cancel_flag = nullptr
+    ) override;
     void cancelAll() override;
 
     // Prefetch support - low priority background requests
@@ -86,15 +93,17 @@ public:
 private:
     // Work item for the background thread
     struct WorkItem {
-        enum class Type { ListBuckets, ListObjects, GetObject, Shutdown };
+        enum class Type { ListBuckets, ListObjects, GetObject, GetObjectRange, Shutdown };
         enum class Priority { High, Low };  // High = user action, Low = prefetch
         Type type;
         Priority priority = Priority::High;
         std::string bucket;
         std::string prefix;
         std::string continuation_token;
-        std::string key;  // For GetObject
+        std::string key;  // For GetObject / GetObjectRange
         size_t max_bytes = 0;  // For GetObject
+        size_t start_byte = 0;  // For GetObjectRange
+        size_t end_byte = 0;    // For GetObjectRange
         std::chrono::steady_clock::time_point queued_at;
         std::shared_ptr<std::atomic<bool>> cancel_flag;  // Shared flag to cancel this request
     };

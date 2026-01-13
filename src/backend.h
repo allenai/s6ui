@@ -41,6 +41,17 @@ public:
         bool cancellable = false
     ) = 0;
 
+    // Request a specific byte range of an object (for streaming large files)
+    // startByte is inclusive, endByte is inclusive
+    // cancel_flag can be used to cancel the request
+    virtual void getObjectRange(
+        const std::string& bucket,
+        const std::string& key,
+        size_t startByte,
+        size_t endByte,
+        std::shared_ptr<std::atomic<bool>> cancel_flag = nullptr
+    ) = 0;
+
     // Cancel all pending requests (optional, for cleanup)
     virtual void cancelAll() {}
 

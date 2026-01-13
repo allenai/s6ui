@@ -16,6 +16,8 @@ enum class EventType {
     ObjectsLoadError,
     ObjectContentLoaded,
     ObjectContentLoadError,
+    ObjectRangeLoaded,
+    ObjectRangeLoadError,
 };
 
 // Event payload types
@@ -50,6 +52,21 @@ struct ObjectContentErrorPayload {
     std::string error_message;
 };
 
+struct ObjectRangeLoadedPayload {
+    std::string bucket;
+    std::string key;
+    size_t startByte;
+    size_t totalSize;  // Total size of the object
+    std::string data;
+};
+
+struct ObjectRangeErrorPayload {
+    std::string bucket;
+    std::string key;
+    size_t startByte;
+    std::string error_message;
+};
+
 // A state change event from a backend
 struct StateEvent {
     EventType type;
@@ -58,7 +75,9 @@ struct StateEvent {
         ObjectsLoadedPayload,
         ErrorPayload,
         ObjectContentLoadedPayload,
-        ObjectContentErrorPayload
+        ObjectContentErrorPayload,
+        ObjectRangeLoadedPayload,
+        ObjectRangeErrorPayload
     > payload;
 
     // Helper constructors
@@ -123,6 +142,31 @@ struct StateEvent {
         StateEvent e;
         e.type = EventType::ObjectContentLoadError;
         e.payload = ObjectContentErrorPayload{bucket, key, error};
+        return e;
+    }
+
+    static StateEvent objectRangeLoaded(
+        const std::string& bucket,
+        const std::string& key,
+        size_t startByte,
+        size_t totalSize,
+        std::string data
+    ) {
+        StateEvent e;
+        e.type = EventType::ObjectRangeLoaded;
+        e.payload = ObjectRangeLoadedPayload{bucket, key, startByte, totalSize, std::move(data)};
+        return e;
+    }
+
+    static StateEvent objectRangeError(
+        const std::string& bucket,
+        const std::string& key,
+        size_t startByte,
+        const std::string& error
+    ) {
+        StateEvent e;
+        e.type = EventType::ObjectRangeLoadError;
+        e.payload = ObjectRangeErrorPayload{bucket, key, startByte, error};
         return e;
     }
 };

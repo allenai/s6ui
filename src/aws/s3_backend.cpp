@@ -37,6 +37,43 @@ static size_t writeCallback(void* contents, size_t size, size_t nmemb, std::stri
     return total;
 }
 
+// Header callback for capturing Content-Range header
+struct HttpResponseContext {
+    std::string body;
+    size_t contentRangeTotal = 0;  // Total size from Content-Range header
+};
+
+static size_t headerCallback(char* buffer, size_t size, size_t nitems, void* userdata) {
+    size_t total = size * nitems;
+    auto* ctx = static_cast<HttpResponseContext*>(userdata);
+
+    std::string header(buffer, total);
+    // Look for Content-Range: bytes 0-1023/12345
+    if (header.find("Content-Range:") == 0 || header.find("content-range:") == 0) {
+        size_t slashPos = header.find('/');
+        if (slashPos != std::string::npos) {
+            std::string totalStr = header.substr(slashPos + 1);
+            // Trim whitespace
+            while (!totalStr.empty() && (totalStr.back() == '\r' || totalStr.back() == '\n' || totalStr.back() == ' ')) {
+                totalStr.pop_back();
+            }
+            try {
+                ctx->contentRangeTotal = std::stoull(totalStr);
+            } catch (...) {
+                // Ignore parse errors
+            }
+        }
+    }
+    return total;
+}
+
+static size_t writeCallbackCtx(void* contents, size_t size, size_t nmemb, void* userdata) {
+    size_t total = size * nmemb;
+    auto* ctx = static_cast<HttpResponseContext*>(userdata);
+    ctx->body.append(static_cast<char*>(contents), total);
+    return total;
+}
+
 static std::string extractTag(const std::string& xml, const std::string& tag) {
     std::string open = "<" + tag + ">";
     std::string close = "</" + tag + ">";
@@ -97,7 +134,10 @@ S3Backend::~S3Backend() {
     {
         std::lock_guard<std::mutex> lock(m_highPriorityMutex);
         for (size_t i = 0; i < m_numWorkers; ++i) {
-            m_highPriorityQueue.push_back({WorkItem::Type::Shutdown, WorkItem::Priority::High, "", "", "", "", 0, {}, nullptr});
+            WorkItem item;
+            item.type = WorkItem::Type::Shutdown;
+            item.priority = WorkItem::Priority::High;
+            m_highPriorityQueue.push_back(std::move(item));
         }
     }
     m_highPriorityCv.notify_all();
@@ -106,7 +146,10 @@ S3Backend::~S3Backend() {
     {
         std::lock_guard<std::mutex> lock(m_lowPriorityMutex);
         for (size_t i = 0; i < m_numWorkers; ++i) {
-            m_lowPriorityQueue.push_back({WorkItem::Type::Shutdown, WorkItem::Priority::Low, "", "", "", "", 0, {}, nullptr});
+            WorkItem item;
+            item.type = WorkItem::Type::Shutdown;
+            item.priority = WorkItem::Priority::Low;
+            m_lowPriorityQueue.push_back(std::move(item));
         }
     }
     m_lowPriorityCv.notify_all();
@@ -149,7 +192,11 @@ void S3Backend::setProfile(const AWSProfile& profile) {
 
 void S3Backend::listBuckets() {
     LOG_F(INFO, "S3Backend: queuing listBuckets request");
-    enqueue({WorkItem::Type::ListBuckets, WorkItem::Priority::High, "", "", "", "", 0, std::chrono::steady_clock::now(), nullptr});
+    WorkItem item;
+    item.type = WorkItem::Type::ListBuckets;
+    item.priority = WorkItem::Priority::High;
+    item.queued_at = std::chrono::steady_clock::now();
+    enqueue(std::move(item));
 }
 
 void S3Backend::listObjects(
@@ -162,7 +209,15 @@ void S3Backend::listObjects(
           bucket.c_str(), prefix.c_str(),
           continuation_token.empty() ? "(none)" : continuation_token.substr(0, 20).c_str(),
           cancel_flag != nullptr);
-    enqueue({WorkItem::Type::ListObjects, WorkItem::Priority::High, bucket, prefix, continuation_token, "", 0, std::chrono::steady_clock::now(), cancel_flag});
+    WorkItem item;
+    item.type = WorkItem::Type::ListObjects;
+    item.priority = WorkItem::Priority::High;
+    item.bucket = bucket;
+    item.prefix = prefix;
+    item.continuation_token = continuation_token;
+    item.queued_at = std::chrono::steady_clock::now();
+    item.cancel_flag = cancel_flag;
+    enqueue(std::move(item));
 }
 
 void S3Backend::getObject(
@@ -193,6 +248,29 @@ void S3Backend::getObject(
         item.cancel_flag = std::make_shared<std::atomic<bool>>(false);
         m_currentHoverCancelFlag = item.cancel_flag;
     }
+
+    enqueue(std::move(item));
+}
+
+void S3Backend::getObjectRange(
+    const std::string& bucket,
+    const std::string& key,
+    size_t startByte,
+    size_t endByte,
+    std::shared_ptr<std::atomic<bool>> cancel_flag
+) {
+    LOG_F(INFO, "S3Backend: queuing getObjectRange bucket=%s key=%s range=%zu-%zu",
+          bucket.c_str(), key.c_str(), startByte, endByte);
+
+    WorkItem item;
+    item.type = WorkItem::Type::GetObjectRange;
+    item.priority = WorkItem::Priority::High;
+    item.bucket = bucket;
+    item.key = key;
+    item.start_byte = startByte;
+    item.end_byte = endByte;
+    item.queued_at = std::chrono::steady_clock::now();
+    item.cancel_flag = cancel_flag;
 
     enqueue(std::move(item));
 }
@@ -560,6 +638,97 @@ void S3Backend::processWorkItem(WorkItem& item) {
                 LOG_F(INFO, "S3Backend: getObject success bucket=%s key=%s size=%zu (total=%lldms http=%lldms)",
                       item.bucket.c_str(), item.key.c_str(), response.size(), total_ms, http_ms);
                 pushEvent(StateEvent::objectContentLoaded(item.bucket, item.key, std::move(response)));
+            }
+        }
+    }
+    else if (item.type == WorkItem::Type::GetObjectRange) {
+        std::string host;
+        std::string path;
+        if (!m_profile.endpoint_url.empty()) {
+            host = parseEndpointHost(m_profile.endpoint_url);
+            path = "/" + item.bucket + "/" + item.key;
+        } else {
+            host = item.bucket + ".s3." + m_profile.region + ".amazonaws.com";
+            path = "/" + item.key;
+        }
+        LOG_F(1, "S3Backend: fetching object range bucket=%s key=%s range=%zu-%zu host=%s path=%s",
+              item.bucket.c_str(), item.key.c_str(), item.start_byte, item.end_byte, host.c_str(), path.c_str());
+
+        auto signedReq = aws_sign_request(
+            "GET", host, path, "", m_profile.region, "s3",
+            m_profile.access_key_id, m_profile.secret_access_key
+        );
+
+        // Add Range header
+        signedReq.headers["Range"] = "bytes=" + std::to_string(item.start_byte) + "-" + std::to_string(item.end_byte);
+
+        // Use httpGetWithContext to capture Content-Range header
+        auto http_start = std::chrono::steady_clock::now();
+
+        CURL* curl = curl_easy_init();
+        if (!curl) {
+            pushEvent(StateEvent::objectRangeError(item.bucket, item.key, item.start_byte, "ERROR: Failed to init curl"));
+            return;
+        }
+
+        HttpResponseContext ctx;
+        curl_easy_setopt(curl, CURLOPT_URL, signedReq.url.c_str());
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallbackCtx);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
+        curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, headerCallback);
+        curl_easy_setopt(curl, CURLOPT_HEADERDATA, &ctx);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);  // Longer timeout for larger chunks
+
+        if (item.cancel_flag) {
+            curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+            curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, cancelCheckProgressCallback);
+            curl_easy_setopt(curl, CURLOPT_XFERINFODATA, item.cancel_flag.get());
+        }
+
+        struct curl_slist* headerList = nullptr;
+        for (const auto& [key, value] : signedReq.headers) {
+            std::string header = key + ": " + value;
+            headerList = curl_slist_append(headerList, header.c_str());
+        }
+        if (headerList) {
+            curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headerList);
+        }
+
+        CURLcode res = curl_easy_perform(curl);
+
+        if (headerList) curl_slist_free_all(headerList);
+        curl_easy_cleanup(curl);
+
+        auto http_end = std::chrono::steady_clock::now();
+
+        if (res == CURLE_ABORTED_BY_CALLBACK) {
+            LOG_F(INFO, "S3Backend: getObjectRange cancelled bucket=%s key=%s",
+                  item.bucket.c_str(), item.key.c_str());
+            return;
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - item.queued_at).count();
+        auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
+
+        if (res != CURLE_OK) {
+            LOG_F(WARNING, "S3Backend: getObjectRange HTTP error: %s (total=%lldms http=%lldms)",
+                  curl_easy_strerror(res), total_ms, http_ms);
+            pushEvent(StateEvent::objectRangeError(item.bucket, item.key, item.start_byte,
+                "ERROR: " + std::string(curl_easy_strerror(res))));
+        } else {
+            // Check for S3 error in XML response
+            std::string error = extractError(ctx.body);
+            if (!error.empty()) {
+                LOG_F(WARNING, "S3Backend: getObjectRange S3 error: %s (total=%lldms http=%lldms)",
+                      error.c_str(), total_ms, http_ms);
+                pushEvent(StateEvent::objectRangeError(item.bucket, item.key, item.start_byte, error));
+            } else {
+                LOG_F(INFO, "S3Backend: getObjectRange success bucket=%s key=%s range=%zu-%zu got=%zu total=%zu (total=%lldms http=%lldms)",
+                      item.bucket.c_str(), item.key.c_str(), item.start_byte, item.end_byte,
+                      ctx.body.size(), ctx.contentRangeTotal, total_ms, http_ms);
+                pushEvent(StateEvent::objectRangeLoaded(item.bucket, item.key, item.start_byte,
+                    ctx.contentRangeTotal, std::move(ctx.body)));
             }
         }
     }

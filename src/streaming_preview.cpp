@@ -1,0 +1,233 @@
+#include "streaming_preview.h"
+#include "loguru.hpp"
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <cstdlib>
+#include <cstring>
+
+StreamingFilePreview::StreamingFilePreview(
+    const std::string& bucket,
+    const std::string& key,
+    const std::string& initialData,
+    size_t totalFileSize)
+    : m_bucket(bucket)
+    , m_key(key)
+    , m_totalSourceSize(totalFileSize)
+    , m_transform(std::make_unique<PassThroughTransform>())
+{
+    // Create temp file
+    const char* tmpdir = std::getenv("TMPDIR");
+    if (!tmpdir) tmpdir = "/tmp";
+
+    m_tempFilePath = std::string(tmpdir) + "/s3v_preview_XXXXXX";
+
+    // mkstemp modifies the string in place
+    std::vector<char> pathBuf(m_tempFilePath.begin(), m_tempFilePath.end());
+    pathBuf.push_back('\0');
+
+    m_fd = mkstemp(pathBuf.data());
+    if (m_fd < 0) {
+        LOG_F(ERROR, "StreamingFilePreview: failed to create temp file: %s", strerror(errno));
+        return;
+    }
+
+    m_tempFilePath = pathBuf.data();
+    LOG_F(INFO, "StreamingFilePreview: created temp file %s for %s/%s (total=%zu bytes)",
+          m_tempFilePath.c_str(), bucket.c_str(), key.c_str(), totalFileSize);
+
+    // Initialize with first line offset
+    m_lineOffsets.push_back(0);
+
+    // Write initial data
+    if (!initialData.empty()) {
+        std::string transformed = m_transform->transform(initialData.data(), initialData.size());
+        writeToTempFile(transformed.data(), transformed.size());
+        m_bytesDownloaded = initialData.size();
+
+        // Check if we got the whole file
+        if (m_bytesDownloaded >= m_totalSourceSize) {
+            finishStream();
+        }
+    }
+}
+
+StreamingFilePreview::~StreamingFilePreview() {
+    if (m_fd >= 0) {
+        close(m_fd);
+        m_fd = -1;
+    }
+
+    // Delete temp file
+    if (!m_tempFilePath.empty()) {
+        LOG_F(INFO, "StreamingFilePreview: deleting temp file %s", m_tempFilePath.c_str());
+        unlink(m_tempFilePath.c_str());
+    }
+}
+
+void StreamingFilePreview::setTransform(std::unique_ptr<IStreamTransform> transform) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_bytesDownloaded > 0) {
+        LOG_F(WARNING, "StreamingFilePreview: setTransform called after data received, ignoring");
+        return;
+    }
+    m_transform = std::move(transform);
+}
+
+void StreamingFilePreview::appendChunk(const std::string& data, size_t offset) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    if (m_fd < 0) {
+        LOG_F(WARNING, "StreamingFilePreview: appendChunk called but no temp file");
+        return;
+    }
+
+    if (offset != m_bytesDownloaded) {
+        LOG_F(WARNING, "StreamingFilePreview: chunk offset mismatch, expected %zu got %zu",
+              m_bytesDownloaded, offset);
+        // We could handle out-of-order chunks here, but for now assume sequential
+        return;
+    }
+
+    // Transform the data (e.g., decompress)
+    std::string transformed = m_transform->transform(data.data(), data.size());
+
+    // Write to temp file
+    writeToTempFile(transformed.data(), transformed.size());
+    m_bytesDownloaded += data.size();
+
+    LOG_F(1, "StreamingFilePreview: appended %zu bytes at offset %zu, total downloaded=%zu/%zu, lines=%zu",
+          data.size(), offset, m_bytesDownloaded, m_totalSourceSize, m_lineOffsets.size());
+
+    // Check if we're done
+    if (m_bytesDownloaded >= m_totalSourceSize) {
+        finishStream();
+    }
+}
+
+void StreamingFilePreview::finishStream() {
+    // Already holding lock from caller or constructor
+
+    if (m_complete) return;
+
+    // Flush any remaining transform data
+    std::string remaining = m_transform->flush();
+    if (!remaining.empty()) {
+        writeToTempFile(remaining.data(), remaining.size());
+    }
+
+    m_complete = true;
+    LOG_F(INFO, "StreamingFilePreview: stream complete, %zu bytes downloaded, %zu bytes written, %zu lines",
+          m_bytesDownloaded, m_bytesWritten, m_lineOffsets.size());
+}
+
+void StreamingFilePreview::writeToTempFile(const char* data, size_t len) {
+    // Caller must hold lock
+
+    if (m_fd < 0 || len == 0) return;
+
+    // Write data
+    ssize_t written = write(m_fd, data, len);
+    if (written < 0) {
+        LOG_F(ERROR, "StreamingFilePreview: write failed: %s", strerror(errno));
+        return;
+    }
+
+    // Index newlines in the data we just wrote
+    size_t baseOffset = m_bytesWritten;
+    indexNewlines(data, len, baseOffset);
+
+    m_bytesWritten += static_cast<size_t>(written);
+}
+
+void StreamingFilePreview::indexNewlines(const char* data, size_t len, size_t baseOffset) {
+    // Caller must hold lock
+
+    for (size_t i = 0; i < len; ++i) {
+        if (data[i] == '\n') {
+            // The next line starts at the byte after this newline
+            size_t nextLineOffset = baseOffset + i + 1;
+            // Only add if there's more data (or will be more data)
+            if (nextLineOffset < m_bytesWritten + len || !m_complete) {
+                m_lineOffsets.push_back(nextLineOffset);
+            }
+        }
+    }
+}
+
+size_t StreamingFilePreview::lineCount() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_lineOffsets.size();
+}
+
+size_t StreamingFilePreview::bytesDownloaded() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_bytesDownloaded;
+}
+
+size_t StreamingFilePreview::bytesWritten() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_bytesWritten;
+}
+
+size_t StreamingFilePreview::totalSourceBytes() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_totalSourceSize;
+}
+
+bool StreamingFilePreview::isComplete() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_complete;
+}
+
+size_t StreamingFilePreview::nextByteNeeded() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_bytesDownloaded;
+}
+
+std::string StreamingFilePreview::getLine(size_t lineIndex) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    if (m_fd < 0) return "";
+    if (lineIndex >= m_lineOffsets.size()) return "";
+
+    size_t startOffset = m_lineOffsets[lineIndex];
+
+    // Determine end offset
+    size_t endOffset;
+    if (lineIndex + 1 < m_lineOffsets.size()) {
+        // End at start of next line (minus the newline character)
+        endOffset = m_lineOffsets[lineIndex + 1] - 1;
+    } else {
+        // Last line - end at current write position
+        endOffset = m_bytesWritten;
+    }
+
+    if (startOffset >= endOffset) return "";
+
+    size_t lineLen = endOffset - startOffset;
+
+    // Cap line length to prevent huge allocations
+    constexpr size_t MAX_LINE_LEN = 10 * 1024 * 1024;  // 10MB max line
+    if (lineLen > MAX_LINE_LEN) {
+        lineLen = MAX_LINE_LEN;
+    }
+
+    // Read the line from temp file
+    std::string line(lineLen, '\0');
+
+    ssize_t bytesRead = pread(m_fd, line.data(), lineLen, static_cast<off_t>(startOffset));
+    if (bytesRead < 0) {
+        LOG_F(ERROR, "StreamingFilePreview: pread failed: %s", strerror(errno));
+        return "";
+    }
+
+    line.resize(static_cast<size_t>(bytesRead));
+
+    // Trim trailing newline/carriage return if present
+    while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
+        line.pop_back();
+    }
+
+    return line;
+}
