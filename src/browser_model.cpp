@@ -28,6 +28,15 @@ void BrowserModel::loadProfiles() {
                 break;
             }
         }
+    } else {
+        // No AWS_PROFILE set, look for a profile named "default"
+        for (size_t i = 0; i < m_profiles.size(); i++) {
+            if (m_profiles[i].name == "default") {
+                m_selectedProfileIdx = static_cast<int>(i);
+                LOG_F(INFO, "Selected profile 'default'");
+                break;
+            }
+        }
     }
 
     LOG_F(INFO, "Loaded %zu profiles", m_profiles.size());
