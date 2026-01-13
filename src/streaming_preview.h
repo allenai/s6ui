@@ -67,6 +67,9 @@ public:
     // Get the raw content of a line (before any JSON formatting)
     std::string getRawLine(size_t lineIndex) const { return getLine(lineIndex); }
 
+    // Check if a line is complete (has a terminating newline or is at end of completed file)
+    bool isLineComplete(size_t lineIndex) const;
+
     // File identifiers
     const std::string& bucket() const { return m_bucket; }
     const std::string& key() const { return m_key; }

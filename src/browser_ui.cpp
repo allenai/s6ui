@@ -569,10 +569,35 @@ void BrowserUI::renderJsonlViewer(float width, float height) {
 
     // Get current line content
     if (lineCount > 0) {
+        bool lineComplete = sp->isLineComplete(m_currentJsonlLine);
         std::string lineContent = sp->getLine(m_currentJsonlLine);
 
         if (lineContent.empty()) {
             ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "(empty line)");
+        } else if (!lineComplete) {
+            // Line is still being downloaded - invalidate cache so it re-formats when complete
+            if (m_formattedJsonLineIndex == m_currentJsonlLine) {
+                m_formattedJsonLineIndex = SIZE_MAX;
+            }
+
+            // Show partial content with indicator
+            ImGui::TextColored(ImVec4(0.5f, 0.5f, 1.0f, 1.0f),
+                "Line incomplete (%zu bytes loaded so far)...", lineContent.size());
+            ImGui::Spacing();
+
+            // Show partial content in raw form (don't try to parse incomplete JSON)
+            ImVec2 availSize = ImGui::GetContentRegionAvail();
+            ImGui::BeginChild("PartialContent", availSize, false,
+                ImGuiWindowFlags_HorizontalScrollbar);
+            // Show first/last part of partial content
+            if (lineContent.size() > 1000) {
+                std::string preview = lineContent.substr(0, 500) + "\n...\n" +
+                                      lineContent.substr(lineContent.size() - 500);
+                ImGui::TextUnformatted(preview.c_str());
+            } else {
+                ImGui::TextUnformatted(lineContent.c_str());
+            }
+            ImGui::EndChild();
         } else if (m_jsonlRawMode) {
             // Raw mode - show unformatted line in scrollable region
             ImVec2 availSize = ImGui::GetContentRegionAvail();

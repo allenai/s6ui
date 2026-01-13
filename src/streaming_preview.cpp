@@ -231,3 +231,19 @@ std::string StreamingFilePreview::getLine(size_t lineIndex) const {
 
     return line;
 }
+
+bool StreamingFilePreview::isLineComplete(size_t lineIndex) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    if (lineIndex >= m_lineOffsets.size()) return false;
+
+    // Line is complete if:
+    // 1. There's a next line (meaning we found a newline after this line)
+    // 2. OR the file download is complete
+    if (lineIndex + 1 < m_lineOffsets.size()) {
+        return true;  // There's a next line, so this one is terminated
+    }
+
+    // This is the last known line - it's only complete if file is fully downloaded
+    return m_complete;
+}
