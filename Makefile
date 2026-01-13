@@ -120,7 +120,7 @@ APP_SOURCES = $(SRC_DIR)/browser_model.cpp \
 ifeq ($(UNAME_S), Darwin)
 	MAIN_SOURCES = $(SRC_DIR)/main.mm
 else
-	MAIN_SOURCES = $(SRC_DIR)/main.cpp
+	MAIN_SOURCES = $(SRC_DIR)/main_linux.cpp
 endif
 
 # Object files (in build directory)
