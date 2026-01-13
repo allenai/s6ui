@@ -162,4 +162,12 @@ private:
     std::vector<StateEvent> m_events;
 
     void pushEvent(StateEvent event);
+
+    // Bucket region cache for multi-region support
+    std::map<std::string, std::string> m_bucketRegionCache;
+    mutable std::mutex m_regionCacheMutex;
+
+    // Helper methods for region cache
+    std::string getCachedRegion(const std::string& bucket) const;
+    void cacheRegion(const std::string& bucket, const std::string& region);
 };
