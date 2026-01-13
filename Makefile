@@ -1,14 +1,25 @@
-# S3 Browser - Dear ImGui + GLFW + Metal + libcurl
+# S3 Browser - Dear ImGui + GLFW + Metal/OpenGL + libcurl
+
+# Detect OS
+UNAME_S := $(shell uname -s)
 
 # Enable parallel builds by default
-MAKEFLAGS += -j$(shell sysctl -n hw.ncpu 2>/dev/null || echo 4)
+ifeq ($(UNAME_S), Darwin)
+	MAKEFLAGS += -j$(shell sysctl -n hw.ncpu 2>/dev/null || echo 4)
+else
+	MAKEFLAGS += -j$(shell nproc 2>/dev/null || echo 4)
+endif
 
 CC = clang
 CXX = clang++
 OBJCXX = clang++
 
-# Detect Homebrew prefix (Apple Silicon vs Intel)
-HOMEBREW_PREFIX := $(shell brew --prefix 2>/dev/null || echo /usr/local)
+# Detect Homebrew prefix (Apple Silicon vs Intel) on macOS
+ifeq ($(UNAME_S), Darwin)
+	HOMEBREW_PREFIX := $(shell brew --prefix 2>/dev/null || echo /usr/local)
+else
+	HOMEBREW_PREFIX := /usr/local
+endif
 
 # Directories
 LIBS_DIR = libs
@@ -38,22 +49,37 @@ LIBS_CXXFLAGS += -I$(SRC_DIR)
 LIBS_CFLAGS = -O2 -w
 LIBS_CFLAGS += -I$(LIBS_DIR)/zstd
 
-# Objective-C++ flags
-OBJCXXFLAGS = $(CXXFLAGS) -fobjc-arc
-LIBS_OBJCXXFLAGS = $(LIBS_CXXFLAGS) -fobjc-arc
+# Objective-C++ flags (only on macOS)
+ifeq ($(UNAME_S), Darwin)
+	OBJCXXFLAGS = $(CXXFLAGS) -fobjc-arc
+	LIBS_OBJCXXFLAGS = $(LIBS_CXXFLAGS) -fobjc-arc
+else
+	OBJCXXFLAGS = $(CXXFLAGS)
+	LIBS_OBJCXXFLAGS = $(LIBS_CXXFLAGS)
+endif
 
 # Linker flags
 LDFLAGS = -L$(HOMEBREW_PREFIX)/lib
 LDFLAGS += -lglfw
 LDFLAGS += -lcurl
 LDFLAGS += -lz
-LDFLAGS += -framework Metal
-LDFLAGS += -framework MetalKit
-LDFLAGS += -framework Cocoa
-LDFLAGS += -framework IOKit
-LDFLAGS += -framework CoreVideo
-LDFLAGS += -framework QuartzCore
-LDFLAGS += -framework Security
+LDFLAGS += -lssl
+LDFLAGS += -lcrypto
+
+# Platform-specific linker flags
+ifeq ($(UNAME_S), Darwin)
+	LDFLAGS += -framework Metal
+	LDFLAGS += -framework MetalKit
+	LDFLAGS += -framework Cocoa
+	LDFLAGS += -framework IOKit
+	LDFLAGS += -framework CoreVideo
+	LDFLAGS += -framework QuartzCore
+	LDFLAGS += -framework Security
+else
+	LDFLAGS += -lGL
+	LDFLAGS += -ldl
+	LDFLAGS += -lpthread
+endif
 
 # Source files
 IMGUI_DIR = $(LIBS_DIR)/imgui
@@ -64,7 +90,14 @@ IMGUI_SOURCES = $(IMGUI_DIR)/imgui.cpp \
                 $(IMGUI_DIR)/imgui_widgets.cpp \
                 $(IMGUI_DIR)/imgui_impl_glfw.cpp
 
-IMGUI_METAL_SOURCES = $(IMGUI_DIR)/imgui_impl_metal.mm
+# Platform-specific ImGui backend
+ifeq ($(UNAME_S), Darwin)
+	IMGUI_METAL_SOURCES = $(IMGUI_DIR)/imgui_impl_metal.mm
+	IMGUI_OPENGL_SOURCES =
+else
+	IMGUI_METAL_SOURCES =
+	IMGUI_OPENGL_SOURCES = $(IMGUI_DIR)/imgui_impl_opengl3.cpp
+endif
 
 LOGURU_DIR = $(LIBS_DIR)/loguru
 LOGURU_SOURCES = $(LOGURU_DIR)/loguru.cpp
@@ -83,19 +116,31 @@ APP_SOURCES = $(SRC_DIR)/browser_model.cpp \
               $(SRC_DIR)/browser_ui.cpp \
               $(SRC_DIR)/streaming_preview.cpp
 
-MAIN_SOURCES = $(SRC_DIR)/main.mm
+# Platform-specific main file
+ifeq ($(UNAME_S), Darwin)
+	MAIN_SOURCES = $(SRC_DIR)/main.mm
+else
+	MAIN_SOURCES = $(SRC_DIR)/main_linux.cpp
+endif
 
 # Object files (in build directory)
 IMGUI_OBJS = $(patsubst $(LIBS_DIR)/%.cpp,$(BUILD_DIR)/libs/%.o,$(IMGUI_SOURCES))
 IMGUI_METAL_OBJS = $(patsubst $(LIBS_DIR)/%.mm,$(BUILD_DIR)/libs/%.o,$(IMGUI_METAL_SOURCES))
+IMGUI_OPENGL_OBJS = $(patsubst $(LIBS_DIR)/%.cpp,$(BUILD_DIR)/libs/%.o,$(IMGUI_OPENGL_SOURCES))
 LOGURU_OBJS = $(patsubst $(LIBS_DIR)/%.cpp,$(BUILD_DIR)/libs/%.o,$(LOGURU_SOURCES))
 TEXTEDIT_OBJS = $(patsubst $(LIBS_DIR)/%.cpp,$(BUILD_DIR)/libs/%.o,$(TEXTEDIT_SOURCES))
 ZSTD_OBJS = $(patsubst $(LIBS_DIR)/%.c,$(BUILD_DIR)/libs/%.o,$(ZSTD_SOURCES))
 AWS_OBJS = $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/src/%.o,$(AWS_SOURCES))
 APP_OBJS = $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/src/%.o,$(APP_SOURCES))
-MAIN_OBJS = $(patsubst $(SRC_DIR)/%.mm,$(BUILD_DIR)/src/%.o,$(MAIN_SOURCES))
 
-ALL_OBJS = $(IMGUI_OBJS) $(IMGUI_METAL_OBJS) $(LOGURU_OBJS) $(TEXTEDIT_OBJS) $(ZSTD_OBJS) $(AWS_OBJS) $(APP_OBJS) $(MAIN_OBJS)
+# Platform-specific main object files
+ifeq ($(UNAME_S), Darwin)
+	MAIN_OBJS = $(patsubst $(SRC_DIR)/%.mm,$(BUILD_DIR)/src/%.o,$(MAIN_SOURCES))
+else
+	MAIN_OBJS = $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/src/%.o,$(MAIN_SOURCES))
+endif
+
+ALL_OBJS = $(IMGUI_OBJS) $(IMGUI_METAL_OBJS) $(IMGUI_OPENGL_OBJS) $(LOGURU_OBJS) $(TEXTEDIT_OBJS) $(ZSTD_OBJS) $(AWS_OBJS) $(APP_OBJS) $(MAIN_OBJS)
 
 # Output
 TARGET = s6ui
@@ -104,7 +149,11 @@ TARGET = s6ui
 all: $(TARGET)
 
 $(TARGET): $(ALL_OBJS)
+ifeq ($(UNAME_S), Darwin)
 	$(OBJCXX) $(ALL_OBJS) $(LDFLAGS) -o $@
+else
+	$(CXX) $(ALL_OBJS) $(LDFLAGS) -o $@
+endif
 
 # Create build directories
 $(BUILD_DIR)/libs/imgui $(BUILD_DIR)/libs/loguru $(BUILD_DIR)/libs/imguicolortextedit $(BUILD_DIR)/src/aws:
@@ -155,8 +204,6 @@ debug: LIBS_CXXFLAGS += -I$(LIBS_DIR)/zstd
 debug: LIBS_CXXFLAGS += -I$(SRC_DIR)
 debug: LIBS_CFLAGS = -g -O0 -w
 debug: LIBS_CFLAGS += -I$(LIBS_DIR)/zstd
-debug: OBJCXXFLAGS = $(CXXFLAGS) -fobjc-arc
-debug: LIBS_OBJCXXFLAGS = $(LIBS_CXXFLAGS) -fobjc-arc
 debug: clean $(TARGET)
 
 # Address Sanitizer build (catches memory errors)
@@ -176,8 +223,6 @@ asan: LIBS_CXXFLAGS += -I$(LIBS_DIR)/zstd
 asan: LIBS_CXXFLAGS += -I$(SRC_DIR)
 asan: LIBS_CFLAGS = -g -O1 -w -fsanitize=address -fno-omit-frame-pointer
 asan: LIBS_CFLAGS += -I$(LIBS_DIR)/zstd
-asan: OBJCXXFLAGS = $(CXXFLAGS) -fobjc-arc
-asan: LIBS_OBJCXXFLAGS = $(LIBS_CXXFLAGS) -fobjc-arc
 asan: LDFLAGS += -fsanitize=address
 asan: clean $(TARGET)
 

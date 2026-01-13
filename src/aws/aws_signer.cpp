@@ -1,6 +1,6 @@
 #include "aws_signer.h"
-#include <CommonCrypto/CommonHMAC.h>
-#include <CommonCrypto/CommonDigest.h>
+#include <openssl/hmac.h>
+#include <openssl/sha.h>
 #include <ctime>
 #include <sstream>
 #include <iomanip>
@@ -17,21 +17,27 @@ static std::string to_hex(const unsigned char* data, size_t len) {
 }
 
 static std::string sha256(const std::string& data) {
-    unsigned char hash[CC_SHA256_DIGEST_LENGTH];
-    CC_SHA256(data.c_str(), static_cast<CC_LONG>(data.size()), hash);
-    return to_hex(hash, CC_SHA256_DIGEST_LENGTH);
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256(reinterpret_cast<const unsigned char*>(data.c_str()), data.size(), hash);
+    return to_hex(hash, SHA256_DIGEST_LENGTH);
 }
 
 static std::string hmac_sha256_raw(const std::string& key, const std::string& data) {
-    unsigned char hash[CC_SHA256_DIGEST_LENGTH];
-    CCHmac(kCCHmacAlgSHA256, key.c_str(), key.size(), data.c_str(), data.size(), hash);
-    return std::string(reinterpret_cast<char*>(hash), CC_SHA256_DIGEST_LENGTH);
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    unsigned int len = SHA256_DIGEST_LENGTH;
+    HMAC(EVP_sha256(), key.c_str(), key.size(),
+         reinterpret_cast<const unsigned char*>(data.c_str()), data.size(),
+         hash, &len);
+    return std::string(reinterpret_cast<char*>(hash), SHA256_DIGEST_LENGTH);
 }
 
 static std::string hmac_sha256_hex(const std::string& key, const std::string& data) {
-    unsigned char hash[CC_SHA256_DIGEST_LENGTH];
-    CCHmac(kCCHmacAlgSHA256, key.c_str(), key.size(), data.c_str(), data.size(), hash);
-    return to_hex(hash, CC_SHA256_DIGEST_LENGTH);
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    unsigned int len = SHA256_DIGEST_LENGTH;
+    HMAC(EVP_sha256(), key.c_str(), key.size(),
+         reinterpret_cast<const unsigned char*>(data.c_str()), data.size(),
+         hash, &len);
+    return to_hex(hash, SHA256_DIGEST_LENGTH);
 }
 
 static std::string get_timestamp() {
