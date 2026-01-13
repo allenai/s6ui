@@ -25,3 +25,7 @@ struct AWSProfile {
 
 // Load all AWS profiles from ~/.aws/credentials and ~/.aws/config
 std::vector<AWSProfile> load_aws_profiles();
+
+// Refresh credentials for a specific profile (reloads from disk, resolves SSO if needed)
+// Returns true if credentials were successfully refreshed
+bool refresh_profile_credentials(AWSProfile& profile);

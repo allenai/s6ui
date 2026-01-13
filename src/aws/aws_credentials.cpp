@@ -421,3 +421,127 @@ std::vector<AWSProfile> load_aws_profiles() {
 
     return profiles;
 }
+
+bool refresh_profile_credentials(AWSProfile& profile) {
+    LOG_F(INFO, "Refreshing credentials for profile '%s'", profile.name.c_str());
+
+    std::string home = get_home_dir();
+    if (home.empty()) {
+        LOG_F(ERROR, "Cannot refresh credentials: HOME directory not found");
+        return false;
+    }
+
+    // Parse credentials and config files
+    auto creds = parse_ini_file(home + "/.aws/credentials");
+    auto config = parse_ini_file(home + "/.aws/config");
+
+    // Find the profile in credentials
+    auto cred_it = creds.find(profile.name);
+    if (cred_it == creds.end()) {
+        // Profile might be SSO-only (in config but not credentials)
+        LOG_F(INFO, "Profile '%s' not found in credentials file, checking config", profile.name.c_str());
+    } else {
+        // Update credentials from file
+        auto it = cred_it->second.find("aws_access_key_id");
+        if (it != cred_it->second.end()) {
+            profile.access_key_id = it->second;
+        } else {
+            profile.access_key_id.clear();
+        }
+
+        it = cred_it->second.find("aws_secret_access_key");
+        if (it != cred_it->second.end()) {
+            profile.secret_access_key = it->second;
+        } else {
+            profile.secret_access_key.clear();
+        }
+
+        it = cred_it->second.find("aws_session_token");
+        if (it != cred_it->second.end()) {
+            profile.session_token = it->second;
+        } else {
+            profile.session_token.clear();
+        }
+    }
+
+    // Update config from config file
+    auto cfg_it = config.find(profile.name);
+    if (cfg_it != config.end()) {
+        auto reg_it = cfg_it->second.find("region");
+        if (reg_it != cfg_it->second.end()) {
+            profile.region = reg_it->second;
+        }
+
+        auto endpoint_it = cfg_it->second.find("endpoint_url");
+        if (endpoint_it != cfg_it->second.end()) {
+            profile.endpoint_url = endpoint_it->second;
+        } else {
+            profile.endpoint_url.clear();
+        }
+
+        // Update SSO configuration
+        auto sso_start_it = cfg_it->second.find("sso_start_url");
+        if (sso_start_it != cfg_it->second.end()) {
+            profile.sso_start_url = sso_start_it->second;
+        } else {
+            profile.sso_start_url.clear();
+        }
+
+        auto sso_region_it = cfg_it->second.find("sso_region");
+        if (sso_region_it != cfg_it->second.end()) {
+            profile.sso_region = sso_region_it->second;
+        } else {
+            profile.sso_region.clear();
+        }
+
+        auto sso_account_it = cfg_it->second.find("sso_account_id");
+        if (sso_account_it != cfg_it->second.end()) {
+            profile.sso_account_id = sso_account_it->second;
+        } else {
+            profile.sso_account_id.clear();
+        }
+
+        auto sso_role_it = cfg_it->second.find("sso_role_name");
+        if (sso_role_it != cfg_it->second.end()) {
+            profile.sso_role_name = sso_role_it->second;
+        } else {
+            profile.sso_role_name.clear();
+        }
+
+        // Resolve sso_session reference
+        profile.sso_session_name.clear();
+        resolve_sso_session(profile, config);
+
+        // Re-parse SSO account and role from profile (may override session)
+        auto profile_sso_account_it = cfg_it->second.find("sso_account_id");
+        if (profile_sso_account_it != cfg_it->second.end()) {
+            profile.sso_account_id = profile_sso_account_it->second;
+        }
+        auto profile_sso_role_it = cfg_it->second.find("sso_role_name");
+        if (profile_sso_role_it != cfg_it->second.end()) {
+            profile.sso_role_name = profile_sso_role_it->second;
+        }
+    }
+
+    // Default region if not specified
+    if (profile.region.empty()) {
+        profile.region = "us-east-1";
+    }
+
+    // If this is an SSO profile without static credentials, resolve SSO credentials
+    if (!profile.sso_start_url.empty() && profile.access_key_id.empty()) {
+        if (!get_sso_credentials(profile)) {
+            LOG_F(ERROR, "Failed to refresh SSO credentials for profile '%s'", profile.name.c_str());
+            return false;
+        }
+    }
+
+    // Verify we have valid credentials
+    if (profile.access_key_id.empty() || profile.secret_access_key.empty()) {
+        LOG_F(ERROR, "Profile '%s' has no valid credentials after refresh", profile.name.c_str());
+        return false;
+    }
+
+    LOG_F(INFO, "Successfully refreshed credentials for profile '%s'", profile.name.c_str());
+    return true;
+}
