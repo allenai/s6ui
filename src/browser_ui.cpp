@@ -156,6 +156,7 @@ void BrowserUI::renderBucketList() {
         std::string label = "[B] " + bucket.name;
         if (ImGui::Selectable(label.c_str())) {
             m_model.navigateInto(bucket.name, "");
+            ImGui::SetScrollY(0);
         }
         // Right-click context menu
         if (ImGui::BeginPopupContextItem()) {
@@ -184,6 +185,7 @@ void BrowserUI::renderFolderContents() {
     // Show [..] to navigate up
     if (ImGui::Selectable("[..]")) {
         m_model.navigateUp();
+        ImGui::SetScrollY(0);
         return;  // Return early to avoid rendering stale content
     }
     // Prefetch parent folder on hover for instant navigation
@@ -222,6 +224,7 @@ void BrowserUI::renderFolderContents() {
         std::string label = "[D] " + obj.display_name;
         if (ImGui::Selectable(label.c_str())) {
             m_model.navigateInto(bucket, obj.key);
+            ImGui::SetScrollY(0);
         }
         // Right-click context menu
         if (ImGui::BeginPopupContextItem()) {
