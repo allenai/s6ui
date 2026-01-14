@@ -522,8 +522,11 @@ bool BrowserModel::processEvents() {
                         loadMore(payload.bucket, payload.prefix);
                     }
 
-                    // Trigger prefetch for subfolders
-                    triggerPrefetch(payload.bucket, node.objects);
+                    // Only trigger prefetch on initial load, not on pagination continuations
+                    // This prevents prefetching more and more folders as pagination progresses
+                    if (payload.continuation_token.empty()) {
+                        triggerPrefetch(payload.bucket, node.objects);
+                    }
                 }
                 break;
             }
