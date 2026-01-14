@@ -54,6 +54,8 @@ void JsonlPreviewRenderer::render(const PreviewContext& ctx) {
         m_currentLine = 0;
         m_formattedLineIndex = SIZE_MAX;
         m_formattedCache.clear();
+        m_textFieldCache.clear();
+        m_textFieldName.clear();
     }
 
     // Header with filename and progress
@@ -143,18 +145,41 @@ void JsonlPreviewRenderer::render(const PreviewContext& ctx) {
             ImGui::TextUnformatted(lineContent.c_str());
             ImGui::EndChild();
         } else {
-            // Formatted mode - show pretty-printed JSON
+            // Formatted mode - show pretty-printed JSON (and extract text field)
             if (m_formattedLineIndex != m_currentLine) {
-                m_formattedCache = formatJson(lineContent);
+                updateCache(lineContent);
                 m_formattedLineIndex = m_currentLine;
             }
 
             ImVec2 availSize = ImGui::GetContentRegionAvail();
-            ImGui::BeginChild("FormattedContent", availSize, false,
-                ImGuiWindowFlags_HorizontalScrollbar);
-            if (fileChanged) ImGui::SetScrollY(0);
-            ImGui::TextUnformatted(m_formattedCache.c_str());
-            ImGui::EndChild();
+
+            // If we have a text field, split the view horizontally
+            if (!m_textFieldCache.empty()) {
+                float halfHeight = availSize.y * 0.5f - 4;
+
+                // Top pane: formatted JSON
+                ImGui::BeginChild("FormattedContent", ImVec2(availSize.x, halfHeight), true,
+                    ImGuiWindowFlags_HorizontalScrollbar);
+                if (fileChanged) ImGui::SetScrollY(0);
+                ImGui::TextUnformatted(m_formattedCache.c_str());
+                ImGui::EndChild();
+
+                // Bottom pane: text field with word wrap
+                ImGui::BeginChild("TextFieldContent", ImVec2(availSize.x, halfHeight), true);
+                if (fileChanged) ImGui::SetScrollY(0);
+                // Render text with word wrap
+                ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x);
+                ImGui::TextUnformatted(m_textFieldCache.c_str());
+                ImGui::PopTextWrapPos();
+                ImGui::EndChild();
+            } else {
+                // No text field - show JSON only
+                ImGui::BeginChild("FormattedContent", availSize, false,
+                    ImGuiWindowFlags_HorizontalScrollbar);
+                if (fileChanged) ImGui::SetScrollY(0);
+                ImGui::TextUnformatted(m_formattedCache.c_str());
+                ImGui::EndChild();
+            }
         }
     } else {
         ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "No lines loaded yet...");
@@ -166,6 +191,8 @@ void JsonlPreviewRenderer::reset() {
     m_currentLine = 0;
     m_rawMode = false;
     m_formattedCache.clear();
+    m_textFieldCache.clear();
+    m_textFieldName.clear();
     m_formattedLineIndex = SIZE_MAX;
 }
 
@@ -193,12 +220,37 @@ void JsonlPreviewRenderer::navigateLine(int delta, const PreviewContext& ctx) {
     }
 }
 
-std::string JsonlPreviewRenderer::formatJson(const std::string& json) {
+void JsonlPreviewRenderer::updateCache(const std::string& rawJson) {
     try {
-        auto parsed = nlohmann::json::parse(json);
-        return parsed.dump(2);  // Pretty-print with 2-space indent
+        auto parsed = nlohmann::json::parse(rawJson);
+        m_formattedCache = parsed.dump(2);  // Pretty-print with 2-space indent
+        m_textFieldCache = extractTextField(rawJson, m_textFieldName);
     } catch (const nlohmann::json::parse_error& e) {
         // Not valid JSON - return original with error message
-        return std::string("(Invalid JSON: ") + e.what() + ")\n\n" + json;
+        m_formattedCache = std::string("(Invalid JSON: ") + e.what() + ")\n\n" + rawJson;
+        m_textFieldCache.clear();
+        m_textFieldName.clear();
     }
+}
+
+std::string JsonlPreviewRenderer::extractTextField(const std::string& json, std::string& outFieldName) {
+    outFieldName.clear();
+
+    try {
+        auto parsed = nlohmann::json::parse(json);
+        if (!parsed.is_object()) {
+            return "";
+        }
+
+        // Only look for "text" field
+        if (parsed.contains("text") && parsed["text"].is_string()) {
+            outFieldName = "text";
+            return parsed["text"].get<std::string>();
+        }
+
+    } catch (...) {
+        // Ignore parse errors
+    }
+
+    return "";
 }

@@ -17,11 +17,14 @@ public:
 
 private:
     void navigateLine(int delta, const PreviewContext& ctx);
-    static std::string formatJson(const std::string& json);
+    void updateCache(const std::string& rawJson);
+    static std::string extractTextField(const std::string& json, std::string& outFieldName);
 
     std::string m_currentKey;        // bucket/key of loaded file
     size_t m_currentLine = 0;
     bool m_rawMode = false;
-    std::string m_formattedCache;
+    std::string m_formattedCache;    // Pretty-printed JSON
+    std::string m_textFieldCache;    // Extracted text field content
+    std::string m_textFieldName;     // Name of the extracted text field
     size_t m_formattedLineIndex = SIZE_MAX;
 };
