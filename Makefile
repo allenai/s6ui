@@ -119,9 +119,14 @@ AWS_SOURCES = $(AWS_DIR)/aws_credentials.cpp \
               $(AWS_DIR)/aws_signer.cpp \
               $(AWS_DIR)/s3_backend.cpp
 
+PREVIEW_DIR = $(SRC_DIR)/preview
+PREVIEW_SOURCES = $(PREVIEW_DIR)/text_preview.cpp \
+                  $(PREVIEW_DIR)/jsonl_preview.cpp
+
 APP_SOURCES = $(SRC_DIR)/browser_model.cpp \
               $(SRC_DIR)/browser_ui.cpp \
-              $(SRC_DIR)/streaming_preview.cpp
+              $(SRC_DIR)/streaming_preview.cpp \
+              $(PREVIEW_SOURCES)
 
 # Platform-specific main file
 ifeq ($(UNAME_S), Darwin)
@@ -164,7 +169,7 @@ else
 endif
 
 # Create build directories
-$(BUILD_DIR)/libs/imgui $(BUILD_DIR)/libs/loguru $(BUILD_DIR)/libs/imguicolortextedit $(BUILD_DIR)/src/aws:
+$(BUILD_DIR)/libs/imgui $(BUILD_DIR)/libs/loguru $(BUILD_DIR)/libs/imguicolortextedit $(BUILD_DIR)/src/aws $(BUILD_DIR)/src/preview:
 	mkdir -p $@
 
 # Compile libs C++ files (with warnings suppressed)
