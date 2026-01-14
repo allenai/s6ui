@@ -1,4 +1,5 @@
 #include "browser_ui.h"
+#include "preview/image_preview.h"
 #include "preview/jsonl_preview.h"
 #include "preview/text_preview.h"
 #include "aws/aws_signer.h"
@@ -11,6 +12,7 @@ BrowserUI::BrowserUI(BrowserModel& model)
     std::strcpy(m_pathInput, "s3://");
 
     // Initialize preview renderers (order matters - first match wins)
+    m_previewRenderers.push_back(std::make_unique<ImagePreviewRenderer>());
     m_previewRenderers.push_back(std::make_unique<JsonlPreviewRenderer>());
     m_previewRenderers.push_back(std::make_unique<TextPreviewRenderer>());
 }

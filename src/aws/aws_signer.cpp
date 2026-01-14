@@ -53,6 +53,29 @@ static std::string get_date(const std::string& timestamp) {
     return timestamp.substr(0, 8);
 }
 
+// URL encode a path segment (everything except alphanumerics and -_.~)
+// This is used for encoding path components for AWS signature
+static std::string uri_encode(const std::string& value, bool encode_slash = true) {
+    std::ostringstream escaped;
+    escaped.fill('0');
+    escaped << std::hex;
+
+    for (unsigned char c : value) {
+        // Keep alphanumeric and other accepted characters intact
+        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            escaped << c;
+        } else if (c == '/' && !encode_slash) {
+            escaped << c;  // Keep slashes as-is when encoding paths
+        } else {
+            // Any other characters are percent-encoded
+            escaped << '%' << std::uppercase << std::setw(2)
+                    << static_cast<int>(c);
+        }
+    }
+
+    return escaped.str();
+}
+
 static std::string sort_query_string(const std::string& query) {
     if (query.empty()) return "";
 
@@ -102,8 +125,8 @@ AWSSignedRequest aws_sign_request(
     // Payload hash
     std::string payload_hash = sha256(payload);
 
-    // Canonical URI (path)
-    std::string canonical_uri = path.empty() ? "/" : path;
+    // Canonical URI (path) - must be URI-encoded, but keep slashes
+    std::string canonical_uri = path.empty() ? "/" : uri_encode(path, false);
 
     // Canonical query string (must be sorted alphabetically by parameter name)
     std::string canonical_query = sort_query_string(query);
@@ -216,8 +239,8 @@ std::string aws_generate_presigned_url(
     // Build the host
     std::string host = bucket + ".s3." + region + ".amazonaws.com";
 
-    // Build the canonical URI (path) - must be URL encoded
-    std::string canonical_uri = "/" + key;
+    // Build the canonical URI (path) - must be URL encoded, but keep slashes
+    std::string canonical_uri = "/" + uri_encode(key, false);
 
     // For presigned URLs, we use UNSIGNED-PAYLOAD
     const std::string payload_hash = "UNSIGNED-PAYLOAD";

@@ -121,7 +121,15 @@ AWS_SOURCES = $(AWS_DIR)/aws_credentials.cpp \
 
 PREVIEW_DIR = $(SRC_DIR)/preview
 PREVIEW_SOURCES = $(PREVIEW_DIR)/text_preview.cpp \
-                  $(PREVIEW_DIR)/jsonl_preview.cpp
+                  $(PREVIEW_DIR)/jsonl_preview.cpp \
+                  $(PREVIEW_DIR)/image_preview.cpp
+
+# Platform-specific image texture sources
+ifeq ($(UNAME_S), Darwin)
+	IMAGE_TEXTURE_SOURCES = $(PREVIEW_DIR)/image_texture_metal.mm
+else
+	IMAGE_TEXTURE_SOURCES = $(PREVIEW_DIR)/image_texture_opengl.cpp
+endif
 
 APP_SOURCES = $(SRC_DIR)/browser_model.cpp \
               $(SRC_DIR)/browser_ui.cpp \
@@ -149,11 +157,13 @@ APP_OBJS = $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/src/%.o,$(APP_SOURCES))
 # Platform-specific main object files
 ifeq ($(UNAME_S), Darwin)
 	MAIN_OBJS = $(patsubst $(SRC_DIR)/%.mm,$(BUILD_DIR)/src/%.o,$(MAIN_SOURCES))
+	IMAGE_TEXTURE_OBJS = $(patsubst $(SRC_DIR)/%.mm,$(BUILD_DIR)/src/%.o,$(IMAGE_TEXTURE_SOURCES))
 else
 	MAIN_OBJS = $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/src/%.o,$(MAIN_SOURCES))
+	IMAGE_TEXTURE_OBJS = $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/src/%.o,$(IMAGE_TEXTURE_SOURCES))
 endif
 
-ALL_OBJS = $(IMGUI_OBJS) $(IMGUI_METAL_OBJS) $(IMGUI_OPENGL_OBJS) $(LOGURU_OBJS) $(TEXTEDIT_OBJS) $(ZSTD_OBJS) $(STB_OBJS) $(AWS_OBJS) $(APP_OBJS) $(MAIN_OBJS)
+ALL_OBJS = $(IMGUI_OBJS) $(IMGUI_METAL_OBJS) $(IMGUI_OPENGL_OBJS) $(LOGURU_OBJS) $(TEXTEDIT_OBJS) $(ZSTD_OBJS) $(STB_OBJS) $(AWS_OBJS) $(APP_OBJS) $(IMAGE_TEXTURE_OBJS) $(MAIN_OBJS)
 
 # Output
 TARGET = s6ui

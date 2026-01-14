@@ -457,6 +457,9 @@ bool BrowserModel::isPreviewSupported(const std::string& key) {
         // Assembly
         ".asm", ".s", ".S",
 
+        // Images (supported by stb_image)
+        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".psd", ".tga", ".hdr", ".pic", ".pnm", ".pgm", ".ppm",
+
         // Other
         ".vim", ".vimrc",
         ".tmux",
