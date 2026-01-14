@@ -418,6 +418,7 @@ void BrowserUI::renderPreviewPane(float width, float height) {
                         // Reset cursor and selection for new file
                         m_editor.SetCursorPosition(TextEditor::Coordinates(0, 0));
                         m_editor.SetSelection(TextEditor::Coordinates(0, 0), TextEditor::Coordinates(0, 0));
+                        // Note: SetText() internally sets mScrollToTop = true, so scroll resets automatically
                     }
 
                     // Render the editor (read-only, with syntax highlighting)
@@ -527,7 +528,8 @@ void BrowserUI::renderJsonlViewer(float /*width*/, float /*height*/) {
 
     // Check if file changed - reset state
     std::string fullKey = m_model.selectedBucket() + "/" + key;
-    if (m_jsonlCurrentKey != fullKey) {
+    bool fileChanged = (m_jsonlCurrentKey != fullKey);
+    if (fileChanged) {
         m_jsonlCurrentKey = fullKey;
         m_currentJsonlLine = 0;
         m_formattedJsonLineIndex = SIZE_MAX;
@@ -603,6 +605,7 @@ void BrowserUI::renderJsonlViewer(float /*width*/, float /*height*/) {
             ImVec2 availSize = ImGui::GetContentRegionAvail();
             ImGui::BeginChild("PartialContent", availSize, false,
                 ImGuiWindowFlags_HorizontalScrollbar);
+            if (fileChanged) ImGui::SetScrollY(0);
             // Show first/last part of partial content
             if (lineContent.size() > 1000) {
                 std::string preview = lineContent.substr(0, 500) + "\n...\n" +
@@ -617,6 +620,7 @@ void BrowserUI::renderJsonlViewer(float /*width*/, float /*height*/) {
             ImVec2 availSize = ImGui::GetContentRegionAvail();
             ImGui::BeginChild("RawContent", availSize, false,
                 ImGuiWindowFlags_HorizontalScrollbar);
+            if (fileChanged) ImGui::SetScrollY(0);
             ImGui::TextUnformatted(lineContent.c_str());
             ImGui::EndChild();
         } else {
@@ -629,6 +633,7 @@ void BrowserUI::renderJsonlViewer(float /*width*/, float /*height*/) {
             ImVec2 availSize = ImGui::GetContentRegionAvail();
             ImGui::BeginChild("FormattedContent", availSize, false,
                 ImGuiWindowFlags_HorizontalScrollbar);
+            if (fileChanged) ImGui::SetScrollY(0);
             ImGui::TextUnformatted(m_formattedJsonCache.c_str());
             ImGui::EndChild();
         }
