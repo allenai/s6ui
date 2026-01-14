@@ -4,6 +4,7 @@
 #include <curl/curl.h>
 #include <sstream>
 #include <cctype>
+#include <functional>
 #include <GLFW/glfw3.h>
 
 // Helper to parse endpoint URL and extract host (with port if present)

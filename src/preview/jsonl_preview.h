@@ -3,6 +3,7 @@
 #include "preview_renderer.h"
 #include <string>
 #include <climits>
+#include <cstdint>
 
 class JsonlPreviewRenderer : public IPreviewRenderer {
 public:
