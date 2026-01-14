@@ -26,6 +26,7 @@ LIBS_DIR = libs
 SRC_DIR = src
 AWS_DIR = $(SRC_DIR)/aws
 BUILD_DIR = build
+RESOURCES_DIR = resources
 
 # Compiler flags for our source code
 CXXFLAGS = -std=c++17 -Wall -Wextra -O2
@@ -36,6 +37,7 @@ CXXFLAGS += -I$(LIBS_DIR)/imgui
 CXXFLAGS += -I$(LIBS_DIR)/loguru
 CXXFLAGS += -I$(LIBS_DIR)/zstd
 CXXFLAGS += -I$(SRC_DIR)
+CXXFLAGS += -I$(RESOURCES_DIR)
 
 # Compiler flags for third-party libraries (suppress warnings)
 LIBS_CXXFLAGS = -std=c++17 -O2 -w
@@ -146,15 +148,30 @@ ALL_OBJS = $(IMGUI_OBJS) $(IMGUI_METAL_OBJS) $(IMGUI_OPENGL_OBJS) $(LOGURU_OBJS)
 # Output
 TARGET = s6ui
 
+# Font embedding tool and generated files
+FONT_TOOL = $(BUILD_DIR)/binary_to_compressed_c
+FONT_SOURCE = $(RESOURCES_DIR)/fonts/RobotoMono-Medium.ttf
+FONT_HEADER = $(RESOURCES_DIR)/embedded_font.h
+
 # Rules
 all: $(TARGET)
 
-$(TARGET): $(ALL_OBJS)
+# Main target depends on font header being generated first
+$(TARGET): $(FONT_HEADER) $(ALL_OBJS)
 ifeq ($(UNAME_S), Darwin)
 	$(OBJCXX) $(ALL_OBJS) $(LDFLAGS) -o $@
 else
 	$(CXX) $(ALL_OBJS) $(LDFLAGS) -o $@
 endif
+
+# Build the font embedding tool
+$(FONT_TOOL): $(RESOURCES_DIR)/binary_to_compressed_c.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) -std=c++17 -O2 -w $< -o $@
+
+# Generate embedded font header from TTF file
+$(FONT_HEADER): $(FONT_TOOL) $(FONT_SOURCE)
+	$(FONT_TOOL) -u8 $(FONT_SOURCE) RobotoMono_Medium > $@
 
 # Create build directories
 $(BUILD_DIR)/libs/imgui $(BUILD_DIR)/libs/loguru $(BUILD_DIR)/libs/imguicolortextedit $(BUILD_DIR)/src/aws:
@@ -185,8 +202,12 @@ $(BUILD_DIR)/src/%.o: $(SRC_DIR)/%.mm | $(BUILD_DIR)/src/aws
 	@mkdir -p $(dir $@)
 	$(OBJCXX) $(OBJCXXFLAGS) -c $< -o $@
 
+# Main files depend on the embedded font header
+$(BUILD_DIR)/src/main.o: $(FONT_HEADER)
+$(BUILD_DIR)/src/main_linux.o: $(FONT_HEADER)
+
 clean:
-	rm -rf $(BUILD_DIR) $(TARGET)
+	rm -rf $(BUILD_DIR) $(TARGET) $(FONT_HEADER)
 
 # Debug build with symbols and no optimization
 debug: CXXFLAGS = -std=c++17 -Wall -Wextra -g -O0
@@ -197,6 +218,7 @@ debug: CXXFLAGS += -I$(LIBS_DIR)/imgui
 debug: CXXFLAGS += -I$(LIBS_DIR)/loguru
 debug: CXXFLAGS += -I$(LIBS_DIR)/zstd
 debug: CXXFLAGS += -I$(SRC_DIR)
+debug: CXXFLAGS += -I$(RESOURCES_DIR)
 debug: LIBS_CXXFLAGS = -std=c++17 -g -O0 -w
 debug: LIBS_CXXFLAGS += -I$(HOMEBREW_PREFIX)/include
 debug: LIBS_CXXFLAGS += -I$(LIBS_DIR)
@@ -217,6 +239,7 @@ asan: CXXFLAGS += -I$(LIBS_DIR)/imgui
 asan: CXXFLAGS += -I$(LIBS_DIR)/loguru
 asan: CXXFLAGS += -I$(LIBS_DIR)/zstd
 asan: CXXFLAGS += -I$(SRC_DIR)
+asan: CXXFLAGS += -I$(RESOURCES_DIR)
 asan: LIBS_CXXFLAGS = -std=c++17 -g -O1 -w -fsanitize=address -fno-omit-frame-pointer
 asan: LIBS_CXXFLAGS += -I$(HOMEBREW_PREFIX)/include
 asan: LIBS_CXXFLAGS += -I$(LIBS_DIR)

@@ -17,6 +17,8 @@
 #include <memory>
 #include <vector>
 
+#include "embedded_font.h"
+
 // OpenGL loader - we'll use GLEW or glad; for simplicity using GL directly for now
 #include <GL/gl.h>
 
@@ -103,6 +105,12 @@ int main(int argc, char* argv[])
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO(); (void)io;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+
+    // Load embedded font with 2x oversampling for smoother rendering
+    ImFontConfig fontConfig;
+    fontConfig.OversampleH = 2;
+    fontConfig.OversampleV = 2;
+    io.Fonts->AddFontFromMemoryCompressedTTF(RobotoMono_Medium_compressed_data, RobotoMono_Medium_compressed_size, 16.0f, &fontConfig);
 
     // Setup Dear ImGui style
     ImGui::StyleColorsDark();

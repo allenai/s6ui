@@ -22,6 +22,8 @@
 #include <memory>
 #include <vector>
 
+#include "embedded_font.h"
+
 static void glfw_error_callback(int error, const char* description)
 {
     fprintf(stderr, "GLFW Error %d: %s\n", error, description);
@@ -111,6 +113,12 @@ int main(int argc, char* argv[])
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO(); (void)io;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+
+    // Load embedded font with 2x oversampling for smoother rendering
+    ImFontConfig fontConfig;
+    fontConfig.OversampleH = 2;
+    fontConfig.OversampleV = 2;
+    io.Fonts->AddFontFromMemoryCompressedTTF(RobotoMono_Medium_compressed_data, RobotoMono_Medium_compressed_size, 14.0f, &fontConfig);
 
     // Setup Dear ImGui style
     ImGui::StyleColorsDark();
