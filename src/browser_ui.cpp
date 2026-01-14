@@ -61,6 +61,15 @@ void BrowserUI::renderLeftPane(float width, float height) {
 
     renderContent();
 
+    // Right-click context menu for empty space
+    if (ImGui::BeginPopupContextWindow("BrowserContextMenu", ImGuiPopupFlags_MouseButtonRight | ImGuiPopupFlags_NoOpenOverItems)) {
+        if (ImGui::MenuItem("Copy path")) {
+            std::string path = buildS3Path(m_model.currentBucket(), m_model.currentPrefix());
+            ImGui::SetClipboardText(path.c_str());
+        }
+        ImGui::EndPopup();
+    }
+
     ImGui::EndChild();
 
     // Status bar
