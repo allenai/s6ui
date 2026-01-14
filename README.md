@@ -1,15 +1,16 @@
 # s6ui
 
-If `s5cmd` is a fast way to work with AWS S3 buckets via the command line, then `s6ui` is a fast way to do so via GUI.
+`s6ui` is a fast GUI for browsing AWS S3 buckets. If you like `s5cmd`, then you will like `s6ui`.
 
-<img width="1195" height="821" alt="image" src="https://github.com/user-attachments/assets/fa5d5723-bddd-43bb-96d3-fff9a8f423a1" />
+<img width="1312" height="940" alt="Screenshot 2026-01-14 at 2 36 06 PM" src="https://github.com/user-attachments/assets/1c05b724-018d-43fc-8716-e06882f8b851" />
 
-s6ui lets you browse an AWS S3 bucket with a nice lightweight GUI. The idea is that requests are heavily prefetched, so browsing is
-as instant as possible. Most of the time you just click on a prefix/folder and the contents shows up immediately.
 
-There are also nice tools built around some of the things we do here at AI2, such as previewing large datasets. So, click on a file
-containing [Dolma documents](https://github.com/allenai/dolma), and you can quickly see results. You don't even need to load a full 1GB file,
-everything is streamed to make this as fast as possible.
+s6ui lets you browse an AWS S3 bucket with a lightweight GUI powered by [DearImGui](https://github.com/ocornut/imgui)
+s6ui hides latency by prefetching things when you hover your cursor over them. By the time you click on something, most of the time it will load instantly.
+
+There are some tools built-in to help with some of the things we do here at AI2, such as previewing large datasets. So, click on a file
+containing [Dolma documents](https://github.com/allenai/dolma), and you can quickly see results. You don't even need to wait to load a full 1GB file,
+everything is streamed to make this as fast as possible. It's a quick way to see what's inside your bucket or dataset.
 
 ### How to build
 Right now we support MacOSX, (soon Linux).
@@ -47,6 +48,7 @@ aws_secret_access_key = YOUR_SECRET_ACCESS_KEY
 [work]
 aws_access_key_id = WORK_ACCESS_KEY_ID
 aws_secret_access_key = WORK_SECRET_ACCESS_KEY
+endpoint_url = https://custom-weka-server.org:9000
 ```
 
 To use a specific profile, set the `AWS_PROFILE` environment variable:
@@ -54,6 +56,8 @@ To use a specific profile, set the `AWS_PROFILE` environment variable:
 ```bash
 AWS_PROFILE=work ./s6ui
 ```
+
+Regions are auto-detected.
 
 #### Option 2: AWS SSO Configuration
 
