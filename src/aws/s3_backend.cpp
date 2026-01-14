@@ -96,26 +96,84 @@ static std::string extractError(const std::string& xml) {
 
 // Helper to extract region from an S3 endpoint like "bucket.s3.us-west-2.amazonaws.com"
 static std::string extractRegionFromEndpoint(const std::string& endpoint) {
-    // Expected format: bucket.s3.region.amazonaws.com or bucket.s3-region.amazonaws.com
-    // Find "s3." or "s3-" and extract the region part
-    size_t s3Pos = endpoint.find(".s3.");
-    if (s3Pos == std::string::npos) {
-        s3Pos = endpoint.find(".s3-");
+    // Expected formats:
+    // - bucket.s3.region.amazonaws.com
+    // - bucket.s3-region.amazonaws.com
+    // - s3.region.amazonaws.com (without bucket prefix)
+    // - s3-region.amazonaws.com (old format)
+    // Special case: s3.amazonaws.com (global endpoint, no region)
+
+    std::string search = endpoint;
+
+    // Check for global endpoint first
+    if (search == "s3.amazonaws.com" || search.find("s3.amazonaws.com") == 0) {
+        // Check if there's actually a region between s3 and amazonaws
+        // s3.amazonaws.com -> no region
+        // s3.us-east-1.amazonaws.com -> has region
+        size_t s3Pos = search.find("s3.");
+        if (s3Pos != std::string::npos) {
+            size_t regionStart = s3Pos + 3;  // After "s3."
+            size_t amazonawsPos = search.find(".amazonaws.com", regionStart);
+            if (amazonawsPos != std::string::npos) {
+                // Check if there's anything between "s3." and ".amazonaws.com"
+                if (amazonawsPos == regionStart) {
+                    // It's "s3.amazonaws.com" with nothing in between
+                    return "";
+                }
+            }
+        }
     }
-    if (s3Pos == std::string::npos) {
+
+    // Look for "s3." or "s3-" patterns
+    size_t s3DotPos = search.find("s3.");
+    size_t s3DashPos = search.find("s3-");
+
+    size_t s3Pos = std::string::npos;
+    size_t regionStart = 0;
+
+    if (s3DotPos != std::string::npos) {
+        // Found "s3." - region starts after "s3."
+        s3Pos = s3DotPos;
+        regionStart = s3Pos + 3;  // Skip "s3."
+    } else if (s3DashPos != std::string::npos) {
+        // Found "s3-" - region starts after "s3-"
+        s3Pos = s3DashPos;
+        regionStart = s3Pos + 3;  // Skip "s3-"
+    } else {
         return "";  // Can't parse
     }
 
-    // Start after ".s3." or ".s3-"
-    size_t regionStart = s3Pos + 4;
-
     // Find the next dot (before amazonaws.com)
-    size_t regionEnd = endpoint.find('.', regionStart);
-    if (regionEnd == std::string::npos) {
+    size_t regionEnd = search.find('.', regionStart);
+    if (regionEnd == std::string::npos || regionEnd <= regionStart) {
         return "";
     }
 
-    return endpoint.substr(regionStart, regionEnd - regionStart);
+    std::string region = search.substr(regionStart, regionEnd - regionStart);
+
+    // Validate it looks like a region (not "amazonaws" or other invalid values)
+    // Valid regions typically contain at least one dash (e.g., us-east-1, eu-west-2)
+    if (region.find('-') == std::string::npos) {
+        return "";  // Not a valid region format
+    }
+
+    return region;
+}
+
+// Bucket region cache methods
+std::string S3Backend::getCachedRegion(const std::string& bucket) const {
+    std::lock_guard<std::mutex> lock(m_regionCacheMutex);
+    auto it = m_bucketRegionCache.find(bucket);
+    if (it != m_bucketRegionCache.end()) {
+        return it->second;
+    }
+    return "";  // Not cached
+}
+
+void S3Backend::cacheRegion(const std::string& bucket, const std::string& region) {
+    std::lock_guard<std::mutex> lock(m_regionCacheMutex);
+    m_bucketRegionCache[bucket] = region;
+    LOG_F(1, "S3Backend: cached region for bucket=%s region=%s", bucket.c_str(), region.c_str());
 }
 
 // Progress callback for cancellable requests
@@ -214,6 +272,13 @@ void S3Backend::setProfile(const AWSProfile& profile) {
 
     // Cancel all pending requests to ensure clean state
     cancelAll();
+
+    // Clear the bucket region cache when switching profiles
+    {
+        std::lock_guard<std::mutex> lock(m_regionCacheMutex);
+        m_bucketRegionCache.clear();
+        LOG_F(1, "S3Backend: cleared region cache on profile switch");
+    }
 
     // Copy the profile and refresh credentials from disk
     m_profile = profile;
@@ -549,7 +614,19 @@ void S3Backend::processWorkItem(WorkItem& item) {
         }
     }
     else if (item.type == WorkItem::Type::ListObjects) {
-        std::string region = m_profile.region;
+        // Check cache first, fall back to profile region
+        std::string cachedRegion = getCachedRegion(item.bucket);
+        std::string region = cachedRegion.empty() ? m_profile.region : cachedRegion;
+
+        // Validate region is not empty
+        if (region.empty()) {
+            LOG_F(ERROR, "S3Backend: region is empty for bucket=%s, profile.region=%s, cached=%s",
+                  item.bucket.c_str(), m_profile.region.c_str(), cachedRegion.c_str());
+            pushEvent(StateEvent::objectsError(item.bucket, item.prefix,
+                "ERROR: Region not configured. Please ensure your AWS profile has a valid region."));
+            return;
+        }
+
         bool retried = false;
 
         // Retry loop for handling PermanentRedirect
@@ -621,15 +698,59 @@ void S3Backend::processWorkItem(WorkItem& item) {
                 if (errorCode == "PermanentRedirect" && attempt == 0) {
                     // Extract the correct endpoint and retry
                     std::string correctEndpoint = extractTag(response, "Endpoint");
+                    LOG_F(INFO, "S3Backend: PermanentRedirect error, endpoint in response: '%s'",
+                          correctEndpoint.c_str());
+
+                    std::string correctRegion;
+
+                    // Try to extract region from the endpoint
                     if (!correctEndpoint.empty()) {
-                        std::string correctRegion = extractRegionFromEndpoint(correctEndpoint);
-                        if (!correctRegion.empty()) {
-                            LOG_F(INFO, "S3Backend: detected PermanentRedirect, retrying with region=%s (was %s)",
-                                  correctRegion.c_str(), region.c_str());
-                            region = correctRegion;
-                            retried = true;
-                            continue;  // Retry with corrected region
+                        correctRegion = extractRegionFromEndpoint(correctEndpoint);
+                    }
+
+                    // If that failed, try to extract region from bucket name
+                    // Many buckets have region in their name, e.g., "my-bucket-us-east-1"
+                    if (correctRegion.empty()) {
+                        LOG_F(INFO, "S3Backend: trying to extract region from bucket name: '%s'",
+                              item.bucket.c_str());
+                        // Look for region pattern in bucket name (e.g., us-east-1, eu-west-2)
+                        // Common patterns: us-east-1, us-west-2, eu-west-1, ap-southeast-1, etc.
+                        std::string bucketLower = item.bucket;
+                        for (auto& c : bucketLower) c = std::tolower(c);
+
+                        // List of common AWS regions to search for
+                        const char* regions[] = {
+                            "us-east-1", "us-east-2", "us-west-1", "us-west-2",
+                            "eu-west-1", "eu-west-2", "eu-west-3", "eu-central-1", "eu-north-1",
+                            "ap-southeast-1", "ap-southeast-2", "ap-northeast-1", "ap-northeast-2", "ap-south-1",
+                            "ca-central-1", "sa-east-1"
+                        };
+
+                        for (const char* regionName : regions) {
+                            if (bucketLower.find(regionName) != std::string::npos) {
+                                correctRegion = regionName;
+                                LOG_F(INFO, "S3Backend: extracted region from bucket name: %s", correctRegion.c_str());
+                                break;
+                            }
                         }
+                    }
+
+                    // Last resort: use us-east-1 as default (most common region)
+                    if (correctRegion.empty()) {
+                        correctRegion = "us-east-1";
+                        LOG_F(INFO, "S3Backend: falling back to default region: %s", correctRegion.c_str());
+                    }
+
+                    if (!correctRegion.empty() && correctRegion != region) {
+                        LOG_F(INFO, "S3Backend: detected PermanentRedirect, retrying with region=%s (was %s)",
+                              correctRegion.c_str(), region.c_str());
+                        region = correctRegion;
+                        cacheRegion(item.bucket, correctRegion);  // Cache for future requests
+                        retried = true;
+                        continue;  // Retry with corrected region
+                    } else {
+                        LOG_F(WARNING, "S3Backend: PermanentRedirect but could not determine correct region (endpoint: '%s', bucket: '%s')",
+                              correctEndpoint.c_str(), item.bucket.c_str());
                     }
                 }
 
@@ -638,6 +759,9 @@ void S3Backend::processWorkItem(WorkItem& item) {
                 pushEvent(StateEvent::objectsError(item.bucket, item.prefix, result.error));
                 return;
             }
+
+            // Cache the region on success (either profile region or corrected region)
+            cacheRegion(item.bucket, region);
 
             LOG_F(INFO, "S3Backend: listObjects success bucket=%s prefix=%s count=%zu truncated=%d (total=%lldms http=%lldms parse=%lldms)",
                   item.bucket.c_str(), item.prefix.c_str(),
@@ -654,7 +778,19 @@ void S3Backend::processWorkItem(WorkItem& item) {
         }
     }
     else if (item.type == WorkItem::Type::GetObject) {
-        std::string region = m_profile.region;
+        // Check cache first, fall back to profile region
+        std::string cachedRegion = getCachedRegion(item.bucket);
+        std::string region = cachedRegion.empty() ? m_profile.region : cachedRegion;
+
+        // Validate region is not empty
+        if (region.empty()) {
+            LOG_F(ERROR, "S3Backend: region is empty for bucket=%s, profile.region=%s, cached=%s",
+                  item.bucket.c_str(), m_profile.region.c_str(), cachedRegion.c_str());
+            pushEvent(StateEvent::objectContentError(item.bucket, item.key,
+                "ERROR: Region not configured. Please ensure your AWS profile has a valid region."));
+            return;
+        }
+
         bool retried = false;
 
         // Retry loop for handling PermanentRedirect
@@ -715,15 +851,55 @@ void S3Backend::processWorkItem(WorkItem& item) {
                 if (errorCode == "PermanentRedirect" && attempt == 0) {
                     // Extract the correct endpoint and retry
                     std::string correctEndpoint = extractTag(response, "Endpoint");
+                    LOG_F(INFO, "S3Backend: PermanentRedirect error, endpoint in response: '%s'",
+                          correctEndpoint.c_str());
+
+                    std::string correctRegion;
+
+                    // Try to extract region from the endpoint
                     if (!correctEndpoint.empty()) {
-                        std::string correctRegion = extractRegionFromEndpoint(correctEndpoint);
-                        if (!correctRegion.empty()) {
-                            LOG_F(INFO, "S3Backend: detected PermanentRedirect, retrying with region=%s (was %s)",
-                                  correctRegion.c_str(), region.c_str());
-                            region = correctRegion;
-                            retried = true;
-                            continue;  // Retry with corrected region
+                        correctRegion = extractRegionFromEndpoint(correctEndpoint);
+                    }
+
+                    // If that failed, try to extract region from bucket name
+                    if (correctRegion.empty()) {
+                        LOG_F(INFO, "S3Backend: trying to extract region from bucket name: '%s'",
+                              item.bucket.c_str());
+                        std::string bucketLower = item.bucket;
+                        for (auto& c : bucketLower) c = std::tolower(c);
+
+                        const char* regions[] = {
+                            "us-east-1", "us-east-2", "us-west-1", "us-west-2",
+                            "eu-west-1", "eu-west-2", "eu-west-3", "eu-central-1", "eu-north-1",
+                            "ap-southeast-1", "ap-southeast-2", "ap-northeast-1", "ap-northeast-2", "ap-south-1",
+                            "ca-central-1", "sa-east-1"
+                        };
+
+                        for (const char* regionName : regions) {
+                            if (bucketLower.find(regionName) != std::string::npos) {
+                                correctRegion = regionName;
+                                LOG_F(INFO, "S3Backend: extracted region from bucket name: %s", correctRegion.c_str());
+                                break;
+                            }
                         }
+                    }
+
+                    // Last resort: use us-east-1 as default
+                    if (correctRegion.empty()) {
+                        correctRegion = "us-east-1";
+                        LOG_F(INFO, "S3Backend: falling back to default region: %s", correctRegion.c_str());
+                    }
+
+                    if (!correctRegion.empty() && correctRegion != region) {
+                        LOG_F(INFO, "S3Backend: detected PermanentRedirect, retrying with region=%s (was %s)",
+                              correctRegion.c_str(), region.c_str());
+                        region = correctRegion;
+                        cacheRegion(item.bucket, correctRegion);  // Cache for future requests
+                        retried = true;
+                        continue;  // Retry with corrected region
+                    } else {
+                        LOG_F(WARNING, "S3Backend: PermanentRedirect but could not determine correct region (endpoint: '%s', bucket: '%s')",
+                              correctEndpoint.c_str(), item.bucket.c_str());
                     }
                 }
 
@@ -741,6 +917,9 @@ void S3Backend::processWorkItem(WorkItem& item) {
                 return;
             }
 
+            // Cache the region on success (either profile region or corrected region)
+            cacheRegion(item.bucket, region);
+
             LOG_F(INFO, "S3Backend: getObject success bucket=%s key=%s size=%zu (total=%lldms http=%lldms)",
                   item.bucket.c_str(), item.key.c_str(), response.size(), total_ms, http_ms);
             pushEvent(StateEvent::objectContentLoaded(item.bucket, item.key, std::move(response)));
@@ -748,7 +927,19 @@ void S3Backend::processWorkItem(WorkItem& item) {
         }
     }
     else if (item.type == WorkItem::Type::GetObjectRange) {
-        std::string region = m_profile.region;
+        // Check cache first, fall back to profile region
+        std::string cachedRegion = getCachedRegion(item.bucket);
+        std::string region = cachedRegion.empty() ? m_profile.region : cachedRegion;
+
+        // Validate region is not empty
+        if (region.empty()) {
+            LOG_F(ERROR, "S3Backend: region is empty for bucket=%s, profile.region=%s, cached=%s",
+                  item.bucket.c_str(), m_profile.region.c_str(), cachedRegion.c_str());
+            pushEvent(StateEvent::objectRangeError(item.bucket, item.key, item.start_byte,
+                "ERROR: Region not configured. Please ensure your AWS profile has a valid region."));
+            return;
+        }
+
         bool retried = false;
 
         // Retry loop for handling PermanentRedirect
@@ -840,15 +1031,55 @@ void S3Backend::processWorkItem(WorkItem& item) {
                 if (errorCode == "PermanentRedirect" && attempt == 0) {
                     // Extract the correct endpoint and retry
                     std::string correctEndpoint = extractTag(ctx.body, "Endpoint");
+                    LOG_F(INFO, "S3Backend: PermanentRedirect error, endpoint in response: '%s'",
+                          correctEndpoint.c_str());
+
+                    std::string correctRegion;
+
+                    // Try to extract region from the endpoint
                     if (!correctEndpoint.empty()) {
-                        std::string correctRegion = extractRegionFromEndpoint(correctEndpoint);
-                        if (!correctRegion.empty()) {
-                            LOG_F(INFO, "S3Backend: detected PermanentRedirect, retrying with region=%s (was %s)",
-                                  correctRegion.c_str(), region.c_str());
-                            region = correctRegion;
-                            retried = true;
-                            continue;  // Retry with corrected region
+                        correctRegion = extractRegionFromEndpoint(correctEndpoint);
+                    }
+
+                    // If that failed, try to extract region from bucket name
+                    if (correctRegion.empty()) {
+                        LOG_F(INFO, "S3Backend: trying to extract region from bucket name: '%s'",
+                              item.bucket.c_str());
+                        std::string bucketLower = item.bucket;
+                        for (auto& c : bucketLower) c = std::tolower(c);
+
+                        const char* regions[] = {
+                            "us-east-1", "us-east-2", "us-west-1", "us-west-2",
+                            "eu-west-1", "eu-west-2", "eu-west-3", "eu-central-1", "eu-north-1",
+                            "ap-southeast-1", "ap-southeast-2", "ap-northeast-1", "ap-northeast-2", "ap-south-1",
+                            "ca-central-1", "sa-east-1"
+                        };
+
+                        for (const char* regionName : regions) {
+                            if (bucketLower.find(regionName) != std::string::npos) {
+                                correctRegion = regionName;
+                                LOG_F(INFO, "S3Backend: extracted region from bucket name: %s", correctRegion.c_str());
+                                break;
+                            }
                         }
+                    }
+
+                    // Last resort: use us-east-1 as default
+                    if (correctRegion.empty()) {
+                        correctRegion = "us-east-1";
+                        LOG_F(INFO, "S3Backend: falling back to default region: %s", correctRegion.c_str());
+                    }
+
+                    if (!correctRegion.empty() && correctRegion != region) {
+                        LOG_F(INFO, "S3Backend: detected PermanentRedirect, retrying with region=%s (was %s)",
+                              correctRegion.c_str(), region.c_str());
+                        region = correctRegion;
+                        cacheRegion(item.bucket, correctRegion);  // Cache for future requests
+                        retried = true;
+                        continue;  // Retry with corrected region
+                    } else {
+                        LOG_F(WARNING, "S3Backend: PermanentRedirect but could not determine correct region (endpoint: '%s', bucket: '%s')",
+                              correctEndpoint.c_str(), item.bucket.c_str());
                     }
                 }
 
@@ -857,6 +1088,9 @@ void S3Backend::processWorkItem(WorkItem& item) {
                 pushEvent(StateEvent::objectRangeError(item.bucket, item.key, item.start_byte, error));
                 return;
             }
+
+            // Cache the region on success (either profile region or corrected region)
+            cacheRegion(item.bucket, region);
 
             LOG_F(INFO, "S3Backend: getObjectRange success bucket=%s key=%s range=%zu-%zu got=%zu total=%zu (total=%lldms http=%lldms)",
                   item.bucket.c_str(), item.key.c_str(), item.start_byte, item.end_byte,
