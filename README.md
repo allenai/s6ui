@@ -6,10 +6,10 @@
 
 
 s6ui lets you browse an AWS S3 bucket with a lightweight GUI powered by [DearImGui](https://github.com/ocornut/imgui).
-s6ui hides latency by prefetching things when you hover your cursor over them. By the time you click on something, most of the time it will load instantly.
+s6ui hides latency by prefetching things when you hover your cursor over them. By the time you click on something, it will load instantly.
 
-There are some tools built-in to help with some of the things we do here at AI2, such as previewing large datasets. So, click on a file
-containing [Dolma documents](https://github.com/allenai/dolma), and you can quickly see results. You don't even need to wait to load a full 1GB file,
+There are some tools built-in to help with previewing large datasets. Click on a file
+containing [Dolma documents](https://github.com/allenai/dolma), and you can quickly see a preview of the contents. .gz and .zstd decoders are included. You don't even need to wait to load a full 1GB file,
 everything is streamed to make this as fast as possible. It's a quick way to see what's inside your bucket or dataset.
 
 ### How to build
