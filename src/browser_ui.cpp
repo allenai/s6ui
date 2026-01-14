@@ -1,6 +1,7 @@
 #include "browser_ui.h"
 #include "preview/jsonl_preview.h"
 #include "preview/text_preview.h"
+#include "aws/aws_signer.h"
 #include "imgui/imgui.h"
 #include <cstring>
 
@@ -263,6 +264,23 @@ void BrowserUI::renderFolderContents() {
             if (ImGui::MenuItem("Copy path")) {
                 std::string path = "s3://" + bucket + "/" + obj.key;
                 ImGui::SetClipboardText(path.c_str());
+            }
+            if (ImGui::MenuItem("Copy pre-signed URL (7 days)")) {
+                const auto& profiles = m_model.profiles();
+                int idx = m_model.selectedProfileIndex();
+                if (idx >= 0 && idx < static_cast<int>(profiles.size())) {
+                    const auto& profile = profiles[idx];
+                    std::string url = aws_generate_presigned_url(
+                        bucket,
+                        obj.key,
+                        profile.region,
+                        profile.access_key_id,
+                        profile.secret_access_key,
+                        profile.session_token,
+                        604800  // 7 days in seconds
+                    );
+                    ImGui::SetClipboardText(url.c_str());
+                }
             }
             ImGui::EndPopup();
         }
