@@ -146,10 +146,12 @@ void JsonlPreviewRenderer::render(const PreviewContext& ctx) {
             ImGui::EndChild();
         } else {
             // Formatted mode - show pretty-printed JSON (and extract text field)
-            if (m_formattedLineIndex != m_currentLine) {
+            bool lineChanged = (m_formattedLineIndex != m_currentLine);
+            if (lineChanged) {
                 updateCache(lineContent);
                 m_formattedLineIndex = m_currentLine;
             }
+            bool resetScroll = fileChanged || lineChanged;
 
             ImVec2 availSize = ImGui::GetContentRegionAvail();
 
@@ -160,13 +162,13 @@ void JsonlPreviewRenderer::render(const PreviewContext& ctx) {
                 // Top pane: formatted JSON
                 ImGui::BeginChild("FormattedContent", ImVec2(availSize.x, halfHeight), true,
                     ImGuiWindowFlags_HorizontalScrollbar);
-                if (fileChanged) ImGui::SetScrollY(0);
+                if (resetScroll) ImGui::SetScrollY(0);
                 ImGui::TextUnformatted(m_formattedCache.c_str());
                 ImGui::EndChild();
 
                 // Bottom pane: text field with word wrap
                 ImGui::BeginChild("TextFieldContent", ImVec2(availSize.x, halfHeight), true);
-                if (fileChanged) ImGui::SetScrollY(0);
+                if (resetScroll) ImGui::SetScrollY(0);
                 // Render text with word wrap
                 ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x);
                 ImGui::TextUnformatted(m_textFieldCache.c_str());
@@ -176,7 +178,7 @@ void JsonlPreviewRenderer::render(const PreviewContext& ctx) {
                 // No text field - show JSON only
                 ImGui::BeginChild("FormattedContent", availSize, false,
                     ImGuiWindowFlags_HorizontalScrollbar);
-                if (fileChanged) ImGui::SetScrollY(0);
+                if (resetScroll) ImGui::SetScrollY(0);
                 ImGui::TextUnformatted(m_formattedCache.c_str());
                 ImGui::EndChild();
             }
