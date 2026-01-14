@@ -19,3 +19,7 @@ License: MIT
 # zstd
 Source: https://github.com/facebook/zstd/tree/v1.5.7/build/single_file_libs
 License: BSD
+
+# stb_image
+Source: https://github.com/nothings/stb
+License: MIT / Public Domain

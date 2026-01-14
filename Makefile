@@ -35,6 +35,7 @@ CXXFLAGS += -I$(LIBS_DIR)
 CXXFLAGS += -I$(LIBS_DIR)/imgui
 CXXFLAGS += -I$(LIBS_DIR)/loguru
 CXXFLAGS += -I$(LIBS_DIR)/zstd
+CXXFLAGS += -I$(LIBS_DIR)/stb
 CXXFLAGS += -I$(SRC_DIR)
 
 # Compiler flags for third-party libraries (suppress warnings)
@@ -44,11 +45,13 @@ LIBS_CXXFLAGS += -I$(LIBS_DIR)
 LIBS_CXXFLAGS += -I$(LIBS_DIR)/imgui
 LIBS_CXXFLAGS += -I$(LIBS_DIR)/loguru
 LIBS_CXXFLAGS += -I$(LIBS_DIR)/zstd
+LIBS_CXXFLAGS += -I$(LIBS_DIR)/stb
 LIBS_CXXFLAGS += -I$(SRC_DIR)
 
 # C compiler flags for third-party C libraries (suppress warnings)
 LIBS_CFLAGS = -O2 -w
 LIBS_CFLAGS += -I$(LIBS_DIR)/zstd
+LIBS_CFLAGS += -I$(LIBS_DIR)/stb
 
 # Objective-C++ flags (only on macOS)
 ifeq ($(UNAME_S), Darwin)
@@ -109,6 +112,9 @@ TEXTEDIT_SOURCES = $(TEXTEDIT_DIR)/TextEditor.cpp
 ZSTD_DIR = $(LIBS_DIR)/zstd
 ZSTD_SOURCES = $(ZSTD_DIR)/zstddeclib.c
 
+STB_DIR = $(LIBS_DIR)/stb
+STB_SOURCES = $(STB_DIR)/stb_image_impl.c
+
 AWS_SOURCES = $(AWS_DIR)/aws_credentials.cpp \
               $(AWS_DIR)/aws_signer.cpp \
               $(AWS_DIR)/s3_backend.cpp
@@ -131,6 +137,7 @@ IMGUI_OPENGL_OBJS = $(patsubst $(LIBS_DIR)/%.cpp,$(BUILD_DIR)/libs/%.o,$(IMGUI_O
 LOGURU_OBJS = $(patsubst $(LIBS_DIR)/%.cpp,$(BUILD_DIR)/libs/%.o,$(LOGURU_SOURCES))
 TEXTEDIT_OBJS = $(patsubst $(LIBS_DIR)/%.cpp,$(BUILD_DIR)/libs/%.o,$(TEXTEDIT_SOURCES))
 ZSTD_OBJS = $(patsubst $(LIBS_DIR)/%.c,$(BUILD_DIR)/libs/%.o,$(ZSTD_SOURCES))
+STB_OBJS = $(patsubst $(LIBS_DIR)/%.c,$(BUILD_DIR)/libs/%.o,$(STB_SOURCES))
 AWS_OBJS = $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/src/%.o,$(AWS_SOURCES))
 APP_OBJS = $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/src/%.o,$(APP_SOURCES))
 
@@ -141,7 +148,7 @@ else
 	MAIN_OBJS = $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/src/%.o,$(MAIN_SOURCES))
 endif
 
-ALL_OBJS = $(IMGUI_OBJS) $(IMGUI_METAL_OBJS) $(IMGUI_OPENGL_OBJS) $(LOGURU_OBJS) $(TEXTEDIT_OBJS) $(ZSTD_OBJS) $(AWS_OBJS) $(APP_OBJS) $(MAIN_OBJS)
+ALL_OBJS = $(IMGUI_OBJS) $(IMGUI_METAL_OBJS) $(IMGUI_OPENGL_OBJS) $(LOGURU_OBJS) $(TEXTEDIT_OBJS) $(ZSTD_OBJS) $(STB_OBJS) $(AWS_OBJS) $(APP_OBJS) $(MAIN_OBJS)
 
 # Output
 TARGET = s6ui
