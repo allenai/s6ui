@@ -165,8 +165,6 @@ int main(int argc, char* argv[])
             // Render browser UI
             ui.render(win_width, win_height);
 
-            LOG_F(INFO, "Frame");
-
             // Rendering
             ImGui::Render();
             ImDrawData* draw_data = ImGui::GetDrawData();

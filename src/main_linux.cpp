@@ -113,13 +113,17 @@ int main(int argc, char* argv[])
 
     ImVec4 clear_color = ImVec4(0.1f, 0.1f, 0.1f, 1.0f);
 
-    // Main loop
+    // Main loop - adaptive frame rate to save CPU
+    bool hadActivity = true;  // Start active to ensure initial render
     while (!glfwWindowShouldClose(window))
     {
-        glfwPollEvents();
+        // Use adaptive timeout: short when active, longer when idle
+        // This dramatically reduces CPU usage when nothing is happening
+        double timeout = hadActivity ? 0.016 : 0.5;  // 60fps when active, 10fps when idle
+        glfwWaitEventsTimeout(timeout);
 
         // Process any pending events from backend
-        model.processEvents();
+        bool hasBackendEvents = model.processEvents();
 
         // Start the Dear ImGui frame
         ImGui_ImplOpenGL3_NewFrame();
@@ -143,6 +147,13 @@ int main(int argc, char* argv[])
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
         glfwSwapBuffers(window);
+
+        // Track activity for next frame's timeout decision
+        // Stay in fast mode if: backend events, mouse moving/clicking, or keyboard input
+        hadActivity = hasBackendEvents ||
+                      io.MouseDelta.x != 0 || io.MouseDelta.y != 0 ||
+                      io.MouseClicked[0] || io.MouseReleased[0] ||
+                      io.MouseClicked[1] || io.MouseReleased[1];
     }
 
     // Cleanup
