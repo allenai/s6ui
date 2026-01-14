@@ -144,8 +144,8 @@ private:
     static std::string makePreviewCacheKey(const std::string& bucket, const std::string& key);
     static constexpr size_t PREVIEW_MAX_BYTES = 64 * 1024;  // 64KB
 
-    // Gzip helper
-    static bool isGzipped(const std::string& key);
+    // Compression helper - detects .gz, .zst, .zstd extensions
+    static bool isCompressed(const std::string& key);
 
     // Track current hover targets to avoid re-queueing the same request every frame
     std::string m_lastHoveredFile;    // bucket/key of last hovered file

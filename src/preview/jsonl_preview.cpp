@@ -56,15 +56,19 @@ void JsonlPreviewRenderer::render(const PreviewContext& ctx) {
         m_formattedCache.clear();
     }
 
-    // Header with filename
+    // Header with filename and progress
     ImGui::Text("Preview: %s", ctx.filename.c_str());
+    if (!sp->isComplete()) {
+        size_t totalBytes = sp->totalSourceBytes();
+        size_t downloadedBytes = sp->bytesDownloaded();
+        float progress = totalBytes > 0 ? static_cast<float>(downloadedBytes) / static_cast<float>(totalBytes) : 0.0f;
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 1.0f, 1.0f), " (%.0f%%)", progress * 100.0f);
+    }
     ImGui::Separator();
 
     // Navigation bar
     size_t lineCount = sp->lineCount();
-    size_t totalBytes = sp->totalSourceBytes();
-    size_t downloadedBytes = sp->bytesDownloaded();
-    float progress = totalBytes > 0 ? static_cast<float>(downloadedBytes) / static_cast<float>(totalBytes) : 0.0f;
 
     // Clamp current line to valid range
     if (m_currentLine >= lineCount && lineCount > 0) {
@@ -88,11 +92,6 @@ void JsonlPreviewRenderer::render(const PreviewContext& ctx) {
     if (ImGui::Button(">") || (ImGui::IsKeyPressed(ImGuiKey_RightArrow) && !ImGui::GetIO().WantTextInput)) {
         navigateLine(1, ctx);
     }
-    ImGui::SameLine();
-
-    // Progress bar
-    ImGui::SetNextItemWidth(100);
-    ImGui::ProgressBar(progress, ImVec2(0, 0), sp->isComplete() ? "Done" : "");
     ImGui::SameLine();
 
     // Toggle raw/formatted

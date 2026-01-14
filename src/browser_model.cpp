@@ -258,7 +258,7 @@ void BrowserModel::selectFile(const std::string& bucket, const std::string& key)
             m_previewLoading = false;
 
             // Start streaming for gzipped files or large files
-            bool needsStreaming = isGzipped(key) ||
+            bool needsStreaming = isCompressed(key) ||
                 static_cast<size_t>(m_selectedFileSize) > STREAMING_THRESHOLD;
             if (needsStreaming) {
                 startStreamingDownload(static_cast<size_t>(m_selectedFileSize));
@@ -310,11 +310,14 @@ std::string BrowserModel::makePreviewCacheKey(const std::string& bucket, const s
     return bucket + "/" + key;
 }
 
-bool BrowserModel::isGzipped(const std::string& key) {
-    if (key.size() < 3) return false;
-    std::string ext = key.substr(key.size() - 3);
+bool BrowserModel::isCompressed(const std::string& key) {
+    size_t dotPos = key.rfind('.');
+    if (dotPos == std::string::npos) return false;
+
+    std::string ext = key.substr(dotPos);
     for (char& c : ext) c = std::tolower(static_cast<unsigned char>(c));
-    return ext == ".gz";
+
+    return ext == ".gz" || ext == ".zst" || ext == ".zstd";
 }
 
 void BrowserModel::prefetchFolder(const std::string& bucket, const std::string& prefix) {
@@ -558,7 +561,7 @@ bool BrowserModel::processEvents() {
                     // Start streaming for:
                     // 1. Gzipped files (always, for transparent decompression)
                     // 2. Large files that need more data
-                    bool needsStreaming = isGzipped(payload.key) ||
+                    bool needsStreaming = isCompressed(payload.key) ||
                         (static_cast<size_t>(m_selectedFileSize) > STREAMING_THRESHOLD &&
                          static_cast<size_t>(m_selectedFileSize) > payload.content.size());
 
