@@ -135,9 +135,7 @@ private:
     std::shared_ptr<std::atomic<bool>> m_streamingCancelFlag;
     bool m_streamingEnabled = false;  // Whether we're in streaming mode
     void startStreamingDownload(size_t totalFileSize);
-    void requestNextStreamingChunk();
     void cancelStreamingDownload();
-    static constexpr size_t STREAMING_CHUNK_SIZE = 1024 * 1024;  // 1MB chunks
     static constexpr size_t STREAMING_THRESHOLD = 64 * 1024;     // Stream files > 64KB
 
     // Cache for prefetched file previews (bucket/key -> content)

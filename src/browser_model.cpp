@@ -596,11 +596,8 @@ bool BrowserModel::processEvents() {
                     payload.key == m_streamingPreview->key()) {
 
                     m_streamingPreview->appendChunk(payload.data, payload.startByte);
-
-                    // Request next chunk if not complete
-                    if (!m_streamingPreview->isComplete()) {
-                        requestNextStreamingChunk();
-                    }
+                    // Chunks arrive automatically from the single streaming request
+                    // No need to request next chunk - CURL streams them as they arrive
                 }
                 break;
             }
@@ -770,40 +767,18 @@ void BrowserModel::startStreamingDownload(size_t totalFileSize) {
     m_streamingEnabled = true;
     m_streamingCancelFlag = std::make_shared<std::atomic<bool>>(false);
 
-    // Request the next chunk (starting after what we already have)
-    requestNextStreamingChunk();
-}
-
-void BrowserModel::requestNextStreamingChunk() {
-    if (!m_backend || !m_streamingPreview || !m_streamingEnabled) {
-        return;
-    }
-
-    if (m_streamingPreview->isComplete()) {
-        LOG_F(INFO, "Streaming complete for bucket=%s key=%s",
-              m_streamingPreview->bucket().c_str(), m_streamingPreview->key().c_str());
-        return;
-    }
-
+    // Start streaming from where the initial preview left off
+    // Use single streaming request instead of multiple chunk requests
     size_t startByte = m_streamingPreview->nextByteNeeded();
-    size_t endByte = startByte + STREAMING_CHUNK_SIZE - 1;
-
-    // Cap to file size
-    size_t totalSize = m_streamingPreview->totalSourceBytes();
-    if (endByte >= totalSize) {
-        endByte = totalSize - 1;
+    if (startByte < totalFileSize) {
+        LOG_F(INFO, "Starting single streaming request from byte %zu", startByte);
+        m_backend->getObjectStreaming(
+            m_selectedBucket,
+            m_selectedKey,
+            startByte,
+            totalFileSize,
+            m_streamingCancelFlag);
     }
-
-    LOG_F(1, "Requesting streaming chunk: bucket=%s key=%s range=%zu-%zu",
-          m_streamingPreview->bucket().c_str(), m_streamingPreview->key().c_str(),
-          startByte, endByte);
-
-    m_backend->getObjectRange(
-        m_streamingPreview->bucket(),
-        m_streamingPreview->key(),
-        startByte,
-        endByte,
-        m_streamingCancelFlag);
 }
 
 void BrowserModel::cancelStreamingDownload() {
