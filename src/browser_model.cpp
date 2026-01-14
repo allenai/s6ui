@@ -1,6 +1,7 @@
 #include "browser_model.h"
 #include "loguru.hpp"
 #include <unordered_set>
+#include <cstdlib>
 
 BrowserModel::BrowserModel() = default;
 
@@ -15,6 +16,29 @@ void BrowserModel::loadProfiles() {
     LOG_F(INFO, "Loading AWS profiles");
     m_profiles = load_aws_profiles();
     m_selectedProfileIdx = 0;
+
+    // Check for AWS_PROFILE environment variable
+    const char* aws_profile_env = std::getenv("AWS_PROFILE");
+    if (aws_profile_env) {
+        std::string profile_name(aws_profile_env);
+        for (size_t i = 0; i < m_profiles.size(); i++) {
+            if (m_profiles[i].name == profile_name) {
+                m_selectedProfileIdx = static_cast<int>(i);
+                LOG_F(INFO, "Selected profile from AWS_PROFILE: %s", profile_name.c_str());
+                break;
+            }
+        }
+    } else {
+        // No AWS_PROFILE set, look for a profile named "default"
+        for (size_t i = 0; i < m_profiles.size(); i++) {
+            if (m_profiles[i].name == "default") {
+                m_selectedProfileIdx = static_cast<int>(i);
+                LOG_F(INFO, "Selected profile 'default'");
+                break;
+            }
+        }
+    }
+
     LOG_F(INFO, "Loaded %zu profiles", m_profiles.size());
 }
 
