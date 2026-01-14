@@ -5,7 +5,7 @@
 <img width="1312" height="940" alt="Screenshot 2026-01-14 at 2 36 06 PM" src="https://github.com/user-attachments/assets/1c05b724-018d-43fc-8716-e06882f8b851" />
 
 
-s6ui lets you browse an AWS S3 bucket with a lightweight GUI powered by [DearImGui](https://github.com/ocornut/imgui)
+s6ui lets you browse an AWS S3 bucket with a lightweight GUI powered by [DearImGui](https://github.com/ocornut/imgui).
 s6ui hides latency by prefetching things when you hover your cursor over them. By the time you click on something, most of the time it will load instantly.
 
 There are some tools built-in to help with some of the things we do here at AI2, such as previewing large datasets. So, click on a file
