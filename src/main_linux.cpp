@@ -17,6 +17,8 @@
 #include <memory>
 #include <vector>
 
+#include "stb_image.h"
+
 // OpenGL loader - we'll use GLEW or glad; for simplicity using GL directly for now
 #include <GL/gl.h>
 
@@ -97,6 +99,23 @@ int main(int argc, char* argv[])
         return 1;
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1); // Enable vsync
+
+    // Set window icon
+    {
+        int iconWidth, iconHeight, iconChannels;
+        unsigned char* iconPixels = stbi_load("resources/icon/icon512.png", &iconWidth, &iconHeight, &iconChannels, 4);
+        if (iconPixels) {
+            GLFWimage icon;
+            icon.width = iconWidth;
+            icon.height = iconHeight;
+            icon.pixels = iconPixels;
+            glfwSetWindowIcon(window, 1, &icon);
+            stbi_image_free(iconPixels);
+            LOG_F(INFO, "Window icon set: %dx%d", iconWidth, iconHeight);
+        } else {
+            LOG_F(WARNING, "Failed to load window icon: resources/icon/icon.png");
+        }
+    }
 
     // Setup Dear ImGui context
     IMGUI_CHECKVERSION();

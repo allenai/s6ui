@@ -2,6 +2,7 @@
 
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
+#import <AppKit/AppKit.h>
 
 #define GLFW_INCLUDE_NONE
 #define GLFW_EXPOSE_NATIVE_COCOA
@@ -93,6 +94,18 @@ int main(int argc, char* argv[])
     GLFWwindow* window = glfwCreateWindow(1200, 800, "S3 Browser", nullptr, nullptr);
     if (window == nullptr)
         return 1;
+
+    // Set application icon (dock icon on macOS)
+    {
+        NSString* iconPath = @"resources/icon/icon512.png";
+        NSImage* iconImage = [[NSImage alloc] initWithContentsOfFile:iconPath];
+        if (iconImage) {
+            [NSApp setApplicationIconImage:iconImage];
+            LOG_F(INFO, "Application icon set from: %s", [iconPath UTF8String]);
+        } else {
+            LOG_F(WARNING, "Failed to load application icon: %s", [iconPath UTF8String]);
+        }
+    }
 
     // Setup Metal
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
