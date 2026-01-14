@@ -4,6 +4,7 @@
 #include <curl/curl.h>
 #include <sstream>
 #include <cctype>
+#include <GLFW/glfw3.h>
 
 // Helper to parse endpoint URL and extract host (with port if present)
 static std::string parseEndpointHost(const std::string& endpoint_url) {
@@ -304,8 +305,12 @@ std::vector<StateEvent> S3Backend::takeEvents() {
 
 void S3Backend::pushEvent(StateEvent event) {
     if (m_shutdown) return;  // Don't push events during shutdown
-    std::lock_guard<std::mutex> lock(m_eventMutex);
-    m_events.push_back(std::move(event));
+    {
+        std::lock_guard<std::mutex> lock(m_eventMutex);
+        m_events.push_back(std::move(event));
+    }
+    // Wake up the main event loop so it processes this event immediately
+    glfwPostEmptyEvent();
 }
 
 void S3Backend::setProfile(const AWSProfile& profile) {
