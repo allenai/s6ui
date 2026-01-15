@@ -22,6 +22,7 @@
 #include <cstring>
 #include <memory>
 #include <vector>
+#include <climits>
 
 static void glfw_error_callback(int error, const char* description)
 {
@@ -107,7 +108,15 @@ int main(int argc, char* argv[])
 
     // Set application icon (dock icon on macOS)
     {
-        NSString* iconPath = @"resources/icon/icon512.png";
+        // Get the executable's directory and construct icon path relative to it
+        // Use realpath to resolve symlinks (in case executable is symlinked)
+        NSString* execPath = [[NSBundle mainBundle] executablePath];
+        char realPath[PATH_MAX];
+        if (realpath([execPath UTF8String], realPath) != nullptr) {
+            execPath = [NSString stringWithUTF8String:realPath];
+        }
+        NSString* execDir = [execPath stringByDeletingLastPathComponent];
+        NSString* iconPath = [execDir stringByAppendingPathComponent:@"resources/icon/icon512.png"];
         NSImage* iconImage = [[NSImage alloc] initWithContentsOfFile:iconPath];
         if (iconImage) {
             [NSApp setApplicationIconImage:iconImage];

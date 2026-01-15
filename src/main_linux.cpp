@@ -13,9 +13,13 @@
 #include "loguru.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <vector>
+#include <unistd.h>
+#include <libgen.h>
+#include <climits>
 
 #include "stb_image.h"
 
@@ -105,8 +109,26 @@ int main(int argc, char* argv[])
 
     // Set window icon
     {
+        // Get the executable's directory and construct icon path relative to it
+        // Use realpath to resolve symlinks (in case executable is symlinked)
+        char exePath[PATH_MAX];
+        char realPath[PATH_MAX];
+        ssize_t len = readlink("/proc/self/exe", exePath, sizeof(exePath) - 1);
+        std::string iconPath = "resources/icon/icon512.png";  // fallback
+        if (len != -1) {
+            exePath[len] = '\0';
+            // Resolve any symlinks
+            if (realpath(exePath, realPath) != nullptr) {
+                std::string exeDir = dirname(realPath);
+                iconPath = exeDir + "/resources/icon/icon512.png";
+            } else {
+                std::string exeDir = dirname(exePath);
+                iconPath = exeDir + "/resources/icon/icon512.png";
+            }
+        }
+
         int iconWidth, iconHeight, iconChannels;
-        unsigned char* iconPixels = stbi_load("resources/icon/icon512.png", &iconWidth, &iconHeight, &iconChannels, 4);
+        unsigned char* iconPixels = stbi_load(iconPath.c_str(), &iconWidth, &iconHeight, &iconChannels, 4);
         if (iconPixels) {
             GLFWimage icon;
             icon.width = iconWidth;
@@ -114,9 +136,9 @@ int main(int argc, char* argv[])
             icon.pixels = iconPixels;
             glfwSetWindowIcon(window, 1, &icon);
             stbi_image_free(iconPixels);
-            LOG_F(INFO, "Window icon set: %dx%d", iconWidth, iconHeight);
+            LOG_F(INFO, "Window icon set: %dx%d from %s", iconWidth, iconHeight, iconPath.c_str());
         } else {
-            LOG_F(WARNING, "Failed to load window icon: resources/icon/icon.png");
+            LOG_F(WARNING, "Failed to load window icon: %s", iconPath.c_str());
         }
     }
 
