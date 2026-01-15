@@ -305,7 +305,7 @@ void BrowserUI::renderFolderContents() {
         }
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
-            "(%zu items loaded)", node->objects.size());
+            "(%s items loaded)", formatNumber(node->objects.size()).c_str());
     }
 }
 
@@ -320,7 +320,7 @@ void BrowserUI::renderStatusBar() {
             ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Error loading buckets");
         } else {
             size_t bucketCount = m_model.buckets().size();
-            ImGui::Text("%zu bucket%s", bucketCount, bucketCount == 1 ? "" : "s");
+            ImGui::Text("%s bucket%s", formatNumber(bucketCount).c_str(), bucketCount == 1 ? "" : "s");
         }
     } else {
         // In a folder - show object stats
@@ -350,11 +350,11 @@ void BrowserUI::renderStatusBar() {
             // Build status string
             std::string status;
             if (folderCount > 0) {
-                status += std::to_string(folderCount) + " folder" + (folderCount == 1 ? "" : "s");
+                status += formatNumber(folderCount) + " folder" + (folderCount == 1 ? "" : "s");
             }
             if (fileCount > 0) {
                 if (!status.empty()) status += ", ";
-                status += std::to_string(fileCount) + " file" + (fileCount == 1 ? "" : "s");
+                status += formatNumber(fileCount) + " file" + (fileCount == 1 ? "" : "s");
                 status += " (" + formatSize(totalSize) + ")";
             }
             if (status.empty()) {
@@ -464,11 +464,26 @@ void BrowserUI::renderPreviewPane(float width, float height) {
     ImGui::EndChild();
 }
 
+std::string BrowserUI::formatNumber(int64_t number) {
+    std::string numStr = std::to_string(number);
+    std::string result;
+    int count = 0;
+
+    for (auto it = numStr.rbegin(); it != numStr.rend(); ++it) {
+        if (count > 0 && count % 3 == 0) {
+            result = ',' + result;
+        }
+        result = *it + result;
+        count++;
+    }
+    return result;
+}
+
 std::string BrowserUI::formatSize(int64_t bytes) {
-    if (bytes < 1024) return std::to_string(bytes) + " B";
-    if (bytes < 1024 * 1024) return std::to_string(bytes / 1024) + " KB";
-    if (bytes < 1024 * 1024 * 1024) return std::to_string(bytes / (1024 * 1024)) + " MB";
-    return std::to_string(bytes / (1024 * 1024 * 1024)) + " GB";
+    if (bytes < 1024) return formatNumber(bytes) + " B";
+    if (bytes < 1024 * 1024) return formatNumber(bytes / 1024) + " KB";
+    if (bytes < 1024 * 1024 * 1024) return formatNumber(bytes / (1024 * 1024)) + " MB";
+    return formatNumber(bytes / (1024 * 1024 * 1024)) + " GB";
 }
 
 std::string BrowserUI::buildS3Path(const std::string& bucket, const std::string& prefix) {

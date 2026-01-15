@@ -24,6 +24,7 @@ private:
     void renderPreviewPane(float width, float height);
 
     static std::string formatSize(int64_t bytes);
+    static std::string formatNumber(int64_t number);
     static std::string buildS3Path(const std::string& bucket, const std::string& prefix);
 
     BrowserModel& m_model;
