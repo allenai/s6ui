@@ -644,6 +644,31 @@ void S3Backend::workerThread(WorkItem::Priority priority, size_t workerIndex) {
     loguru::set_thread_name(threadName);
     LOG_F(INFO, "S3Backend: %s priority worker %zu started", priorityStr, workerIndex);
 
+    // Warm up the connection pool by establishing a TCP connection to the S3 endpoint
+    {
+        CURL* curl = getThreadCurl();
+        if (curl) {
+            std::string host;
+            if (!m_profile.endpoint_url.empty()) {
+                host = m_profile.endpoint_url;
+            } else {
+                host = "https://s3." + m_profile.region + ".amazonaws.com/";
+            }
+            curl_easy_setopt(curl, CURLOPT_URL, host.c_str());
+            curl_easy_setopt(curl, CURLOPT_CONNECT_ONLY, 1L);
+            curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+            CURLcode res = curl_easy_perform(curl);
+            if (res == CURLE_OK) {
+                LOG_F(INFO, "S3Backend: %s priority worker %zu warmed up connection to %s",
+                      priorityStr, workerIndex, host.c_str());
+            } else {
+                LOG_F(WARNING, "S3Backend: %s priority worker %zu warmup failed: %s",
+                      priorityStr, workerIndex, curl_easy_strerror(res));
+            }
+            resetThreadCurl();
+        }
+    }
+
     // Select the appropriate queue, mutex, and cv based on priority
     auto& queue = (priority == WorkItem::Priority::High) ? m_highPriorityQueue : m_lowPriorityQueue;
     auto& mutex = (priority == WorkItem::Priority::High) ? m_highPriorityMutex : m_lowPriorityMutex;
