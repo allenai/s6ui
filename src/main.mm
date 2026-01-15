@@ -146,11 +146,14 @@ int main(int argc, char* argv[])
     ImGuiIO& io = ImGui::GetIO(); (void)io;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
+    io.Fonts->AddFontDefault();
     // Load embedded font with 2x oversampling for smoother rendering
     ImFontConfig fontConfig;
     fontConfig.OversampleH = 2;
     fontConfig.OversampleV = 2;
-    io.Fonts->AddFontFromMemoryCompressedTTF(RobotoMono_Medium_compressed_data, RobotoMono_Medium_compressed_size, 14.0f, &fontConfig);
+    fontConfig.MergeMode = true;
+    //io.Fonts->AddFontFromMemoryCompressedTTF(RobotoMono_Medium_compressed_data, RobotoMono_Medium_compressed_size, 0.0f, &fontConfig);
+    io.Fonts->AddFontFromFileTTF("resources/fonts/NotoSansCJKjp-Medium.otf", 0.0f, &fontConfig);
 
     // Setup Dear ImGui style
     ImGui::StyleColorsDark();

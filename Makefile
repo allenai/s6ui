@@ -43,6 +43,7 @@ CXXFLAGS += -I$(RESOURCES_DIR)
 # Compiler flags for third-party libraries (suppress warnings)
 LIBS_CXXFLAGS = -std=c++17 -O2 -w
 LIBS_CXXFLAGS += -I$(HOMEBREW_PREFIX)/include
+LIBS_CXXFLAGS += -I$(HOMEBREW_PREFIX)/include/freetype2
 LIBS_CXXFLAGS += -I$(LIBS_DIR)
 LIBS_CXXFLAGS += -I$(LIBS_DIR)/imgui
 LIBS_CXXFLAGS += -I$(LIBS_DIR)/loguru
@@ -71,6 +72,7 @@ LDFLAGS += -lcurl
 LDFLAGS += -lz
 LDFLAGS += -lssl
 LDFLAGS += -lcrypto
+LDFLAGS += -lfreetype
 
 # Platform-specific linker flags
 ifeq ($(UNAME_S), Darwin)
@@ -94,7 +96,8 @@ IMGUI_SOURCES = $(IMGUI_DIR)/imgui.cpp \
                 $(IMGUI_DIR)/imgui_draw.cpp \
                 $(IMGUI_DIR)/imgui_tables.cpp \
                 $(IMGUI_DIR)/imgui_widgets.cpp \
-                $(IMGUI_DIR)/imgui_impl_glfw.cpp
+                $(IMGUI_DIR)/imgui_impl_glfw.cpp \
+                $(IMGUI_DIR)/misc/freetype/imgui_freetype.cpp
 
 # Platform-specific ImGui backend
 ifeq ($(UNAME_S), Darwin)
@@ -243,6 +246,7 @@ debug: CXXFLAGS += -I$(SRC_DIR)
 debug: CXXFLAGS += -I$(RESOURCES_DIR)
 debug: LIBS_CXXFLAGS = -std=c++17 -g -O0 -w
 debug: LIBS_CXXFLAGS += -I$(HOMEBREW_PREFIX)/include
+debug: LIBS_CXXFLAGS += -I$(HOMEBREW_PREFIX)/include/freetype2
 debug: LIBS_CXXFLAGS += -I$(LIBS_DIR)
 debug: LIBS_CXXFLAGS += -I$(LIBS_DIR)/imgui
 debug: LIBS_CXXFLAGS += -I$(LIBS_DIR)/loguru
@@ -264,6 +268,7 @@ asan: CXXFLAGS += -I$(SRC_DIR)
 asan: CXXFLAGS += -I$(RESOURCES_DIR)
 asan: LIBS_CXXFLAGS = -std=c++17 -g -O1 -w -fsanitize=address -fno-omit-frame-pointer
 asan: LIBS_CXXFLAGS += -I$(HOMEBREW_PREFIX)/include
+asan: LIBS_CXXFLAGS += -I$(HOMEBREW_PREFIX)/include/freetype2
 asan: LIBS_CXXFLAGS += -I$(LIBS_DIR)
 asan: LIBS_CXXFLAGS += -I$(LIBS_DIR)/imgui
 asan: LIBS_CXXFLAGS += -I$(LIBS_DIR)/loguru
@@ -276,6 +281,6 @@ asan: clean $(TARGET)
 
 # Install dependencies (convenience target)
 deps:
-	brew install glfw
+	brew install glfw freetype
 
 .PHONY: all clean debug asan deps
