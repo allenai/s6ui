@@ -39,6 +39,46 @@ static size_t writeCallback(void* contents, size_t size, size_t nmemb, std::stri
     return total;
 }
 
+// Thread-local CURL handle for connection reuse
+// Each worker thread gets its own handle, automatically cleaned up on thread exit
+struct ThreadCurlHandle {
+    CURL* handle = nullptr;
+
+    ThreadCurlHandle() {
+        handle = curl_easy_init();
+        if (handle) {
+            LOG_F(INFO, "ThreadCurlHandle: created CURL handle for thread");
+        } else {
+            LOG_F(ERROR, "ThreadCurlHandle: failed to create CURL handle");
+        }
+    }
+
+    ~ThreadCurlHandle() {
+        if (handle) {
+            curl_easy_cleanup(handle);
+            LOG_F(INFO, "ThreadCurlHandle: cleaned up CURL handle for thread");
+        }
+    }
+
+    // Non-copyable
+    ThreadCurlHandle(const ThreadCurlHandle&) = delete;
+    ThreadCurlHandle& operator=(const ThreadCurlHandle&) = delete;
+};
+
+// Get the thread-local CURL handle (lazily initialized)
+static CURL* getThreadCurl() {
+    thread_local ThreadCurlHandle tlsCurl;
+    return tlsCurl.handle;
+}
+
+// Reset the thread-local CURL handle for reuse (preserves connection cache)
+static void resetThreadCurl() {
+    CURL* curl = getThreadCurl();
+    if (curl) {
+        curl_easy_reset(curl);
+    }
+}
+
 // Header callback for capturing Content-Range header
 struct HttpResponseContext {
     std::string body;
@@ -630,8 +670,12 @@ void S3Backend::workerThread(WorkItem::Priority priority, size_t workerIndex) {
         }
 
         processWorkItem(item);
+
+        // Reset curl options for next request, but keep connection cache
+        resetThreadCurl();
     }
 
+    // Thread-local CURL handle is automatically cleaned up when thread exits
     LOG_F(INFO, "S3Backend: %s priority worker %zu exiting", priorityStr, workerIndex);
 }
 
@@ -1044,12 +1088,12 @@ void S3Backend::processWorkItem(WorkItem& item) {
             // Add Range header
             signedReq.headers["Range"] = "bytes=" + std::to_string(item.start_byte) + "-" + std::to_string(item.end_byte);
 
-            // Use httpGetWithContext to capture Content-Range header
+            // Use thread-local CURL handle with header callback to capture Content-Range
             auto http_start = std::chrono::steady_clock::now();
 
-            CURL* curl = curl_easy_init();
+            CURL* curl = getThreadCurl();
             if (!curl) {
-                pushEvent(StateEvent::objectRangeError(item.bucket, item.key, item.start_byte, "ERROR: Failed to init curl"));
+                pushEvent(StateEvent::objectRangeError(item.bucket, item.key, item.start_byte, "ERROR: Failed to get thread-local curl handle"));
                 return;
             }
 
@@ -1079,7 +1123,7 @@ void S3Backend::processWorkItem(WorkItem& item) {
             CURLcode res = curl_easy_perform(curl);
 
             if (headerList) curl_slist_free_all(headerList);
-            curl_easy_cleanup(curl);
+            // Don't cleanup curl - it's reused via thread-local storage
 
             auto http_end = std::chrono::steady_clock::now();
 
@@ -1222,10 +1266,10 @@ void S3Backend::processWorkItem(WorkItem& item) {
 
             auto http_start = std::chrono::steady_clock::now();
 
-            CURL* curl = curl_easy_init();
+            CURL* curl = getThreadCurl();
             if (!curl) {
                 pushEvent(StateEvent::objectRangeError(item.bucket, item.key, item.start_byte,
-                    "ERROR: Failed to init curl"));
+                    "ERROR: Failed to get thread-local curl handle"));
                 return;
             }
 
@@ -1262,7 +1306,7 @@ void S3Backend::processWorkItem(WorkItem& item) {
             CURLcode res = curl_easy_perform(curl);
 
             if (headerList) curl_slist_free_all(headerList);
-            curl_easy_cleanup(curl);
+            // Don't cleanup curl - it's reused via thread-local storage
 
             auto http_end = std::chrono::steady_clock::now();
 
@@ -1340,8 +1384,8 @@ void S3Backend::processWorkItem(WorkItem& item) {
 std::string S3Backend::httpGet(const std::string& url,
                                const std::map<std::string, std::string>& headers,
                                std::shared_ptr<std::atomic<bool>> cancel_flag) {
-    CURL* curl = curl_easy_init();
-    if (!curl) return "ERROR: Failed to init curl";
+    CURL* curl = getThreadCurl();
+    if (!curl) return "ERROR: Failed to get thread-local curl handle";
 
     std::string response;
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
@@ -1368,7 +1412,7 @@ std::string S3Backend::httpGet(const std::string& url,
     CURLcode res = curl_easy_perform(curl);
 
     if (headerList) curl_slist_free_all(headerList);
-    curl_easy_cleanup(curl);
+    // Don't cleanup curl - it's reused via thread-local storage
 
     if (res == CURLE_ABORTED_BY_CALLBACK) {
         return "CANCELLED";  // Special marker for cancelled request
