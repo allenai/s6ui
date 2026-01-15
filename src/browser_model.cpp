@@ -334,16 +334,33 @@ void BrowserModel::prefetchFolder(const std::string& bucket, const std::string& 
     if (!m_backend) return;
 
     // Skip if already loaded or loading
-    const auto* node = getNode(bucket, prefix);
+    auto* node = getNode(bucket, prefix);
     if (node && (node->loaded || node->loading)) return;
 
     // Skip if this is the same folder we're already fetching (avoid re-queueing every frame)
     std::string folderKey = bucket + "/" + prefix;
     if (m_lastHoveredFolder == folderKey) return;
 
-    // Queue low-priority prefetch - the backend handles cancellation of stale requests.
-    // Tracking the hover target ensures we only queue when it changes, not every frame.
-    // cancellable=true so newer hover targets cancel this request.
+    // Reset loading state for the previous hover-prefetch folder since we're cancelling it.
+    // This prevents the folder from being stuck in "loading" state if the request is cancelled
+    // before completion. If the request already completed, this is harmless (loaded=true takes precedence).
+    if (!m_lastHoveredFolder.empty()) {
+        size_t slashPos = m_lastHoveredFolder.find('/');
+        if (slashPos != std::string::npos) {
+            std::string oldBucket = m_lastHoveredFolder.substr(0, slashPos);
+            std::string oldPrefix = m_lastHoveredFolder.substr(slashPos + 1);
+            auto* oldNode = getNode(oldBucket, oldPrefix);
+            if (oldNode && oldNode->loading && !oldNode->loaded) {
+                oldNode->loading = false;
+            }
+        }
+    }
+
+    // Create node and mark as loading to prevent loadFolder() from making a duplicate request
+    // if user clicks before the prefetch completes.
+    auto& newNode = getOrCreateNode(bucket, prefix);
+    newNode.loading = true;
+
     m_lastHoveredFolder = folderKey;
     LOG_F(INFO, "Prefetching folder on hover: bucket=%s prefix=%s", bucket.c_str(), prefix.c_str());
     m_backend->listObjectsPrefetch(bucket, prefix, true /* cancellable */);
@@ -518,8 +535,18 @@ bool BrowserModel::processEvents() {
                 if (payload.continuation_token.empty()) {
                     node.objects = std::move(payload.objects);
                 } else {
+                    // Build a set of existing keys to avoid duplicates
+                    // (can happen if multiple requests were in flight for the same folder)
+                    std::unordered_set<std::string> existingKeys;
+                    existingKeys.reserve(node.objects.size());
+                    for (const auto& obj : node.objects) {
+                        existingKeys.insert(obj.key);
+                    }
+
                     for (auto& obj : payload.objects) {
-                        node.objects.push_back(std::move(obj));
+                        if (existingKeys.find(obj.key) == existingKeys.end()) {
+                            node.objects.push_back(std::move(obj));
+                        }
                     }
                 }
 
