@@ -5,7 +5,17 @@
 
 BrowserModel::BrowserModel() = default;
 
-BrowserModel::~BrowserModel() = default;
+BrowserModel::~BrowserModel() {
+    // Cancel any streaming downloads so worker threads can exit
+    if (m_streamingCancelFlag) {
+        m_streamingCancelFlag->store(true);
+    }
+
+    // Cancel any pending pagination requests
+    if (m_paginationCancelFlag) {
+        m_paginationCancelFlag->store(true);
+    }
+}
 
 void BrowserModel::setBackend(std::unique_ptr<IBackend> backend) {
     LOG_F(INFO, "Setting backend");
