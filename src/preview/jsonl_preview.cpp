@@ -218,7 +218,8 @@ void JsonlPreviewRenderer::reset() {
     m_textFieldCache.clear();
     m_textFieldName.clear();
     m_formattedLineIndex = SIZE_MAX;
-    m_fallbackKey.clear();
+    // Don't clear m_fallbackKey - it needs to persist so wantsFallback() works
+    // across renderer switches. It will naturally expire when a different file is selected.
     m_validatedFirstLine = false;
 }
 
