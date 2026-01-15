@@ -71,6 +71,163 @@ def list_first_keys(s3, bucket: str, prefix: str, n: int = 1000) -> List[str]:
     return keys[:n]
 
 
+def list_page_keys(
+    s3,
+    bucket: str,
+    prefix: str,
+    start_after: str,
+    max_keys: int = 1000,
+    high_exclusive: Optional[str] = None,
+) -> List[str]:
+    resp = call_list_objects_v2(
+        s3,
+        Bucket=bucket,
+        Prefix=prefix,
+        StartAfter=start_after,
+        MaxKeys=max_keys,
+    )
+    keys = [o["Key"] for o in (resp.get("Contents") or [])]
+    if high_exclusive is None:
+        return keys
+    return [k for k in keys if k < high_exclusive]
+
+
+def longest_common_prefix(strings: List[str]) -> str:
+    if not strings:
+        return ""
+    s1 = min(strings)
+    s2 = max(strings)
+    i = 0
+    limit = min(len(s1), len(s2))
+    while i < limit and s1[i] == s2[i]:
+        i += 1
+    return s1[:i]
+
+
+@dataclass(frozen=True)
+class NumericTemplate:
+    prefix: str
+    literals: List[str]
+    widths: List[int]
+
+    @property
+    def num_fields(self) -> int:
+        return len(self.widths)
+
+    def parse(self, key: str) -> List[int]:
+        if not key.startswith(self.prefix):
+            raise ValueError("key does not match prefix")
+        suffix = key[len(self.prefix):]
+        parts = re.split(r"(\d+)", suffix)
+        if len(parts) != len(self.literals) + self.num_fields:
+            raise ValueError("key does not match template")
+        nums: List[int] = []
+        for i in range(self.num_fields):
+            lit = parts[2 * i]
+            num = parts[2 * i + 1]
+            if lit != self.literals[i] or len(num) != self.widths[i]:
+                raise ValueError("key does not match template")
+            nums.append(int(num, 10))
+        if parts[-1] != self.literals[-1]:
+            raise ValueError("key does not match template")
+        return nums
+
+    def build(self, nums: List[int]) -> str:
+        out = [self.prefix]
+        for i, n in enumerate(nums):
+            out.append(self.literals[i])
+            out.append(f"{n:0{self.widths[i]}d}")
+        out.append(self.literals[-1])
+        return "".join(out)
+
+    def jump(self, nums: List[int], field_idx: int) -> Optional[str]:
+        next_nums = nums[:]
+        next_val = next_nums[field_idx] + 1
+        if len(str(next_val)) > self.widths[field_idx]:
+            return None
+        next_nums[field_idx] = next_val
+        for j in range(field_idx + 1, self.num_fields):
+            next_nums[j] = 0
+        return self.build(next_nums)
+
+
+def infer_numeric_template(prefix: str, keys: List[str]) -> Optional[NumericTemplate]:
+    if not keys:
+        return None
+    first = keys[0]
+    if not first.startswith(prefix):
+        return None
+    suffix = first[len(prefix):]
+    parts = re.split(r"(\d+)", suffix)
+    if len(parts) < 3:
+        return None
+    literals = parts[::2]
+    widths = [len(parts[i]) for i in range(1, len(parts), 2)]
+    if not widths:
+        return None
+    for k in keys[1:]:
+        if not k.startswith(prefix):
+            return None
+        sfx = k[len(prefix):]
+        p = re.split(r"(\d+)", sfx)
+        if len(p) != len(parts):
+            return None
+        if p[::2] != literals:
+            return None
+        if [len(p[i]) for i in range(1, len(p), 2)] != widths:
+            return None
+    return NumericTemplate(prefix=prefix, literals=literals, widths=widths)
+
+
+def choose_boundary_from_page(
+    s3,
+    bucket: str,
+    prefix: str,
+    low_exclusive: str,
+    high_exclusive: Optional[str],
+    keys: List[str],
+) -> Tuple[Optional[str], int]:
+    """
+    Returns (boundary, peeks_used). Boundary is a key string to split at.
+    """
+    if len(keys) < 2:
+        return None, 0
+
+    peeks_used = 0
+    first_key = keys[0]
+
+    lcp = longest_common_prefix(keys)
+    if lcp and len(lcp) > len(prefix):
+        boundary = peek_next_key(s3, bucket, prefix, start_after=lcp)
+        peeks_used += 1
+        if boundary is not None:
+            if boundary != first_key and boundary > low_exclusive:
+                if high_exclusive is None or boundary < high_exclusive:
+                    return boundary, peeks_used
+
+    tpl = infer_numeric_template(prefix, keys)
+    if tpl is not None:
+        nums_list = [tpl.parse(k) for k in keys]
+        for idx in range(tpl.num_fields):
+            vals = {nums[idx] for nums in nums_list}
+            if len(vals) == 1:
+                boundary = tpl.jump(nums_list[0], idx)
+                if boundary is not None and boundary > low_exclusive:
+                    if high_exclusive is None or boundary < high_exclusive:
+                        return boundary, peeks_used
+
+    mid = keys[len(keys) // 2]
+    if mid == first_key:
+        mid = keys[-1]
+    if high_exclusive is not None and mid >= high_exclusive:
+        mid = None
+        for k in reversed(keys):
+            if k < high_exclusive and k != first_key:
+                mid = k
+                break
+    return mid, peeks_used
+
+
 @dataclass(frozen=True)
 class HexTemplate:
     # full key is: prefix + dir_prefix + stem + hex(width) + tail
@@ -182,6 +339,104 @@ class Interval:
     low_exclusive: str             # StartAfter
     high_exclusive: Optional[str]  # stop when key >= high_exclusive
     pivot_inclusive: Optional[str] # include this key once (StartAfter would exclude it)
+
+
+def discover_intervals_dynamic(
+    s3,
+    bucket: str,
+    prefix: str,
+    desired_parts: int,
+    max_peeks: int = 2000,
+) -> List[Interval]:
+    """
+    Iterative discovery: sample one page at a time, compute LCP to find a workable
+    split boundary, and fall back to mid-key splits when LCP isn't helpful.
+    """
+    first_key = peek_next_key(s3, bucket, prefix, start_after=prefix)
+    if first_key is None:
+        return []
+
+    work: List[Interval] = [Interval(low_exclusive=prefix, high_exclusive=None, pivot_inclusive=None)]
+    peeks = 0
+    stalled_rounds = 0
+
+    while len(work) < desired_parts and peeks < max_peeks:
+        iv = work[0]
+        keys = list_page_keys(
+            s3,
+            bucket,
+            prefix,
+            start_after=iv.low_exclusive,
+            high_exclusive=iv.high_exclusive,
+        )
+        peeks += 1
+
+        if not keys:
+            stalled_rounds += 1
+            work = work[1:] + [iv]
+            if stalled_rounds >= 50:
+                LOG.info("Discovery(dynamic): stalled (empty pages). parts=%d peeks=%d", len(work), peeks)
+                break
+            continue
+
+        boundary, used = choose_boundary_from_page(
+            s3=s3,
+            bucket=bucket,
+            prefix=prefix,
+            low_exclusive=iv.low_exclusive,
+            high_exclusive=iv.high_exclusive,
+            keys=keys,
+        )
+        peeks += used
+
+        if boundary is None:
+            stalled_rounds += 1
+            work = work[1:] + [iv]
+            if stalled_rounds >= 50:
+                LOG.info("Discovery(dynamic): stalled (no boundary). parts=%d peeks=%d", len(work), peeks)
+                break
+            continue
+
+        right_first = peek_next_key(s3, bucket, prefix, start_after=boundary)
+        peeks += 1
+        if right_first is None:
+            stalled_rounds += 1
+            work = work[1:] + [iv]
+            if stalled_rounds >= 50:
+                LOG.info("Discovery(dynamic): stalled (no right). parts=%d peeks=%d", len(work), peeks)
+                break
+            continue
+        if iv.high_exclusive is not None and right_first >= iv.high_exclusive:
+            stalled_rounds += 1
+            work = work[1:] + [iv]
+            if stalled_rounds >= 50:
+                LOG.info("Discovery(dynamic): stalled (right past high). parts=%d peeks=%d", len(work), peeks)
+                break
+            continue
+
+        left = Interval(
+            low_exclusive=iv.low_exclusive,
+            high_exclusive=boundary,
+            pivot_inclusive=iv.pivot_inclusive,
+        )
+        right = Interval(
+            low_exclusive=boundary,
+            high_exclusive=iv.high_exclusive,
+            pivot_inclusive=boundary,
+        )
+        work = [right, left] + work[1:]
+        stalled_rounds = 0
+
+        LOG.info(
+            "Discovery(dynamic): split parts=%d boundary=%r peeks=%d",
+            len(work),
+            boundary,
+            peeks,
+        )
+
+    work.sort(key=lambda x: x.low_exclusive)
+    LOG.info("Discovery(dynamic): finished parts=%d peeks=%d", len(work), peeks)
+    return work
 
 
 def discover_intervals_hex(
@@ -354,6 +609,8 @@ def list_interval(
         token = resp["NextContinuationToken"]
 
 
+
+
 def parallel_list_s3_prefix_startafter(
     s3_uri: str,
     desired_parts: int = 64,
@@ -374,27 +631,29 @@ def parallel_list_s3_prefix_startafter(
     )
     s3 = boto3.client("s3", config=cfg)
 
-    sample = list_first_keys(s3, bucket, prefix, n=sample_n)
-    LOG.info("Sample: got %d keys (first=%r)", len(sample), sample[0] if sample else None)
-
-    tpl = infer_hex_template(prefix, sample)
-    if tpl is None:
-        LOG.error(
-            "Could not infer a stable <stem><hex><tail> template from the first %d keys.\n"
-            "This StartAfter-binary-search strategy won’t be robust here.\n"
-            "If your names are hash-like, prefix-sharding (Prefix=.../output_00..ff) is the reliable fast approach.",
-            sample_n
-        )
-        # Fallback: just sequential list (not implemented here)
-        raise RuntimeError("Template inference failed; use prefix-sharding or plain sequential listing.")
-
-    intervals = discover_intervals_hex(
+    intervals = discover_intervals_dynamic(
         s3=s3,
         bucket=bucket,
-        tpl=tpl,
+        prefix=prefix,
         desired_parts=desired_parts,
         max_peeks=max_peeks,
     )
+
+    if len(intervals) <= 1 and desired_parts > 1:
+        sample = list_first_keys(s3, bucket, prefix, n=sample_n)
+        LOG.info("Sample: got %d keys (first=%r)", len(sample), sample[0] if sample else None)
+        tpl = infer_hex_template(prefix, sample)
+        if tpl is not None:
+            intervals = discover_intervals_hex(
+                s3=s3,
+                bucket=bucket,
+                tpl=tpl,
+                desired_parts=desired_parts,
+                max_peeks=max_peeks,
+            )
+        else:
+            LOG.warning("Template inference failed; using dynamic intervals.")
+
     if not intervals:
         LOG.info("No keys found under prefix.")
         return []
@@ -411,7 +670,6 @@ def parallel_list_s3_prefix_startafter(
             results_by_idx[i] = keys
             LOG.info("Collect: interval=%d keys=%d", i, len(keys))
 
-    # Merge in interval order, de-duping while preserving order
     merged: List[str] = []
     seen = set()
     total = 0
