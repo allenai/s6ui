@@ -79,10 +79,12 @@ ifeq ($(UNAME_S), Darwin)
 	LDFLAGS += -framework CoreVideo
 	LDFLAGS += -framework QuartzCore
 	LDFLAGS += -framework Security
+	LDFLAGS += -lncurses
 else
 	LDFLAGS += -lGL
 	LDFLAGS += -ldl
 	LDFLAGS += -lpthread
+	LDFLAGS += -lncursesw
 endif
 
 # Source files
@@ -133,6 +135,7 @@ endif
 
 APP_SOURCES = $(SRC_DIR)/browser_model.cpp \
               $(SRC_DIR)/browser_ui.cpp \
+              $(SRC_DIR)/browser_tui.cpp \
               $(SRC_DIR)/streaming_preview.cpp \
               $(PREVIEW_SOURCES)
 
