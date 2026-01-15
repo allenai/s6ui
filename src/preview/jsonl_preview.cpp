@@ -26,7 +26,7 @@ bool JsonlPreviewRenderer::isJsonlFile(const std::string& key) {
         }
     }
 
-    return ext == ".json" || ext == ".jsonl" || ext == ".ndjson";
+    return ext == ".jsonl" || ext == ".ndjson";
 }
 
 bool JsonlPreviewRenderer::canHandle(const std::string& key) const {
