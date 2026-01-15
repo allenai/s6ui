@@ -97,6 +97,9 @@ public:
     // Change the active profile
     void setProfile(const AWSProfile& profile);
 
+    // Set artificial lag for testing (seconds)
+    void setRequestLag(float seconds) { m_requestLagSeconds = seconds; }
+
 private:
     // Work item for the background thread
     struct WorkItem {
@@ -145,6 +148,7 @@ private:
 
     AWSProfile m_profile;
     size_t m_numWorkers;
+    float m_requestLagSeconds = 0.0f;  // Artificial lag for testing
 
     // High-priority worker threads and queue (user actions)
     std::vector<std::thread> m_highPriorityWorkers;

@@ -30,11 +30,12 @@ static void glfw_error_callback(int error, const char* description)
 
 int main(int argc, char* argv[])
 {
-    // Check for verbose flag, debug flag, endpoint URL, and S3 path, filter before passing to loguru
+    // Check for verbose flag, debug flag, endpoint URL, lag, and S3 path, filter before passing to loguru
     bool verbose = false;
     bool showDebugWindow = false;
     std::string initialPath;
     std::string endpointUrl;
+    float requestLag = 0.0f;
     std::vector<char*> filtered_argv;
     filtered_argv.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
@@ -44,6 +45,8 @@ int main(int argc, char* argv[])
             showDebugWindow = true;
         } else if (strcmp(argv[i], "--endpoint-url") == 0 && i + 1 < argc) {
             endpointUrl = argv[++i];
+        } else if (strcmp(argv[i], "--lag") == 0 && i + 1 < argc) {
+            requestLag = std::stof(argv[++i]);
         } else if (strncmp(argv[i], "s3://", 5) == 0 || strncmp(argv[i], "s3:", 3) == 0) {
             initialPath = argv[i];
         } else {
@@ -73,6 +76,10 @@ int main(int argc, char* argv[])
     // Create backend with selected profile (respects AWS_PROFILE env var)
     if (!model.profiles().empty()) {
         auto backend = std::make_unique<S3Backend>(model.profiles()[model.selectedProfileIndex()]);
+        if (requestLag > 0.0f) {
+            backend->setRequestLag(requestLag);
+            LOG_F(INFO, "Request lag set to %.2f seconds", requestLag);
+        }
         model.setBackend(std::move(backend));
         model.refresh();
     }

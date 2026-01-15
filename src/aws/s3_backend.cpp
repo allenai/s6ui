@@ -636,6 +636,13 @@ void S3Backend::workerThread(WorkItem::Priority priority, size_t workerIndex) {
 }
 
 void S3Backend::processWorkItem(WorkItem& item) {
+    // Apply artificial lag for testing if configured
+    if (m_requestLagSeconds > 0.0f) {
+        auto lagMs = static_cast<int>(m_requestLagSeconds * 1000);
+        LOG_F(INFO, "S3Backend: applying %dms lag to request", lagMs);
+        std::this_thread::sleep_for(std::chrono::milliseconds(lagMs));
+    }
+
     if (item.type == WorkItem::Type::ListBuckets) {
         std::string host;
         if (!m_profile.endpoint_url.empty()) {
