@@ -30,8 +30,9 @@ static void glfw_error_callback(int error, const char* description)
 
 int main(int argc, char* argv[])
 {
-    // Check for verbose flag, endpoint URL, and S3 path, filter before passing to loguru
+    // Check for verbose flag, debug flag, endpoint URL, and S3 path, filter before passing to loguru
     bool verbose = false;
+    bool showDebugWindow = false;
     std::string initialPath;
     std::string endpointUrl;
     std::vector<char*> filtered_argv;
@@ -39,6 +40,8 @@ int main(int argc, char* argv[])
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
             verbose = true;
+        } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--debug") == 0) {
+            showDebugWindow = true;
         } else if (strcmp(argv[i], "--endpoint-url") == 0 && i + 1 < argc) {
             endpointUrl = argv[++i];
         } else if (strncmp(argv[i], "s3://", 5) == 0 || strncmp(argv[i], "s3:", 3) == 0) {
@@ -177,6 +180,11 @@ int main(int argc, char* argv[])
 
             // Render browser UI
             ui.render(win_width, win_height);
+
+            // Show ImGui demo/debug window if requested
+            if (showDebugWindow) {
+                ImGui::ShowMetricsWindow(&showDebugWindow);
+            }
 
             // Rendering
             ImGui::Render();
