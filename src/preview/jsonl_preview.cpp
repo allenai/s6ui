@@ -6,7 +6,9 @@
 #include <cctype>
 
 bool JsonlPreviewRenderer::isJsonlFile(const std::string& key) {
-    // Check for .jsonl or .ndjson extension (also handles compressed variants)
+    // Check for .jsonl, .ndjson, or .json extension (also handles compressed variants)
+    // Note: .json files are included because they might be newline-delimited JSON
+    // The renderer will validate the first line and fall back if it's not valid JSONL
     size_t dotPos = key.rfind('.');
     if (dotPos == std::string::npos) return false;
 
@@ -26,7 +28,7 @@ bool JsonlPreviewRenderer::isJsonlFile(const std::string& key) {
         }
     }
 
-    return ext == ".jsonl" || ext == ".ndjson";
+    return ext == ".jsonl" || ext == ".ndjson" || ext == ".json";
 }
 
 bool JsonlPreviewRenderer::canHandle(const std::string& key) const {
@@ -56,6 +58,26 @@ void JsonlPreviewRenderer::render(const PreviewContext& ctx) {
         m_formattedCache.clear();
         m_textFieldCache.clear();
         m_textFieldName.clear();
+        m_validatedFirstLine = false;
+        // Don't clear m_fallbackKey here - it's used by wantsFallback() which is called before render()
+    }
+
+    // Validate first line once it's complete - if not valid JSON, trigger fallback
+    if (!m_validatedFirstLine && sp->lineCount() > 0 && sp->isLineComplete(0)) {
+        m_validatedFirstLine = true;
+        std::string firstLine = sp->getLine(0);
+        if (!isValidJsonLine(firstLine)) {
+            // First line isn't valid JSON - mark this file for fallback
+            m_fallbackKey = fullKey;
+            // Return early - UI will switch to text renderer on next frame
+            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Not valid JSONL, switching to text view...");
+            return;
+        }
+    }
+
+    // If this file was marked for fallback, don't render (UI should have caught this)
+    if (m_fallbackKey == fullKey) {
+        return;
     }
 
     // Header with filename and progress
@@ -196,6 +218,38 @@ void JsonlPreviewRenderer::reset() {
     m_textFieldCache.clear();
     m_textFieldName.clear();
     m_formattedLineIndex = SIZE_MAX;
+    m_fallbackKey.clear();
+    m_validatedFirstLine = false;
+}
+
+bool JsonlPreviewRenderer::wantsFallback(const std::string& bucket, const std::string& key) const {
+    std::string fullKey = bucket + "/" + key;
+    return fullKey == m_fallbackKey;
+}
+
+bool JsonlPreviewRenderer::isValidJsonLine(const std::string& line) {
+    if (line.empty()) return false;
+
+    // Quick check: valid JSON objects/arrays start with { or [
+    // Skip leading whitespace
+    size_t start = 0;
+    while (start < line.size() && std::isspace(static_cast<unsigned char>(line[start]))) {
+        ++start;
+    }
+    if (start >= line.size()) return false;
+
+    char firstChar = line[start];
+    if (firstChar != '{' && firstChar != '[') {
+        return false;  // JSONL lines should be objects or arrays
+    }
+
+    // Try to parse as JSON
+    try {
+        (void)nlohmann::json::parse(line);
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 void JsonlPreviewRenderer::navigateLine(int delta, const PreviewContext& ctx) {

@@ -418,14 +418,16 @@ void BrowserUI::renderPreviewPane(float width, float height) {
             for (auto& r : m_previewRenderers) {
                 // For JSONL renderer, also check that streaming preview is available
                 if (r->canHandle(key)) {
-                    // Special case: JSONL renderer needs streaming preview
+                    // Special case: JSONL renderer needs streaming preview and valid JSONL content
                     if (dynamic_cast<JsonlPreviewRenderer*>(r.get())) {
-                        if (m_model.hasStreamingPreview()) {
-                            renderer = r.get();
-                            break;
+                        if (!m_model.hasStreamingPreview()) {
+                            // If no streaming preview, skip JSONL renderer and use text
+                            continue;
                         }
-                        // If no streaming preview, skip JSONL renderer and use text
-                        continue;
+                        // Check if this file was determined to not be valid JSONL
+                        if (r->wantsFallback(m_model.selectedBucket(), key)) {
+                            continue;
+                        }
                     }
                     renderer = r.get();
                     break;

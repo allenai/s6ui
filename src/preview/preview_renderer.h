@@ -30,4 +30,11 @@ public:
 
     // Reset internal state (called when file deselected or renderer changes)
     virtual void reset() = 0;
+
+    // Check if this renderer wants to fall back to the next renderer for this file
+    // This is called after canHandle() returns true, to allow content-based fallback
+    virtual bool wantsFallback(const std::string& bucket, const std::string& key) const {
+        (void)bucket; (void)key;
+        return false;
+    }
 };
