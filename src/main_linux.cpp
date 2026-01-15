@@ -141,7 +141,7 @@ int main(int argc, char* argv[])
     {
         // Use adaptive timeout: short when active, longer when idle
         // This dramatically reduces CPU usage when nothing is happening
-        double timeout = hadActivity ? 0.016 : 0.5;  // 60fps when active, 10fps when idle
+        double timeout = hadActivity ? 0.016 : 0.5;  // 60fps when active, 2fps when idle
         glfwWaitEventsTimeout(timeout);
 
         // Process any pending events from backend
