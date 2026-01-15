@@ -4,6 +4,8 @@
 #include <curl/curl.h>
 #include <sstream>
 #include <cctype>
+#include <functional>
+#include <GLFW/glfw3.h>
 
 // Helper to parse endpoint URL and extract host (with port if present)
 static std::string parseEndpointHost(const std::string& endpoint_url) {
@@ -35,6 +37,46 @@ static size_t writeCallback(void* contents, size_t size, size_t nmemb, std::stri
     size_t total = size * nmemb;
     userp->append(static_cast<char*>(contents), total);
     return total;
+}
+
+// Thread-local CURL handle for connection reuse
+// Each worker thread gets its own handle, automatically cleaned up on thread exit
+struct ThreadCurlHandle {
+    CURL* handle = nullptr;
+
+    ThreadCurlHandle() {
+        handle = curl_easy_init();
+        if (handle) {
+            LOG_F(INFO, "ThreadCurlHandle: created CURL handle for thread");
+        } else {
+            LOG_F(ERROR, "ThreadCurlHandle: failed to create CURL handle");
+        }
+    }
+
+    ~ThreadCurlHandle() {
+        if (handle) {
+            curl_easy_cleanup(handle);
+            LOG_F(INFO, "ThreadCurlHandle: cleaned up CURL handle for thread");
+        }
+    }
+
+    // Non-copyable
+    ThreadCurlHandle(const ThreadCurlHandle&) = delete;
+    ThreadCurlHandle& operator=(const ThreadCurlHandle&) = delete;
+};
+
+// Get the thread-local CURL handle (lazily initialized)
+static CURL* getThreadCurl() {
+    thread_local ThreadCurlHandle tlsCurl;
+    return tlsCurl.handle;
+}
+
+// Reset the thread-local CURL handle for reuse (preserves connection cache)
+static void resetThreadCurl() {
+    CURL* curl = getThreadCurl();
+    if (curl) {
+        curl_easy_reset(curl);
+    }
 }
 
 // Header callback for capturing Content-Range header
@@ -71,6 +113,48 @@ static size_t writeCallbackCtx(void* contents, size_t size, size_t nmemb, void* 
     size_t total = size * nmemb;
     auto* ctx = static_cast<HttpResponseContext*>(userdata);
     ctx->body.append(static_cast<char*>(contents), total);
+    return total;
+}
+
+// Context for streaming downloads - emits events as chunks arrive
+struct StreamingDownloadContext {
+    S3Backend* backend = nullptr;
+    std::string bucket;
+    std::string key;
+    size_t bytesReceived = 0;  // Bytes received in this request (offset from startByte)
+    size_t startByte = 0;      // Starting byte offset in file
+    size_t totalSize = 0;      // Total file size
+    std::shared_ptr<std::atomic<bool>> cancel_flag;
+    std::string buffer;        // Buffer for chunking
+    std::function<void(StateEvent)> pushEvent;  // Callback to push events
+
+    static constexpr size_t CHUNK_SIZE = 256 * 1024;  // Emit events every 256KB
+};
+
+static size_t streamingWriteCallback(void* contents, size_t size, size_t nmemb, void* userdata) {
+    size_t total = size * nmemb;
+    auto* ctx = static_cast<StreamingDownloadContext*>(userdata);
+
+    // Check cancellation
+    if (ctx->cancel_flag && ctx->cancel_flag->load()) {
+        return 0;  // Abort transfer
+    }
+
+    // Add to buffer
+    ctx->buffer.append(static_cast<char*>(contents), total);
+
+    // Emit events for complete chunks
+    while (ctx->buffer.size() >= StreamingDownloadContext::CHUNK_SIZE) {
+        std::string chunk(ctx->buffer.begin(), ctx->buffer.begin() + StreamingDownloadContext::CHUNK_SIZE);
+        ctx->buffer.erase(0, StreamingDownloadContext::CHUNK_SIZE);
+
+        size_t chunkOffset = ctx->startByte + ctx->bytesReceived;
+        ctx->bytesReceived += chunk.size();
+
+        ctx->pushEvent(StateEvent::objectRangeLoaded(
+            ctx->bucket, ctx->key, chunkOffset, ctx->totalSize, std::move(chunk)));
+    }
+
     return total;
 }
 
@@ -262,8 +346,12 @@ std::vector<StateEvent> S3Backend::takeEvents() {
 
 void S3Backend::pushEvent(StateEvent event) {
     if (m_shutdown) return;  // Don't push events during shutdown
-    std::lock_guard<std::mutex> lock(m_eventMutex);
-    m_events.push_back(std::move(event));
+    {
+        std::lock_guard<std::mutex> lock(m_eventMutex);
+        m_events.push_back(std::move(event));
+    }
+    // Wake up the main event loop so it processes this event immediately
+    glfwPostEmptyEvent();
 }
 
 void S3Backend::setProfile(const AWSProfile& profile) {
@@ -372,6 +460,29 @@ void S3Backend::getObjectRange(
     item.key = key;
     item.start_byte = startByte;
     item.end_byte = endByte;
+    item.queued_at = std::chrono::steady_clock::now();
+    item.cancel_flag = cancel_flag;
+
+    enqueue(std::move(item));
+}
+
+void S3Backend::getObjectStreaming(
+    const std::string& bucket,
+    const std::string& key,
+    size_t startByte,
+    size_t totalSize,
+    std::shared_ptr<std::atomic<bool>> cancel_flag
+) {
+    LOG_F(INFO, "S3Backend: queuing getObjectStreaming bucket=%s key=%s startByte=%zu totalSize=%zu",
+          bucket.c_str(), key.c_str(), startByte, totalSize);
+
+    WorkItem item;
+    item.type = WorkItem::Type::GetObjectStreaming;
+    item.priority = WorkItem::Priority::High;
+    item.bucket = bucket;
+    item.key = key;
+    item.start_byte = startByte;
+    item.total_size = totalSize;
     item.queued_at = std::chrono::steady_clock::now();
     item.cancel_flag = cancel_flag;
 
@@ -559,12 +670,23 @@ void S3Backend::workerThread(WorkItem::Priority priority, size_t workerIndex) {
         }
 
         processWorkItem(item);
+
+        // Reset curl options for next request, but keep connection cache
+        resetThreadCurl();
     }
 
+    // Thread-local CURL handle is automatically cleaned up when thread exits
     LOG_F(INFO, "S3Backend: %s priority worker %zu exiting", priorityStr, workerIndex);
 }
 
 void S3Backend::processWorkItem(WorkItem& item) {
+    // Apply artificial lag for testing if configured
+    if (m_requestLagSeconds > 0.0f) {
+        auto lagMs = static_cast<int>(m_requestLagSeconds * 1000);
+        LOG_F(INFO, "S3Backend: applying %dms lag to request", lagMs);
+        std::this_thread::sleep_for(std::chrono::milliseconds(lagMs));
+    }
+
     if (item.type == WorkItem::Type::ListBuckets) {
         std::string host;
         if (!m_profile.endpoint_url.empty()) {
@@ -966,12 +1088,12 @@ void S3Backend::processWorkItem(WorkItem& item) {
             // Add Range header
             signedReq.headers["Range"] = "bytes=" + std::to_string(item.start_byte) + "-" + std::to_string(item.end_byte);
 
-            // Use httpGetWithContext to capture Content-Range header
+            // Use thread-local CURL handle with header callback to capture Content-Range
             auto http_start = std::chrono::steady_clock::now();
 
-            CURL* curl = curl_easy_init();
+            CURL* curl = getThreadCurl();
             if (!curl) {
-                pushEvent(StateEvent::objectRangeError(item.bucket, item.key, item.start_byte, "ERROR: Failed to init curl"));
+                pushEvent(StateEvent::objectRangeError(item.bucket, item.key, item.start_byte, "ERROR: Failed to get thread-local curl handle"));
                 return;
             }
 
@@ -1001,7 +1123,7 @@ void S3Backend::processWorkItem(WorkItem& item) {
             CURLcode res = curl_easy_perform(curl);
 
             if (headerList) curl_slist_free_all(headerList);
-            curl_easy_cleanup(curl);
+            // Don't cleanup curl - it's reused via thread-local storage
 
             auto http_end = std::chrono::steady_clock::now();
 
@@ -1100,13 +1222,170 @@ void S3Backend::processWorkItem(WorkItem& item) {
             return;  // Success
         }
     }
+    else if (item.type == WorkItem::Type::GetObjectStreaming) {
+        // Check cache first, fall back to profile region
+        std::string cachedRegion = getCachedRegion(item.bucket);
+        std::string region = cachedRegion.empty() ? m_profile.region : cachedRegion;
+
+        // Validate region is not empty
+        if (region.empty()) {
+            LOG_F(ERROR, "S3Backend: region is empty for bucket=%s, profile.region=%s, cached=%s",
+                  item.bucket.c_str(), m_profile.region.c_str(), cachedRegion.c_str());
+            pushEvent(StateEvent::objectRangeError(item.bucket, item.key, item.start_byte,
+                "ERROR: Region not configured. Please ensure your AWS profile has a valid region."));
+            return;
+        }
+
+        bool retried = false;
+
+        // Retry loop for handling PermanentRedirect
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            std::string host;
+            std::string path;
+            if (!m_profile.endpoint_url.empty()) {
+                host = parseEndpointHost(m_profile.endpoint_url);
+                path = "/" + item.bucket + "/" + item.key;
+            } else {
+                host = item.bucket + ".s3." + region + ".amazonaws.com";
+                path = "/" + item.key;
+            }
+            LOG_F(INFO, "S3Backend: streaming object bucket=%s key=%s startByte=%zu totalSize=%zu host=%s region=%s%s",
+                  item.bucket.c_str(), item.key.c_str(), item.start_byte, item.total_size,
+                  host.c_str(), region.c_str(), retried ? " (retry)" : "");
+
+            auto signedReq = aws_sign_request(
+                "GET", host, path, "", region, "s3",
+                m_profile.access_key_id, m_profile.secret_access_key, "",
+                m_profile.session_token
+            );
+
+            // Add Range header if starting from non-zero offset
+            if (item.start_byte > 0) {
+                signedReq.headers["Range"] = "bytes=" + std::to_string(item.start_byte) + "-";
+            }
+
+            auto http_start = std::chrono::steady_clock::now();
+
+            CURL* curl = getThreadCurl();
+            if (!curl) {
+                pushEvent(StateEvent::objectRangeError(item.bucket, item.key, item.start_byte,
+                    "ERROR: Failed to get thread-local curl handle"));
+                return;
+            }
+
+            // Set up streaming context
+            StreamingDownloadContext streamCtx;
+            streamCtx.backend = this;
+            streamCtx.bucket = item.bucket;
+            streamCtx.key = item.key;
+            streamCtx.startByte = item.start_byte;
+            streamCtx.totalSize = item.total_size;
+            streamCtx.cancel_flag = item.cancel_flag;
+            streamCtx.pushEvent = [this](StateEvent event) { this->pushEvent(std::move(event)); };
+
+            curl_easy_setopt(curl, CURLOPT_URL, signedReq.url.c_str());
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, streamingWriteCallback);
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &streamCtx);
+            curl_easy_setopt(curl, CURLOPT_TIMEOUT, 300L);  // 5 minute timeout for large files
+
+            if (item.cancel_flag) {
+                curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+                curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, cancelCheckProgressCallback);
+                curl_easy_setopt(curl, CURLOPT_XFERINFODATA, item.cancel_flag.get());
+            }
+
+            struct curl_slist* headerList = nullptr;
+            for (const auto& [key, value] : signedReq.headers) {
+                std::string header = key + ": " + value;
+                headerList = curl_slist_append(headerList, header.c_str());
+            }
+            if (headerList) {
+                curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headerList);
+            }
+
+            CURLcode res = curl_easy_perform(curl);
+
+            if (headerList) curl_slist_free_all(headerList);
+            // Don't cleanup curl - it's reused via thread-local storage
+
+            auto http_end = std::chrono::steady_clock::now();
+
+            if (res == CURLE_ABORTED_BY_CALLBACK || (item.cancel_flag && item.cancel_flag->load())) {
+                LOG_F(INFO, "S3Backend: getObjectStreaming cancelled bucket=%s key=%s",
+                      item.bucket.c_str(), item.key.c_str());
+                return;
+            }
+
+            auto now = std::chrono::steady_clock::now();
+            auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - item.queued_at).count();
+            auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
+
+            if (res != CURLE_OK) {
+                LOG_F(WARNING, "S3Backend: getObjectStreaming HTTP error: %s (total=%lldms http=%lldms)",
+                      curl_easy_strerror(res), total_ms, http_ms);
+                pushEvent(StateEvent::objectRangeError(item.bucket, item.key, item.start_byte,
+                    "ERROR: " + std::string(curl_easy_strerror(res))));
+                return;
+            }
+
+            // Check for S3 error in any buffered response (errors come as XML)
+            std::string error = extractError(streamCtx.buffer);
+            if (!error.empty()) {
+                // Check for PermanentRedirect error
+                std::string errorCode = extractTag(streamCtx.buffer, "Code");
+                if (errorCode == "PermanentRedirect" && attempt == 0) {
+                    std::string correctEndpoint = extractTag(streamCtx.buffer, "Endpoint");
+                    LOG_F(INFO, "S3Backend: PermanentRedirect error, endpoint: '%s'", correctEndpoint.c_str());
+
+                    std::string correctRegion;
+                    if (!correctEndpoint.empty()) {
+                        correctRegion = extractRegionFromEndpoint(correctEndpoint);
+                    }
+                    if (correctRegion.empty()) {
+                        correctRegion = "us-east-1";
+                    }
+
+                    if (!correctRegion.empty() && correctRegion != region) {
+                        LOG_F(INFO, "S3Backend: retrying with region=%s (was %s)",
+                              correctRegion.c_str(), region.c_str());
+                        region = correctRegion;
+                        cacheRegion(item.bucket, correctRegion);
+                        retried = true;
+                        continue;
+                    }
+                }
+
+                LOG_F(WARNING, "S3Backend: getObjectStreaming S3 error: %s", error.c_str());
+                pushEvent(StateEvent::objectRangeError(item.bucket, item.key, item.start_byte, error));
+                return;
+            }
+
+            // Cache region on success
+            cacheRegion(item.bucket, region);
+
+            // Emit any remaining buffered data as final chunk
+            if (!streamCtx.buffer.empty()) {
+                size_t chunkOffset = item.start_byte + streamCtx.bytesReceived;
+                LOG_F(1, "S3Backend: emitting final chunk of %zu bytes at offset %zu",
+                      streamCtx.buffer.size(), chunkOffset);
+                pushEvent(StateEvent::objectRangeLoaded(item.bucket, item.key, chunkOffset,
+                    item.total_size, std::move(streamCtx.buffer)));
+            }
+
+            LOG_F(INFO, "S3Backend: getObjectStreaming complete bucket=%s key=%s downloaded=%zu bytes (total=%lldms http=%lldms)",
+                  item.bucket.c_str(), item.key.c_str(),
+                  item.start_byte + streamCtx.bytesReceived + streamCtx.buffer.size(),
+                  total_ms, http_ms);
+            return;  // Success
+        }
+    }
 }
 
 std::string S3Backend::httpGet(const std::string& url,
                                const std::map<std::string, std::string>& headers,
                                std::shared_ptr<std::atomic<bool>> cancel_flag) {
-    CURL* curl = curl_easy_init();
-    if (!curl) return "ERROR: Failed to init curl";
+    CURL* curl = getThreadCurl();
+    if (!curl) return "ERROR: Failed to get thread-local curl handle";
 
     std::string response;
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
@@ -1133,7 +1412,7 @@ std::string S3Backend::httpGet(const std::string& url,
     CURLcode res = curl_easy_perform(curl);
 
     if (headerList) curl_slist_free_all(headerList);
-    curl_easy_cleanup(curl);
+    // Don't cleanup curl - it's reused via thread-local storage
 
     if (res == CURLE_ABORTED_BY_CALLBACK) {
         return "CANCELLED";  // Special marker for cancelled request

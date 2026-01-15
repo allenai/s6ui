@@ -13,9 +13,15 @@
 #include "loguru.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <vector>
+#include <unistd.h>
+#include <libgen.h>
+#include <climits>
+
+#include "stb_image.h"
 
 #include "embedded_font.h"
 
@@ -29,8 +35,9 @@ static void glfw_error_callback(int error, const char* description)
 
 int main(int argc, char* argv[])
 {
-    // Check for verbose flag, endpoint URL, and S3 path, filter before passing to loguru
+    // Check for verbose flag, debug flag, endpoint URL, and S3 path, filter before passing to loguru
     bool verbose = false;
+    bool showDebugWindow = false;
     std::string initialPath;
     std::string endpointUrl;
     std::vector<char*> filtered_argv;
@@ -38,6 +45,8 @@ int main(int argc, char* argv[])
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
             verbose = true;
+        } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--debug") == 0) {
+            showDebugWindow = true;
         } else if (strcmp(argv[i], "--endpoint-url") == 0 && i + 1 < argc) {
             endpointUrl = argv[++i];
         } else if (strncmp(argv[i], "s3://", 5) == 0 || strncmp(argv[i], "s3:", 3) == 0) {
@@ -100,6 +109,41 @@ int main(int argc, char* argv[])
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1); // Enable vsync
 
+    // Set window icon
+    {
+        // Get the executable's directory and construct icon path relative to it
+        // Use realpath to resolve symlinks (in case executable is symlinked)
+        char exePath[PATH_MAX];
+        char realPath[PATH_MAX];
+        ssize_t len = readlink("/proc/self/exe", exePath, sizeof(exePath) - 1);
+        std::string iconPath = "resources/icon/icon512.png";  // fallback
+        if (len != -1) {
+            exePath[len] = '\0';
+            // Resolve any symlinks
+            if (realpath(exePath, realPath) != nullptr) {
+                std::string exeDir = dirname(realPath);
+                iconPath = exeDir + "/resources/icon/icon512.png";
+            } else {
+                std::string exeDir = dirname(exePath);
+                iconPath = exeDir + "/resources/icon/icon512.png";
+            }
+        }
+
+        int iconWidth, iconHeight, iconChannels;
+        unsigned char* iconPixels = stbi_load(iconPath.c_str(), &iconWidth, &iconHeight, &iconChannels, 4);
+        if (iconPixels) {
+            GLFWimage icon;
+            icon.width = iconWidth;
+            icon.height = iconHeight;
+            icon.pixels = iconPixels;
+            glfwSetWindowIcon(window, 1, &icon);
+            stbi_image_free(iconPixels);
+            LOG_F(INFO, "Window icon set: %dx%d from %s", iconWidth, iconHeight, iconPath.c_str());
+        } else {
+            LOG_F(WARNING, "Failed to load window icon: %s", iconPath.c_str());
+        }
+    }
+
     // Setup Dear ImGui context
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -121,13 +165,17 @@ int main(int argc, char* argv[])
 
     ImVec4 clear_color = ImVec4(0.1f, 0.1f, 0.1f, 1.0f);
 
-    // Main loop
+    // Main loop - adaptive frame rate to save CPU
+    bool hadActivity = true;  // Start active to ensure initial render
     while (!glfwWindowShouldClose(window))
     {
-        glfwPollEvents();
+        // Use adaptive timeout: short when active, longer when idle
+        // This dramatically reduces CPU usage when nothing is happening
+        double timeout = hadActivity ? 0.016 : 0.5;  // 60fps when active, 2fps when idle
+        glfwWaitEventsTimeout(timeout);
 
         // Process any pending events from backend
-        model.processEvents();
+        bool hasBackendEvents = model.processEvents();
 
         // Start the Dear ImGui frame
         ImGui_ImplOpenGL3_NewFrame();
@@ -141,6 +189,11 @@ int main(int argc, char* argv[])
         // Render browser UI
         ui.render(win_width, win_height);
 
+        // Show ImGui metrics/debug window if requested
+        if (showDebugWindow) {
+            ImGui::ShowMetricsWindow(&showDebugWindow);
+        }
+
         // Rendering
         ImGui::Render();
         int display_w, display_h;
@@ -151,6 +204,13 @@ int main(int argc, char* argv[])
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
         glfwSwapBuffers(window);
+
+        // Track activity for next frame's timeout decision
+        // Stay in fast mode if: backend events, mouse moving/clicking, or keyboard input
+        hadActivity = hasBackendEvents ||
+                      io.MouseDelta.x != 0 || io.MouseDelta.y != 0 ||
+                      io.MouseClicked[0] || io.MouseReleased[0] ||
+                      io.MouseClicked[1] || io.MouseReleased[1];
     }
 
     // Cleanup

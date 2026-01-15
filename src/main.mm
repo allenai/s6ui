@@ -2,6 +2,7 @@
 
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
+#import <AppKit/AppKit.h>
 
 #define GLFW_INCLUDE_NONE
 #define GLFW_EXPOSE_NATIVE_COCOA
@@ -21,6 +22,7 @@
 #include <cstring>
 #include <memory>
 #include <vector>
+#include <climits>
 
 #include "embedded_font.h"
 
@@ -31,17 +33,23 @@ static void glfw_error_callback(int error, const char* description)
 
 int main(int argc, char* argv[])
 {
-    // Check for verbose flag, endpoint URL, and S3 path, filter before passing to loguru
+    // Check for verbose flag, debug flag, endpoint URL, lag, and S3 path, filter before passing to loguru
     bool verbose = false;
+    bool showDebugWindow = false;
     std::string initialPath;
     std::string endpointUrl;
+    float requestLag = 0.0f;
     std::vector<char*> filtered_argv;
     filtered_argv.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
             verbose = true;
+        } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--debug") == 0) {
+            showDebugWindow = true;
         } else if (strcmp(argv[i], "--endpoint-url") == 0 && i + 1 < argc) {
             endpointUrl = argv[++i];
+        } else if (strcmp(argv[i], "--lag") == 0 && i + 1 < argc) {
+            requestLag = std::stof(argv[++i]);
         } else if (strncmp(argv[i], "s3://", 5) == 0 || strncmp(argv[i], "s3:", 3) == 0) {
             initialPath = argv[i];
         } else {
@@ -71,6 +79,10 @@ int main(int argc, char* argv[])
     // Create backend with selected profile (respects AWS_PROFILE env var)
     if (!model.profiles().empty()) {
         auto backend = std::make_unique<S3Backend>(model.profiles()[model.selectedProfileIndex()]);
+        if (requestLag > 0.0f) {
+            backend->setRequestLag(requestLag);
+            LOG_F(INFO, "Request lag set to %.2f seconds", requestLag);
+        }
         model.setBackend(std::move(backend));
         model.refresh();
     }
@@ -95,6 +107,26 @@ int main(int argc, char* argv[])
     GLFWwindow* window = glfwCreateWindow(1200, 800, "S3 Browser", nullptr, nullptr);
     if (window == nullptr)
         return 1;
+
+    // Set application icon (dock icon on macOS)
+    {
+        // Get the executable's directory and construct icon path relative to it
+        // Use realpath to resolve symlinks (in case executable is symlinked)
+        NSString* execPath = [[NSBundle mainBundle] executablePath];
+        char realPath[PATH_MAX];
+        if (realpath([execPath UTF8String], realPath) != nullptr) {
+            execPath = [NSString stringWithUTF8String:realPath];
+        }
+        NSString* execDir = [execPath stringByDeletingLastPathComponent];
+        NSString* iconPath = [execDir stringByAppendingPathComponent:@"resources/icon/icon512.png"];
+        NSImage* iconImage = [[NSImage alloc] initWithContentsOfFile:iconPath];
+        if (iconImage) {
+            [NSApp setApplicationIconImage:iconImage];
+            LOG_F(INFO, "Application icon set from: %s", [iconPath UTF8String]);
+        } else {
+            LOG_F(WARNING, "Failed to load application icon: %s", [iconPath UTF8String]);
+        }
+    }
 
     // Setup Metal
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -129,15 +161,19 @@ int main(int argc, char* argv[])
 
     ImVec4 clear_color = ImVec4(0.1f, 0.1f, 0.1f, 1.0f);
 
-    // Main loop
+    // Main loop - adaptive frame rate to save CPU
+    bool hadActivity = true;  // Start active to ensure initial render
     while (!glfwWindowShouldClose(window))
     {
         @autoreleasepool
         {
-            glfwPollEvents();
+            // Use adaptive timeout: short when active, longer when idle
+            // This dramatically reduces CPU usage when nothing is happening
+            double timeout = hadActivity ? 0.016 : 0.5;  // 60fps when active, 2fps when idle
+            glfwWaitEventsTimeout(timeout);
 
             // Process any pending events from backend
-            model.processEvents();
+            bool hasBackendEvents = model.processEvents();
 
             // Get framebuffer size for Metal (in pixels)
             int fb_width, fb_height;
@@ -169,6 +205,11 @@ int main(int argc, char* argv[])
             // Render browser UI
             ui.render(win_width, win_height);
 
+            // Show ImGui demo/debug window if requested
+            if (showDebugWindow) {
+                ImGui::ShowMetricsWindow(&showDebugWindow);
+            }
+
             // Rendering
             ImGui::Render();
             ImDrawData* draw_data = ImGui::GetDrawData();
@@ -182,6 +223,13 @@ int main(int argc, char* argv[])
 
             [commandBuffer presentDrawable:drawable];
             [commandBuffer commit];
+
+            // Track activity for next frame's timeout decision
+            // Stay in fast mode if: backend events, mouse moving/clicking, or keyboard input
+            hadActivity = hasBackendEvents ||
+                          io.MouseDelta.x != 0 || io.MouseDelta.y != 0 ||
+                          io.MouseClicked[0] || io.MouseReleased[0] ||
+                          io.MouseClicked[1] || io.MouseReleased[1];
         }
     }
 

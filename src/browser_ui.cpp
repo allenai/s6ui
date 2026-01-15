@@ -1,18 +1,20 @@
 #include "browser_ui.h"
+#include "preview/image_preview.h"
+#include "preview/jsonl_preview.h"
+#include "preview/text_preview.h"
+#include "aws/aws_signer.h"
 #include "imgui/imgui.h"
-#include "nlohmann/json.hpp"
 #include <cstring>
-#include <cctype>
 
 BrowserUI::BrowserUI(BrowserModel& model)
     : m_model(model)
 {
     std::strcpy(m_pathInput, "s3://");
 
-    // Configure the text editor for read-only preview
-    m_editor.SetReadOnly(true);
-    m_editor.SetPalette(TextEditor::GetDarkPalette());
-    m_editor.SetShowWhitespaces(false);
+    // Initialize preview renderers (order matters - first match wins)
+    m_previewRenderers.push_back(std::make_unique<ImagePreviewRenderer>());
+    m_previewRenderers.push_back(std::make_unique<JsonlPreviewRenderer>());
+    m_previewRenderers.push_back(std::make_unique<TextPreviewRenderer>());
 }
 
 void BrowserUI::render(int windowWidth, int windowHeight) {
@@ -60,6 +62,15 @@ void BrowserUI::renderLeftPane(float width, float height) {
         ImGuiWindowFlags_HorizontalScrollbar);
 
     renderContent();
+
+    // Right-click context menu for empty space
+    if (ImGui::BeginPopupContextWindow("BrowserContextMenu", ImGuiPopupFlags_MouseButtonRight | ImGuiPopupFlags_NoOpenOverItems)) {
+        if (ImGui::MenuItem("Copy path")) {
+            std::string path = buildS3Path(m_model.currentBucket(), m_model.currentPrefix());
+            ImGui::SetClipboardText(path.c_str());
+        }
+        ImGui::EndPopup();
+    }
 
     ImGui::EndChild();
 
@@ -156,6 +167,7 @@ void BrowserUI::renderBucketList() {
         std::string label = "[B] " + bucket.name;
         if (ImGui::Selectable(label.c_str())) {
             m_model.navigateInto(bucket.name, "");
+            ImGui::SetScrollY(0);
         }
         // Right-click context menu
         if (ImGui::BeginPopupContextItem()) {
@@ -184,6 +196,7 @@ void BrowserUI::renderFolderContents() {
     // Show [..] to navigate up
     if (ImGui::Selectable("[..]")) {
         m_model.navigateUp();
+        ImGui::SetScrollY(0);
         return;  // Return early to avoid rendering stale content
     }
     // Prefetch parent folder on hover for instant navigation
@@ -222,6 +235,7 @@ void BrowserUI::renderFolderContents() {
         std::string label = "[D] " + obj.display_name;
         if (ImGui::Selectable(label.c_str())) {
             m_model.navigateInto(bucket, obj.key);
+            ImGui::SetScrollY(0);
         }
         // Right-click context menu
         if (ImGui::BeginPopupContextItem()) {
@@ -253,6 +267,23 @@ void BrowserUI::renderFolderContents() {
                 std::string path = "s3://" + bucket + "/" + obj.key;
                 ImGui::SetClipboardText(path.c_str());
             }
+            if (ImGui::MenuItem("Copy pre-signed URL (7 days)")) {
+                const auto& profiles = m_model.profiles();
+                int idx = m_model.selectedProfileIndex();
+                if (idx >= 0 && idx < static_cast<int>(profiles.size())) {
+                    const auto& profile = profiles[idx];
+                    std::string url = aws_generate_presigned_url(
+                        bucket,
+                        obj.key,
+                        profile.region,
+                        profile.access_key_id,
+                        profile.secret_access_key,
+                        profile.session_token,
+                        604800  // 7 days in seconds
+                    );
+                    ImGui::SetClipboardText(url.c_str());
+                }
+            }
             ImGui::EndPopup();
         }
         // Prefetch preview content on hover for instant preview when clicked
@@ -274,7 +305,7 @@ void BrowserUI::renderFolderContents() {
         }
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
-            "(%zu items loaded)", node->objects.size());
+            "(%s items loaded)", formatNumber(node->objects.size()).c_str());
     }
 }
 
@@ -289,7 +320,7 @@ void BrowserUI::renderStatusBar() {
             ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Error loading buckets");
         } else {
             size_t bucketCount = m_model.buckets().size();
-            ImGui::Text("%zu bucket%s", bucketCount, bucketCount == 1 ? "" : "s");
+            ImGui::Text("%s bucket%s", formatNumber(bucketCount).c_str(), bucketCount == 1 ? "" : "s");
         }
     } else {
         // In a folder - show object stats
@@ -319,11 +350,11 @@ void BrowserUI::renderStatusBar() {
             // Build status string
             std::string status;
             if (folderCount > 0) {
-                status += std::to_string(folderCount) + " folder" + (folderCount == 1 ? "" : "s");
+                status += formatNumber(folderCount) + " folder" + (folderCount == 1 ? "" : "s");
             }
             if (fileCount > 0) {
                 if (!status.empty()) status += ", ";
-                status += std::to_string(fileCount) + " file" + (fileCount == 1 ? "" : "s");
+                status += formatNumber(fileCount) + " file" + (fileCount == 1 ? "" : "s");
                 status += " (" + formatSize(totalSize) + ")";
             }
             if (status.empty()) {
@@ -346,19 +377,22 @@ void BrowserUI::renderPreviewPane(float width, float height) {
     ImGui::BeginChild("PreviewPane", ImVec2(width, height), true);
 
     if (!m_model.hasSelection()) {
-        m_editorCurrentKey.clear();
-        m_jsonlCurrentKey.clear();
+        // No file selected - reset active renderer
+        if (m_activeRenderer) {
+            m_activeRenderer->reset();
+            m_activeRenderer = nullptr;
+        }
         ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Select a file to preview");
     } else {
-        // Show filename header
-        // Extract just the filename from the key
         const std::string& key = m_model.selectedKey();
         size_t lastSlash = key.rfind('/');
         std::string filename = (lastSlash != std::string::npos) ? key.substr(lastSlash + 1) : key;
 
         if (!m_model.previewSupported()) {
-            m_editorCurrentKey.clear();
-            m_jsonlCurrentKey.clear();
+            if (m_activeRenderer) {
+                m_activeRenderer->reset();
+                m_activeRenderer = nullptr;
+            }
             ImGui::Text("Preview: %s", filename.c_str());
             ImGui::Separator();
             ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Preview not supported for this file type");
@@ -370,57 +404,61 @@ void BrowserUI::renderPreviewPane(float width, float height) {
             ImGui::Separator();
             ImGui::TextColored(ImVec4(0.5f, 0.5f, 1.0f, 1.0f), "Loading preview...");
         } else if (!m_model.previewError().empty()) {
-            m_editorCurrentKey.clear();
-            m_jsonlCurrentKey.clear();
+            if (m_activeRenderer) {
+                m_activeRenderer->reset();
+                m_activeRenderer = nullptr;
+            }
             ImGui::Text("Preview: %s", filename.c_str());
             ImGui::Separator();
             ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
                 "Error: %s", m_model.previewError().c_str());
         } else {
-            // Check if this is a JSONL file with streaming preview
-            bool useJsonlViewer = isJsonlFile(key) && m_model.hasStreamingPreview();
-
-            if (useJsonlViewer) {
-                // Use JSONL viewer for streaming JSONL files
-                m_editorCurrentKey.clear();
-                ImVec2 availSize = ImGui::GetContentRegionAvail();
-                renderJsonlViewer(availSize.x, availSize.y);
-            } else {
-                // Show preview content using the syntax-highlighted editor
-                m_jsonlCurrentKey.clear();
-                ImGui::Text("Preview: %s", filename.c_str());
-
-                // Show streaming progress if active
-                if (m_model.hasStreamingPreview()) {
-                    auto* sp = m_model.streamingPreview();
-                    float progress = static_cast<float>(sp->bytesDownloaded()) /
-                                     static_cast<float>(sp->totalSourceBytes());
-                    ImGui::SameLine();
-                    ImGui::TextColored(ImVec4(0.5f, 0.5f, 1.0f, 1.0f), " (%.0f%%)", progress * 100.0f);
-                }
-
-                ImGui::Separator();
-
-                const std::string& content = m_model.previewContent();
-                if (content.empty()) {
-                    m_editorCurrentKey.clear();
-                    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "(empty file)");
-                } else {
-                    // Update editor content if file changed
-                    std::string fullKey = m_model.selectedBucket() + "/" + key;
-                    if (m_editorCurrentKey != fullKey) {
-                        m_editorCurrentKey = fullKey;
-                        m_editor.SetText(content);
-                        updateEditorLanguage(filename);
-                        // Reset cursor and selection for new file
-                        m_editor.SetCursorPosition(TextEditor::Coordinates(0, 0));
-                        m_editor.SetSelection(TextEditor::Coordinates(0, 0), TextEditor::Coordinates(0, 0));
+            // Find appropriate renderer
+            IPreviewRenderer* renderer = nullptr;
+            for (auto& r : m_previewRenderers) {
+                // For JSONL renderer, also check that streaming preview is available
+                if (r->canHandle(key)) {
+                    // Special case: JSONL renderer needs streaming preview and valid JSONL content
+                    if (dynamic_cast<JsonlPreviewRenderer*>(r.get())) {
+                        if (!m_model.hasStreamingPreview()) {
+                            // If no streaming preview, skip JSONL renderer and use text
+                            continue;
+                        }
+                        // Check if this file was determined to not be valid JSONL
+                        if (r->wantsFallback(m_model.selectedBucket(), key)) {
+                            continue;
+                        }
                     }
-
-                    // Render the editor (read-only, with syntax highlighting)
-                    ImVec2 availSize = ImGui::GetContentRegionAvail();
-                    m_editor.Render("##preview", availSize, false);
+                    renderer = r.get();
+                    break;
                 }
+            }
+
+            if (renderer) {
+                // Switch renderers if needed
+                if (renderer != m_activeRenderer) {
+                    if (m_activeRenderer) {
+                        m_activeRenderer->reset();
+                    }
+                    m_activeRenderer = renderer;
+                }
+
+                ImVec2 availSize = ImGui::GetContentRegionAvail();
+                PreviewContext ctx{
+                    m_model,
+                    m_model.selectedBucket(),
+                    key,
+                    filename,
+                    m_model.streamingPreview(),
+                    availSize.x,
+                    availSize.y
+                };
+                renderer->render(ctx);
+            } else {
+                // Fallback: no renderer found
+                ImGui::Text("Preview: %s", filename.c_str());
+                ImGui::Separator();
+                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "No preview renderer available");
             }
         }
     }
@@ -428,56 +466,26 @@ void BrowserUI::renderPreviewPane(float width, float height) {
     ImGui::EndChild();
 }
 
-void BrowserUI::updateEditorLanguage(const std::string& filename) {
-    // Find the extension
-    size_t dotPos = filename.rfind('.');
-    if (dotPos == std::string::npos) {
-        // No extension - disable colorization to avoid regex issues
-        m_editor.SetColorizerEnable(false);
-        return;
-    }
+std::string BrowserUI::formatNumber(int64_t number) {
+    std::string numStr = std::to_string(number);
+    std::string result;
+    int count = 0;
 
-    std::string ext = filename.substr(dotPos);
-    // Convert to lowercase for comparison
-    for (auto& c : ext) {
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    for (auto it = numStr.rbegin(); it != numStr.rend(); ++it) {
+        if (count > 0 && count % 3 == 0) {
+            result = ',' + result;
+        }
+        result = *it + result;
+        count++;
     }
-
-    // Set language based on extension
-    // For files with proper language definitions, enable colorization
-    if (ext == ".cpp" || ext == ".cxx" || ext == ".cc" || ext == ".hpp" || ext == ".hxx" || ext == ".h") {
-        m_editor.SetColorizerEnable(true);
-        m_editor.SetLanguageDefinition(TextEditor::LanguageDefinition::CPlusPlus());
-    } else if (ext == ".c") {
-        m_editor.SetColorizerEnable(true);
-        m_editor.SetLanguageDefinition(TextEditor::LanguageDefinition::C());
-    } else if (ext == ".lua") {
-        m_editor.SetColorizerEnable(true);
-        m_editor.SetLanguageDefinition(TextEditor::LanguageDefinition::Lua());
-    } else if (ext == ".sql") {
-        m_editor.SetColorizerEnable(true);
-        m_editor.SetLanguageDefinition(TextEditor::LanguageDefinition::SQL());
-    } else if (ext == ".hlsl" || ext == ".fx") {
-        m_editor.SetColorizerEnable(true);
-        m_editor.SetLanguageDefinition(TextEditor::LanguageDefinition::HLSL());
-    } else if (ext == ".glsl" || ext == ".vert" || ext == ".frag" || ext == ".geom") {
-        m_editor.SetColorizerEnable(true);
-        m_editor.SetLanguageDefinition(TextEditor::LanguageDefinition::GLSL());
-    } else if (ext == ".as") {
-        m_editor.SetColorizerEnable(true);
-        m_editor.SetLanguageDefinition(TextEditor::LanguageDefinition::AngelScript());
-    } else {
-        // For .txt, .md, .json, .jsonl, .html etc., disable colorization
-        // to avoid regex complexity issues with large/complex content
-        m_editor.SetColorizerEnable(false);
-    }
+    return result;
 }
 
 std::string BrowserUI::formatSize(int64_t bytes) {
-    if (bytes < 1024) return std::to_string(bytes) + " B";
-    if (bytes < 1024 * 1024) return std::to_string(bytes / 1024) + " KB";
-    if (bytes < 1024 * 1024 * 1024) return std::to_string(bytes / (1024 * 1024)) + " MB";
-    return std::to_string(bytes / (1024 * 1024 * 1024)) + " GB";
+    if (bytes < 1024) return formatNumber(bytes) + " B";
+    if (bytes < 1024 * 1024) return formatNumber(bytes / 1024) + " KB";
+    if (bytes < 1024 * 1024 * 1024) return formatNumber(bytes / (1024 * 1024)) + " MB";
+    return formatNumber(bytes / (1024 * 1024 * 1024)) + " GB";
 }
 
 std::string BrowserUI::buildS3Path(const std::string& bucket, const std::string& prefix) {
@@ -488,182 +496,4 @@ std::string BrowserUI::buildS3Path(const std::string& bucket, const std::string&
         return "s3://" + bucket + "/";
     }
     return "s3://" + bucket + "/" + prefix;
-}
-
-bool BrowserUI::isJsonlFile(const std::string& key) {
-    // Check for .jsonl or .ndjson extension (also handles compressed variants)
-    size_t dotPos = key.rfind('.');
-    if (dotPos == std::string::npos) return false;
-
-    std::string ext = key.substr(dotPos);
-    for (char& c : ext) {
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
-
-    // If it's a compressed file (.gz, .zst, .zstd), check the inner extension
-    if ((ext == ".gz" || ext == ".zst" || ext == ".zstd") && dotPos > 0) {
-        std::string withoutCompression = key.substr(0, dotPos);
-        size_t innerDotPos = withoutCompression.rfind('.');
-        if (innerDotPos == std::string::npos) return false;
-        ext = withoutCompression.substr(innerDotPos);
-        for (char& c : ext) {
-            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        }
-    }
-
-    return ext == ".json" || ext == ".jsonl" || ext == ".ndjson";
-}
-
-void BrowserUI::renderJsonlViewer(float /*width*/, float /*height*/) {
-    auto* sp = m_model.streamingPreview();
-    if (!sp) return;
-
-    const std::string& key = m_model.selectedKey();
-    size_t lastSlash = key.rfind('/');
-    std::string filename = (lastSlash != std::string::npos) ? key.substr(lastSlash + 1) : key;
-
-    // Check if file changed - reset state
-    std::string fullKey = m_model.selectedBucket() + "/" + key;
-    if (m_jsonlCurrentKey != fullKey) {
-        m_jsonlCurrentKey = fullKey;
-        m_currentJsonlLine = 0;
-        m_formattedJsonLineIndex = SIZE_MAX;
-        m_formattedJsonCache.clear();
-    }
-
-    // Header with filename
-    ImGui::Text("Preview: %s", filename.c_str());
-    ImGui::Separator();
-
-    // Navigation bar
-    size_t lineCount = sp->lineCount();
-    size_t totalBytes = sp->totalSourceBytes();
-    size_t downloadedBytes = sp->bytesDownloaded();
-    float progress = totalBytes > 0 ? static_cast<float>(downloadedBytes) / static_cast<float>(totalBytes) : 0.0f;
-
-    // Clamp current line to valid range
-    if (m_currentJsonlLine >= lineCount && lineCount > 0) {
-        m_currentJsonlLine = lineCount - 1;
-    }
-
-    // Navigation controls
-    ImGui::BeginGroup();
-
-    // Left arrow button
-    if (ImGui::Button("<") || (ImGui::IsKeyPressed(ImGuiKey_LeftArrow) && !ImGui::GetIO().WantTextInput)) {
-        navigateJsonlLine(-1);
-    }
-    ImGui::SameLine();
-
-    // Line counter
-    ImGui::Text("Line %zu / %zu", m_currentJsonlLine + 1, lineCount);
-    ImGui::SameLine();
-
-    // Right arrow button
-    if (ImGui::Button(">") || (ImGui::IsKeyPressed(ImGuiKey_RightArrow) && !ImGui::GetIO().WantTextInput)) {
-        navigateJsonlLine(1);
-    }
-    ImGui::SameLine();
-
-    // Progress bar
-    ImGui::SetNextItemWidth(100);
-    ImGui::ProgressBar(progress, ImVec2(0, 0), sp->isComplete() ? "Done" : "");
-    ImGui::SameLine();
-
-    // Toggle raw/formatted
-    if (ImGui::Checkbox("Raw", &m_jsonlRawMode)) {
-        m_formattedJsonLineIndex = SIZE_MAX;  // Force refresh
-    }
-
-    ImGui::EndGroup();
-    ImGui::Separator();
-
-    // Get current line content
-    if (lineCount > 0) {
-        bool lineComplete = sp->isLineComplete(m_currentJsonlLine);
-        std::string lineContent = sp->getLine(m_currentJsonlLine);
-
-        if (lineContent.empty()) {
-            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "(empty line)");
-        } else if (!lineComplete) {
-            // Line is still being downloaded - invalidate cache so it re-formats when complete
-            if (m_formattedJsonLineIndex == m_currentJsonlLine) {
-                m_formattedJsonLineIndex = SIZE_MAX;
-            }
-
-            // Show partial content with indicator
-            ImGui::TextColored(ImVec4(0.5f, 0.5f, 1.0f, 1.0f),
-                "Line incomplete (%zu bytes loaded so far)...", lineContent.size());
-            ImGui::Spacing();
-
-            // Show partial content in raw form (don't try to parse incomplete JSON)
-            ImVec2 availSize = ImGui::GetContentRegionAvail();
-            ImGui::BeginChild("PartialContent", availSize, false,
-                ImGuiWindowFlags_HorizontalScrollbar);
-            // Show first/last part of partial content
-            if (lineContent.size() > 1000) {
-                std::string preview = lineContent.substr(0, 500) + "\n...\n" +
-                                      lineContent.substr(lineContent.size() - 500);
-                ImGui::TextUnformatted(preview.c_str());
-            } else {
-                ImGui::TextUnformatted(lineContent.c_str());
-            }
-            ImGui::EndChild();
-        } else if (m_jsonlRawMode) {
-            // Raw mode - show unformatted line in scrollable region
-            ImVec2 availSize = ImGui::GetContentRegionAvail();
-            ImGui::BeginChild("RawContent", availSize, false,
-                ImGuiWindowFlags_HorizontalScrollbar);
-            ImGui::TextUnformatted(lineContent.c_str());
-            ImGui::EndChild();
-        } else {
-            // Formatted mode - show pretty-printed JSON
-            if (m_formattedJsonLineIndex != m_currentJsonlLine) {
-                m_formattedJsonCache = formatJson(lineContent);
-                m_formattedJsonLineIndex = m_currentJsonlLine;
-            }
-
-            ImVec2 availSize = ImGui::GetContentRegionAvail();
-            ImGui::BeginChild("FormattedContent", availSize, false,
-                ImGuiWindowFlags_HorizontalScrollbar);
-            ImGui::TextUnformatted(m_formattedJsonCache.c_str());
-            ImGui::EndChild();
-        }
-    } else {
-        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "No lines loaded yet...");
-    }
-}
-
-void BrowserUI::navigateJsonlLine(int delta) {
-    auto* sp = m_model.streamingPreview();
-    if (!sp) return;
-
-    size_t lineCount = sp->lineCount();
-    if (lineCount == 0) return;
-
-    if (delta < 0) {
-        size_t absDelta = static_cast<size_t>(-delta);
-        if (m_currentJsonlLine >= absDelta) {
-            m_currentJsonlLine -= absDelta;
-        } else {
-            m_currentJsonlLine = 0;
-        }
-    } else if (delta > 0) {
-        size_t newLine = m_currentJsonlLine + static_cast<size_t>(delta);
-        if (newLine < lineCount) {
-            m_currentJsonlLine = newLine;
-        } else {
-            m_currentJsonlLine = lineCount - 1;
-        }
-    }
-}
-
-std::string BrowserUI::formatJson(const std::string& json) {
-    try {
-        auto parsed = nlohmann::json::parse(json);
-        return parsed.dump(2);  // Pretty-print with 2-space indent
-    } catch (const nlohmann::json::parse_error& e) {
-        // Not valid JSON - return original with error message
-        return std::string("(Invalid JSON: ") + e.what() + ")\n\n" + json;
-    }
 }

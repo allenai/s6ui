@@ -5,7 +5,17 @@
 
 BrowserModel::BrowserModel() = default;
 
-BrowserModel::~BrowserModel() = default;
+BrowserModel::~BrowserModel() {
+    // Cancel any streaming downloads so worker threads can exit
+    if (m_streamingCancelFlag) {
+        m_streamingCancelFlag->store(true);
+    }
+
+    // Cancel any pending pagination requests
+    if (m_paginationCancelFlag) {
+        m_paginationCancelFlag->store(true);
+    }
+}
 
 void BrowserModel::setBackend(std::unique_ptr<IBackend> backend) {
     LOG_F(INFO, "Setting backend");
@@ -258,7 +268,7 @@ void BrowserModel::selectFile(const std::string& bucket, const std::string& key)
             m_previewLoading = false;
 
             // Start streaming for gzipped files or large files
-            bool needsStreaming = isGzipped(key) ||
+            bool needsStreaming = isCompressed(key) ||
                 static_cast<size_t>(m_selectedFileSize) > STREAMING_THRESHOLD;
             if (needsStreaming) {
                 startStreamingDownload(static_cast<size_t>(m_selectedFileSize));
@@ -310,27 +320,47 @@ std::string BrowserModel::makePreviewCacheKey(const std::string& bucket, const s
     return bucket + "/" + key;
 }
 
-bool BrowserModel::isGzipped(const std::string& key) {
-    if (key.size() < 3) return false;
-    std::string ext = key.substr(key.size() - 3);
+bool BrowserModel::isCompressed(const std::string& key) {
+    size_t dotPos = key.rfind('.');
+    if (dotPos == std::string::npos) return false;
+
+    std::string ext = key.substr(dotPos);
     for (char& c : ext) c = std::tolower(static_cast<unsigned char>(c));
-    return ext == ".gz";
+
+    return ext == ".gz" || ext == ".zst" || ext == ".zstd";
 }
 
 void BrowserModel::prefetchFolder(const std::string& bucket, const std::string& prefix) {
     if (!m_backend) return;
 
     // Skip if already loaded or loading
-    const auto* node = getNode(bucket, prefix);
+    auto* node = getNode(bucket, prefix);
     if (node && (node->loaded || node->loading)) return;
 
     // Skip if this is the same folder we're already fetching (avoid re-queueing every frame)
     std::string folderKey = bucket + "/" + prefix;
     if (m_lastHoveredFolder == folderKey) return;
 
-    // Queue low-priority prefetch - the backend handles cancellation of stale requests.
-    // Tracking the hover target ensures we only queue when it changes, not every frame.
-    // cancellable=true so newer hover targets cancel this request.
+    // Reset loading state for the previous hover-prefetch folder since we're cancelling it.
+    // This prevents the folder from being stuck in "loading" state if the request is cancelled
+    // before completion. If the request already completed, this is harmless (loaded=true takes precedence).
+    if (!m_lastHoveredFolder.empty()) {
+        size_t slashPos = m_lastHoveredFolder.find('/');
+        if (slashPos != std::string::npos) {
+            std::string oldBucket = m_lastHoveredFolder.substr(0, slashPos);
+            std::string oldPrefix = m_lastHoveredFolder.substr(slashPos + 1);
+            auto* oldNode = getNode(oldBucket, oldPrefix);
+            if (oldNode && oldNode->loading && !oldNode->loaded) {
+                oldNode->loading = false;
+            }
+        }
+    }
+
+    // Create node and mark as loading to prevent loadFolder() from making a duplicate request
+    // if user clicks before the prefetch completes.
+    auto& newNode = getOrCreateNode(bucket, prefix);
+    newNode.loading = true;
+
     m_lastHoveredFolder = folderKey;
     LOG_F(INFO, "Prefetching folder on hover: bucket=%s prefix=%s", bucket.c_str(), prefix.c_str());
     m_backend->listObjectsPrefetch(bucket, prefix, true /* cancellable */);
@@ -454,6 +484,9 @@ bool BrowserModel::isPreviewSupported(const std::string& key) {
         // Assembly
         ".asm", ".s", ".S",
 
+        // Images (supported by stb_image)
+        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".psd", ".tga", ".hdr", ".pic", ".pnm", ".pgm", ".ppm",
+
         // Other
         ".vim", ".vimrc",
         ".tmux",
@@ -466,10 +499,11 @@ bool BrowserModel::isPreviewSupported(const std::string& key) {
     return supportedExtensions.find(ext) != supportedExtensions.end();
 }
 
-void BrowserModel::processEvents() {
-    if (!m_backend) return;
+bool BrowserModel::processEvents() {
+    if (!m_backend) return false;
 
     auto events = m_backend->takeEvents();
+    if (events.empty()) return false;
 
     for (auto& event : events) {
         switch (event.type) {
@@ -501,8 +535,18 @@ void BrowserModel::processEvents() {
                 if (payload.continuation_token.empty()) {
                     node.objects = std::move(payload.objects);
                 } else {
+                    // Build a set of existing keys to avoid duplicates
+                    // (can happen if multiple requests were in flight for the same folder)
+                    std::unordered_set<std::string> existingKeys;
+                    existingKeys.reserve(node.objects.size());
+                    for (const auto& obj : node.objects) {
+                        existingKeys.insert(obj.key);
+                    }
+
                     for (auto& obj : payload.objects) {
-                        node.objects.push_back(std::move(obj));
+                        if (existingKeys.find(obj.key) == existingKeys.end()) {
+                            node.objects.push_back(std::move(obj));
+                        }
                     }
                 }
 
@@ -521,8 +565,11 @@ void BrowserModel::processEvents() {
                         loadMore(payload.bucket, payload.prefix);
                     }
 
-                    // Trigger prefetch for subfolders
-                    triggerPrefetch(payload.bucket, node.objects);
+                    // Only trigger prefetch on initial load, not on pagination continuations
+                    // This prevents prefetching more and more folders as pagination progresses
+                    if (payload.continuation_token.empty()) {
+                        triggerPrefetch(payload.bucket, node.objects);
+                    }
                 }
                 break;
             }
@@ -554,7 +601,7 @@ void BrowserModel::processEvents() {
                     // Start streaming for:
                     // 1. Gzipped files (always, for transparent decompression)
                     // 2. Large files that need more data
-                    bool needsStreaming = isGzipped(payload.key) ||
+                    bool needsStreaming = isCompressed(payload.key) ||
                         (static_cast<size_t>(m_selectedFileSize) > STREAMING_THRESHOLD &&
                          static_cast<size_t>(m_selectedFileSize) > payload.content.size());
 
@@ -592,11 +639,8 @@ void BrowserModel::processEvents() {
                     payload.key == m_streamingPreview->key()) {
 
                     m_streamingPreview->appendChunk(payload.data, payload.startByte);
-
-                    // Request next chunk if not complete
-                    if (!m_streamingPreview->isComplete()) {
-                        requestNextStreamingChunk();
-                    }
+                    // Chunks arrive automatically from the single streaming request
+                    // No need to request next chunk - CURL streams them as they arrive
                 }
                 break;
             }
@@ -618,6 +662,7 @@ void BrowserModel::processEvents() {
             }
         }
     }
+    return true;
 }
 
 FolderNode* BrowserModel::getNode(const std::string& bucket, const std::string& prefix) {
@@ -765,40 +810,18 @@ void BrowserModel::startStreamingDownload(size_t totalFileSize) {
     m_streamingEnabled = true;
     m_streamingCancelFlag = std::make_shared<std::atomic<bool>>(false);
 
-    // Request the next chunk (starting after what we already have)
-    requestNextStreamingChunk();
-}
-
-void BrowserModel::requestNextStreamingChunk() {
-    if (!m_backend || !m_streamingPreview || !m_streamingEnabled) {
-        return;
-    }
-
-    if (m_streamingPreview->isComplete()) {
-        LOG_F(INFO, "Streaming complete for bucket=%s key=%s",
-              m_streamingPreview->bucket().c_str(), m_streamingPreview->key().c_str());
-        return;
-    }
-
+    // Start streaming from where the initial preview left off
+    // Use single streaming request instead of multiple chunk requests
     size_t startByte = m_streamingPreview->nextByteNeeded();
-    size_t endByte = startByte + STREAMING_CHUNK_SIZE - 1;
-
-    // Cap to file size
-    size_t totalSize = m_streamingPreview->totalSourceBytes();
-    if (endByte >= totalSize) {
-        endByte = totalSize - 1;
+    if (startByte < totalFileSize) {
+        LOG_F(INFO, "Starting single streaming request from byte %zu", startByte);
+        m_backend->getObjectStreaming(
+            m_selectedBucket,
+            m_selectedKey,
+            startByte,
+            totalFileSize,
+            m_streamingCancelFlag);
     }
-
-    LOG_F(1, "Requesting streaming chunk: bucket=%s key=%s range=%zu-%zu",
-          m_streamingPreview->bucket().c_str(), m_streamingPreview->key().c_str(),
-          startByte, endByte);
-
-    m_backend->getObjectRange(
-        m_streamingPreview->bucket(),
-        m_streamingPreview->key(),
-        startByte,
-        endByte,
-        m_streamingCancelFlag);
 }
 
 void BrowserModel::cancelStreamingDownload() {

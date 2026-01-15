@@ -78,7 +78,8 @@ public:
     int64_t selectedFileSize() const { return m_selectedFileSize; }
 
     // Call once per frame to process pending events from backend
-    void processEvents();
+    // Returns true if any events were processed (UI should redraw)
+    bool processEvents();
 
     // State accessors (call from UI thread after processEvents)
     const std::vector<S3Bucket>& buckets() const { return m_buckets; }
@@ -134,9 +135,7 @@ private:
     std::shared_ptr<std::atomic<bool>> m_streamingCancelFlag;
     bool m_streamingEnabled = false;  // Whether we're in streaming mode
     void startStreamingDownload(size_t totalFileSize);
-    void requestNextStreamingChunk();
     void cancelStreamingDownload();
-    static constexpr size_t STREAMING_CHUNK_SIZE = 1024 * 1024;  // 1MB chunks
     static constexpr size_t STREAMING_THRESHOLD = 64 * 1024;     // Stream files > 64KB
 
     // Cache for prefetched file previews (bucket/key -> content)
@@ -145,8 +144,8 @@ private:
     static std::string makePreviewCacheKey(const std::string& bucket, const std::string& key);
     static constexpr size_t PREVIEW_MAX_BYTES = 64 * 1024;  // 64KB
 
-    // Gzip helper
-    static bool isGzipped(const std::string& key);
+    // Compression helper - detects .gz, .zst, .zstd extensions
+    static bool isCompressed(const std::string& key);
 
     // Track current hover targets to avoid re-queueing the same request every frame
     std::string m_lastHoveredFile;    // bucket/key of last hovered file

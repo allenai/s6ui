@@ -52,6 +52,18 @@ public:
         std::shared_ptr<std::atomic<bool>> cancel_flag = nullptr
     ) = 0;
 
+    // Stream an object from a starting byte offset
+    // Emits ObjectRangeLoaded events as chunks arrive from network
+    // More efficient than multiple getObjectRange calls - single HTTP request
+    // cancel_flag can be used to cancel the request
+    virtual void getObjectStreaming(
+        const std::string& bucket,
+        const std::string& key,
+        size_t startByte,
+        size_t totalSize,
+        std::shared_ptr<std::atomic<bool>> cancel_flag = nullptr
+    ) = 0;
+
     // Cancel all pending requests (optional, for cleanup)
     virtual void cancelAll() {}
 
