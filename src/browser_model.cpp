@@ -267,8 +267,18 @@ void BrowserModel::selectFile(const std::string& bucket, const std::string& key)
             m_previewContent = it->second;
             m_previewLoading = false;
 
-            // Start streaming for gzipped files or large files
+            // Helper to check if file needs JSONL renderer (requires streaming)
+            auto needsJsonlRenderer = [](const std::string& k) -> bool {
+                size_t dotPos = k.rfind('.');
+                if (dotPos == std::string::npos) return false;
+                std::string ext = k.substr(dotPos);
+                for (char& c : ext) c = std::tolower(static_cast<unsigned char>(c));
+                return ext == ".jsonl" || ext == ".ndjson" || ext == ".json";
+            };
+
+            // Start streaming for compressed files, JSONL files, or large files
             bool needsStreaming = isCompressed(key) ||
+                needsJsonlRenderer(key) ||
                 static_cast<size_t>(m_selectedFileSize) > STREAMING_THRESHOLD;
             if (needsStreaming) {
                 startStreamingDownload(static_cast<size_t>(m_selectedFileSize));
@@ -598,10 +608,21 @@ bool BrowserModel::processEvents() {
                     m_previewLoading = false;
                     m_previewError.clear();
 
+                    // Helper to check if file needs JSONL renderer (requires streaming)
+                    auto needsJsonlRenderer = [](const std::string& key) -> bool {
+                        size_t dotPos = key.rfind('.');
+                        if (dotPos == std::string::npos) return false;
+                        std::string ext = key.substr(dotPos);
+                        for (char& c : ext) c = std::tolower(static_cast<unsigned char>(c));
+                        return ext == ".jsonl" || ext == ".ndjson" || ext == ".json";
+                    };
+
                     // Start streaming for:
-                    // 1. Gzipped files (always, for transparent decompression)
-                    // 2. Large files that need more data
+                    // 1. Compressed files (always, for transparent decompression)
+                    // 2. Files needing JSONL renderer (.json/.jsonl/.ndjson)
+                    // 3. Large files that need more data
                     bool needsStreaming = isCompressed(payload.key) ||
+                        needsJsonlRenderer(payload.key) ||
                         (static_cast<size_t>(m_selectedFileSize) > STREAMING_THRESHOLD &&
                          static_cast<size_t>(m_selectedFileSize) > payload.content.size());
 
