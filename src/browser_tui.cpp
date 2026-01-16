@@ -291,8 +291,8 @@ void BrowserTUI::renderFolderContents()
     std::vector<bool> isFolder;
     std::vector<int64_t> sizes;
 
-    // Add parent entry if not at bucket root
-    if (!m_model.currentPrefix().empty()) {
+    // Add parent entry if inside a bucket
+    if (!m_model.isAtRoot()) {
         displayItems.push_back("[..]");
         isFolder.push_back(true);
         sizes.push_back(0);
@@ -625,7 +625,7 @@ void BrowserTUI::moveSelection(int delta)
         const FolderNode* node = m_model.getNode(m_model.currentBucket(), m_model.currentPrefix());
         if (node) {
             maxIndex = node->objects.size();
-            if (!m_model.currentPrefix().empty()) {
+            if (!m_model.isAtRoot()) {
                 maxIndex++;  // Account for [..] entry
             }
             maxIndex--;
@@ -655,13 +655,13 @@ void BrowserTUI::handleEnter()
         int itemIdx = m_selectedIndex;
 
         // Handle [..] parent navigation
-        if (!m_model.currentPrefix().empty() && itemIdx == 0) {
+        if (!m_model.isAtRoot() && itemIdx == 0) {
             handleBackspace();
             return;
         }
 
         // Adjust index if [..] entry exists
-        if (!m_model.currentPrefix().empty()) {
+        if (!m_model.isAtRoot()) {
             itemIdx--;
         }
 
