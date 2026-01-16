@@ -43,7 +43,7 @@ private:
 
     // Render helpers
     void renderNavigationBar(const TUIPreviewContext& ctx, size_t lineCount, bool isStreaming, float progress);
-    void renderLineContent(const TUIPreviewContext& ctx, const std::string& lineContent, bool lineComplete, bool fileChanged);
+    void renderLineContent(const TUIPreviewContext& ctx, const std::string& lineContent, bool lineComplete);
 
     // State
     std::string m_currentKey;           // Track current file (bucket/key)

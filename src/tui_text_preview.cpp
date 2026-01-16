@@ -2,7 +2,7 @@
 #include "streaming_preview.h"
 #include <sstream>
 
-bool TUITextRenderer::canHandle(const std::string& key) const
+bool TUITextRenderer::canHandle(const std::string&) const
 {
     // This is the fallback renderer - it can handle any file type
     return true;

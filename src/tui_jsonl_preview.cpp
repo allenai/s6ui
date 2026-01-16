@@ -94,7 +94,7 @@ bool TUIJsonlRenderer::render(const TUIPreviewContext& ctx)
     if (lineCount > 0) {
         bool lineComplete = sp->isLineComplete(m_currentLine);
         std::string lineContent = sp->getLine(m_currentLine);
-        renderLineContent(ctx, lineContent, lineComplete, fileChanged);
+        renderLineContent(ctx, lineContent, lineComplete);
     } else {
         mvwprintw(ctx.window, 3, 2, "No lines loaded yet...");
     }
@@ -137,7 +137,7 @@ void TUIJsonlRenderer::renderNavigationBar(const TUIPreviewContext& ctx, size_t 
 }
 
 void TUIJsonlRenderer::renderLineContent(const TUIPreviewContext& ctx, const std::string& lineContent,
-                                          bool lineComplete, bool fileChanged)
+                                          bool lineComplete)
 {
     if (lineContent.empty()) {
         mvwprintw(ctx.window, 4, 2, "(empty line)");
