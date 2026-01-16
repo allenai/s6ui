@@ -451,8 +451,30 @@ void BrowserTUI::renderPreview()
         mvwprintw(m_rightPane, i + 1, 2, "%s", displayLine.c_str());
     }
 
-    // Show scroll indicator
+    // Draw scrollbar on right edge if content is scrollable
     if (numLines > contentHeight) {
+        // Calculate scrollbar position and size
+        int scrollbarHeight = contentHeight;
+        int thumbSize = std::max(1, (contentHeight * contentHeight) / numLines);
+        int scrollRange = scrollbarHeight - thumbSize;
+        int thumbPos = 0;
+
+        if (numLines > contentHeight) {
+            thumbPos = (m_previewScrollOffset * scrollRange) / (numLines - contentHeight);
+        }
+
+        // Draw scrollbar track and thumb
+        for (int i = 0; i < scrollbarHeight; ++i) {
+            if (i >= thumbPos && i < thumbPos + thumbSize) {
+                // Draw thumb (scrollbar handle)
+                mvwaddch(m_rightPane, i + 1, width - 2, ACS_CKBOARD);
+            } else {
+                // Draw track
+                mvwaddch(m_rightPane, i + 1, width - 2, ACS_VLINE);
+            }
+        }
+
+        // Show scroll percentage indicator at bottom
         int scrollPercent = (m_previewScrollOffset * 100) / (numLines - contentHeight);
         mvwprintw(m_rightPane, height - 1, width - 8, " %3d%% ", scrollPercent);
     }
