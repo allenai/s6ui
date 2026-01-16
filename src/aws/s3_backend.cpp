@@ -736,7 +736,7 @@ void S3Backend::processWorkItem(WorkItem& item) {
             auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - item.queued_at).count();
             auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
             LOG_F(WARNING, "S3Backend: listBuckets HTTP error: %s (total=%lldms http=%lldms)",
-                  response.c_str(), total_ms, http_ms);
+                  response.c_str(), static_cast<long long>(total_ms), static_cast<long long>(http_ms));
             pushEvent(StateEvent::bucketsError(response));
         } else {
             std::string error = extractError(response);
@@ -745,7 +745,7 @@ void S3Backend::processWorkItem(WorkItem& item) {
                 auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - item.queued_at).count();
                 auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
                 LOG_F(WARNING, "S3Backend: listBuckets S3 error: %s (total=%lldms http=%lldms)",
-                      error.c_str(), total_ms, http_ms);
+                      error.c_str(), static_cast<long long>(total_ms), static_cast<long long>(http_ms));
                 pushEvent(StateEvent::bucketsError(error));
             } else {
                 auto parse_start = std::chrono::steady_clock::now();
@@ -755,7 +755,7 @@ void S3Backend::processWorkItem(WorkItem& item) {
                 auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
                 auto parse_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - parse_start).count();
                 LOG_F(INFO, "S3Backend: listBuckets success, got %zu buckets (total=%lldms http=%lldms parse=%lldms)",
-                      buckets.size(), total_ms, http_ms, parse_ms);
+                      buckets.size(), static_cast<long long>(total_ms), static_cast<long long>(http_ms), static_cast<long long>(parse_ms));
                 pushEvent(StateEvent::bucketsLoaded(std::move(buckets)));
             }
         }
@@ -827,7 +827,7 @@ void S3Backend::processWorkItem(WorkItem& item) {
                 auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - item.queued_at).count();
                 auto http_ms = std::chrono::duration_cast<std::chrono::milliseconds>(http_end - http_start).count();
                 LOG_F(WARNING, "S3Backend: listObjects HTTP error: %s (total=%lldms http=%lldms)",
-                      response.c_str(), total_ms, http_ms);
+                      response.c_str(), static_cast<long long>(total_ms), static_cast<long long>(http_ms));
                 pushEvent(StateEvent::objectsError(item.bucket, item.prefix, response));
                 return;
             }
@@ -902,7 +902,7 @@ void S3Backend::processWorkItem(WorkItem& item) {
                 }
 
                 LOG_F(WARNING, "S3Backend: listObjects S3 error: %s (total=%lldms http=%lldms parse=%lldms)",
-                      result.error.c_str(), total_ms, http_ms, parse_ms);
+                      result.error.c_str(), static_cast<long long>(total_ms), static_cast<long long>(http_ms), static_cast<long long>(parse_ms));
                 pushEvent(StateEvent::objectsError(item.bucket, item.prefix, result.error));
                 return;
             }
@@ -912,7 +912,7 @@ void S3Backend::processWorkItem(WorkItem& item) {
 
             LOG_F(INFO, "S3Backend: listObjects success bucket=%s prefix=%s count=%zu truncated=%d (total=%lldms http=%lldms parse=%lldms)",
                   item.bucket.c_str(), item.prefix.c_str(),
-                  result.objects.size(), result.is_truncated, total_ms, http_ms, parse_ms);
+                  result.objects.size(), result.is_truncated, static_cast<long long>(total_ms), static_cast<long long>(http_ms), static_cast<long long>(parse_ms));
             pushEvent(StateEvent::objectsLoaded(
                 item.bucket,
                 item.prefix,
@@ -985,7 +985,7 @@ void S3Backend::processWorkItem(WorkItem& item) {
 
             if (response.find("ERROR:") == 0) {
                 LOG_F(WARNING, "S3Backend: getObject HTTP error: %s (total=%lldms http=%lldms)",
-                      response.c_str(), total_ms, http_ms);
+                      response.c_str(), static_cast<long long>(total_ms), static_cast<long long>(http_ms));
                 pushEvent(StateEvent::objectContentError(item.bucket, item.key, response));
                 return;
             }
@@ -1053,13 +1053,13 @@ void S3Backend::processWorkItem(WorkItem& item) {
                 // InvalidRange means the file is 0 bytes - return empty content
                 if (errorCode == "InvalidRange") {
                     LOG_F(INFO, "S3Backend: getObject empty file (InvalidRange) bucket=%s key=%s (total=%lldms http=%lldms)",
-                          item.bucket.c_str(), item.key.c_str(), total_ms, http_ms);
+                          item.bucket.c_str(), item.key.c_str(), static_cast<long long>(total_ms), static_cast<long long>(http_ms));
                     pushEvent(StateEvent::objectContentLoaded(item.bucket, item.key, ""));
                     return;
                 }
 
                 LOG_F(WARNING, "S3Backend: getObject S3 error: %s (total=%lldms http=%lldms)",
-                      error.c_str(), total_ms, http_ms);
+                      error.c_str(), static_cast<long long>(total_ms), static_cast<long long>(http_ms));
                 pushEvent(StateEvent::objectContentError(item.bucket, item.key, error));
                 return;
             }
@@ -1068,7 +1068,7 @@ void S3Backend::processWorkItem(WorkItem& item) {
             cacheRegion(item.bucket, region);
 
             LOG_F(INFO, "S3Backend: getObject success bucket=%s key=%s size=%zu (total=%lldms http=%lldms)",
-                  item.bucket.c_str(), item.key.c_str(), response.size(), total_ms, http_ms);
+                  item.bucket.c_str(), item.key.c_str(), response.size(), static_cast<long long>(total_ms), static_cast<long long>(http_ms));
             pushEvent(StateEvent::objectContentLoaded(item.bucket, item.key, std::move(response)));
             return;  // Success
         }
@@ -1164,7 +1164,7 @@ void S3Backend::processWorkItem(WorkItem& item) {
 
             if (res != CURLE_OK) {
                 LOG_F(WARNING, "S3Backend: getObjectRange HTTP error: %s (total=%lldms http=%lldms)",
-                      curl_easy_strerror(res), total_ms, http_ms);
+                      curl_easy_strerror(res), static_cast<long long>(total_ms), static_cast<long long>(http_ms));
                 pushEvent(StateEvent::objectRangeError(item.bucket, item.key, item.start_byte,
                     "ERROR: " + std::string(curl_easy_strerror(res))));
                 return;
@@ -1231,7 +1231,7 @@ void S3Backend::processWorkItem(WorkItem& item) {
                 }
 
                 LOG_F(WARNING, "S3Backend: getObjectRange S3 error: %s (total=%lldms http=%lldms)",
-                      error.c_str(), total_ms, http_ms);
+                      error.c_str(), static_cast<long long>(total_ms), static_cast<long long>(http_ms));
                 pushEvent(StateEvent::objectRangeError(item.bucket, item.key, item.start_byte, error));
                 return;
             }
@@ -1241,7 +1241,7 @@ void S3Backend::processWorkItem(WorkItem& item) {
 
             LOG_F(INFO, "S3Backend: getObjectRange success bucket=%s key=%s range=%zu-%zu got=%zu total=%zu (total=%lldms http=%lldms)",
                   item.bucket.c_str(), item.key.c_str(), item.start_byte, item.end_byte,
-                  ctx.body.size(), ctx.contentRangeTotal, total_ms, http_ms);
+                  ctx.body.size(), ctx.contentRangeTotal, static_cast<long long>(total_ms), static_cast<long long>(http_ms));
             pushEvent(StateEvent::objectRangeLoaded(item.bucket, item.key, item.start_byte,
                 ctx.contentRangeTotal, std::move(ctx.body)));
             return;  // Success
@@ -1347,7 +1347,7 @@ void S3Backend::processWorkItem(WorkItem& item) {
 
             if (res != CURLE_OK) {
                 LOG_F(WARNING, "S3Backend: getObjectStreaming HTTP error: %s (total=%lldms http=%lldms)",
-                      curl_easy_strerror(res), total_ms, http_ms);
+                      curl_easy_strerror(res), static_cast<long long>(total_ms), static_cast<long long>(http_ms));
                 pushEvent(StateEvent::objectRangeError(item.bucket, item.key, item.start_byte,
                     "ERROR: " + std::string(curl_easy_strerror(res))));
                 return;
@@ -1400,7 +1400,7 @@ void S3Backend::processWorkItem(WorkItem& item) {
             LOG_F(INFO, "S3Backend: getObjectStreaming complete bucket=%s key=%s downloaded=%zu bytes (total=%lldms http=%lldms)",
                   item.bucket.c_str(), item.key.c_str(),
                   item.start_byte + streamCtx.bytesReceived + streamCtx.buffer.size(),
-                  total_ms, http_ms);
+                  static_cast<long long>(total_ms), static_cast<long long>(http_ms));
             return;  // Success
         }
     }
