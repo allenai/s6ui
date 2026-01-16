@@ -35,7 +35,25 @@ static void glfw_error_callback(int error, const char* description)
 
 int main(int argc, char* argv[])
 {
-    // Check for --version flag first
+    // Check for --help flag first
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("s6ui %s - Fast AWS S3 Browser\n\n", VERSION_STRING);
+            printf("Usage: %s [options] [s3://bucket/path]\n\n", argv[0]);
+            printf("Options:\n");
+            printf("  -h, --help            Show this help message and exit\n");
+            printf("  --version             Show version information and exit\n");
+            printf("  -v, --verbose         Enable verbose logging\n");
+            printf("  -d, --debug           Show ImGui debug/metrics window\n");
+            printf("  --tui                 Run in terminal UI mode\n");
+            printf("  --endpoint-url <url>  Use custom S3 endpoint URL\n");
+            printf("  s3://bucket/path      Initial S3 path to navigate to\n");
+            printf("\n");
+            return 0;
+        }
+    }
+
+    // Check for --version flag
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--version") == 0) {
             printf("s6ui %s\n", VERSION_STRING);
