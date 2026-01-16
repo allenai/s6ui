@@ -49,6 +49,12 @@ private:
     void handleBackspace();
     void handleRefresh();
 
+    // Profile selector
+    void renderProfileSelectorModal();
+    bool handleProfileSelectorInput(int ch);
+    void moveProfileSelection(int delta);
+    void selectProfile();
+
     // Display helpers
     static std::string formatSize(int64_t bytes);
     static std::string formatNumber(int64_t number);
@@ -69,6 +75,11 @@ private:
     int m_previewScrollOffset = 0;
     bool m_shouldQuit = false;
     bool m_focusOnRight = false;  // false = left pane, true = right pane
+
+    // Profile selector state
+    bool m_showProfileSelector = false;
+    int m_profileSelectorIndex = 0;
+    int m_profileSelectorScrollOffset = 0;
 
     // Terminal dimensions
     int m_termHeight = 0;

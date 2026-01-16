@@ -134,6 +134,11 @@ void BrowserTUI::render()
     wnoutrefresh(m_rightPane);
     wnoutrefresh(m_statusBar);
     doupdate();
+
+    // Render modal on top if profile selector is open
+    if (m_showProfileSelector) {
+        renderProfileSelectorModal();
+    }
 }
 
 void BrowserTUI::renderTopBar()
@@ -164,8 +169,8 @@ void BrowserTUI::renderTopBar()
         loading = " [Loading...]";
     }
 
-    // Format: "Profile: name | Path: s3://bucket/prefix | [Loading...]"
-    std::string header = "Profile: " + profileName + " | Path: " + path + loading;
+    // Format: "[p] Profile: name | Path: s3://bucket/prefix | [Loading...]"
+    std::string header = "[p] Profile: " + profileName + " | Path: " + path + loading;
     header = truncateString(header, m_termWidth - 2);
 
     mvwprintw(m_topBar, 0, 1, "%s", header.c_str());
@@ -509,7 +514,7 @@ void BrowserTUI::renderStatusBar()
     }
 
     // Add keyboard shortcuts
-    status += " | q:quit r:refresh Tab:switch";
+    status += " | q:quit r:refresh p:profile Tab:switch";
     status = truncateString(status, m_termWidth - 2);
 
     mvwprintw(m_statusBar, 0, 1, "%s", status.c_str());
@@ -519,6 +524,11 @@ void BrowserTUI::renderStatusBar()
 
 bool BrowserTUI::handleInput(int ch)
 {
+    // Route input to profile selector if modal is open
+    if (m_showProfileSelector) {
+        return handleProfileSelectorInput(ch);
+    }
+
     switch (ch) {
         case 'q':
         case 'Q':
@@ -528,6 +538,16 @@ bool BrowserTUI::handleInput(int ch)
         case 'r':
         case 'R':
             handleRefresh();
+            return true;
+
+        case 'p':
+        case 'P':
+            // Open profile selector (only when in left pane)
+            if (!m_focusOnRight) {
+                m_showProfileSelector = true;
+                m_profileSelectorIndex = m_model.selectedProfileIndex();
+                m_profileSelectorScrollOffset = 0;
+            }
             return true;
 
         case '\t':  // Tab key
@@ -674,6 +694,165 @@ void BrowserTUI::handleBackspace()
 void BrowserTUI::handleRefresh()
 {
     m_model.refresh();
+}
+
+bool BrowserTUI::handleProfileSelectorInput(int ch)
+{
+    switch (ch) {
+        case 27:  // Escape
+        case 'q':
+        case 'Q':
+            m_showProfileSelector = false;
+            return true;
+
+        case KEY_UP:
+        case 'k':
+            moveProfileSelection(-1);
+            return true;
+
+        case KEY_DOWN:
+        case 'j':
+            moveProfileSelection(1);
+            return true;
+
+        case '\n':  // Enter
+        case KEY_ENTER:
+            selectProfile();
+            return true;
+    }
+
+    return false;
+}
+
+void BrowserTUI::moveProfileSelection(int delta)
+{
+    const auto& profiles = m_model.profiles();
+    int numProfiles = profiles.size();
+
+    if (numProfiles == 0) return;
+
+    m_profileSelectorIndex += delta;
+
+    // Clamp to valid range
+    if (m_profileSelectorIndex < 0) {
+        m_profileSelectorIndex = 0;
+    }
+    if (m_profileSelectorIndex >= numProfiles) {
+        m_profileSelectorIndex = numProfiles - 1;
+    }
+
+    // Adjust scroll offset to keep selection visible
+    // We'll calculate this during rendering based on modal height
+}
+
+void BrowserTUI::selectProfile()
+{
+    const auto& profiles = m_model.profiles();
+
+    if (m_profileSelectorIndex < 0 || m_profileSelectorIndex >= (int)profiles.size()) {
+        m_showProfileSelector = false;
+        return;
+    }
+
+    // Only switch if different from current profile
+    if (m_profileSelectorIndex != m_model.selectedProfileIndex()) {
+        m_model.selectProfile(m_profileSelectorIndex);
+
+        // Reset navigation state to prevent stale data
+        m_selectedIndex = 0;
+        m_scrollOffset = 0;
+        m_previewScrollOffset = 0;
+    }
+
+    // Close modal
+    m_showProfileSelector = false;
+}
+
+void BrowserTUI::renderProfileSelectorModal()
+{
+    const auto& profiles = m_model.profiles();
+    int numProfiles = profiles.size();
+
+    if (numProfiles == 0) return;
+
+    // Calculate modal dimensions
+    int modalWidth = 60;
+    int maxModalHeight = 20;
+    int contentHeight = std::min(numProfiles + 4, maxModalHeight);  // +4 for title, footer, borders
+    int modalHeight = contentHeight;
+
+    // Center the modal
+    int modalX = (m_termWidth - modalWidth) / 2;
+    int modalY = (m_termHeight - modalHeight) / 2;
+
+    // Ensure modal fits on screen
+    if (modalX < 0) modalX = 0;
+    if (modalY < 0) modalY = 0;
+    if (modalWidth > m_termWidth) modalWidth = m_termWidth;
+    if (modalHeight > m_termHeight) modalHeight = m_termHeight;
+
+    // Create temporary window for modal
+    WINDOW* modal = newwin(modalHeight, modalWidth, modalY, modalX);
+    if (!modal) return;
+
+    // Draw border and title
+    box(modal, 0, 0);
+    wattron(modal, COLOR_PAIR(COLOR_HEADER) | A_BOLD);
+    mvwprintw(modal, 0, 2, " Select AWS Profile ");
+    wattroff(modal, COLOR_PAIR(COLOR_HEADER) | A_BOLD);
+
+    // Calculate list area
+    int listHeight = modalHeight - 4;  // -4 for title, footer, borders
+    int listWidth = modalWidth - 4;
+
+    // Adjust scroll offset to keep selection visible
+    if (m_profileSelectorIndex < m_profileSelectorScrollOffset) {
+        m_profileSelectorScrollOffset = m_profileSelectorIndex;
+    }
+    if (m_profileSelectorIndex >= m_profileSelectorScrollOffset + listHeight) {
+        m_profileSelectorScrollOffset = m_profileSelectorIndex - listHeight + 1;
+    }
+
+    // Render profile list
+    int currentProfileIdx = m_model.selectedProfileIndex();
+    for (int i = 0; i < listHeight && i + m_profileSelectorScrollOffset < numProfiles; ++i) {
+        int profileIdx = i + m_profileSelectorScrollOffset;
+        const auto& profile = profiles[profileIdx];
+
+        // Check if this is the current profile
+        bool isCurrent = (profileIdx == currentProfileIdx);
+        bool isSelected = (profileIdx == m_profileSelectorIndex);
+
+        // Apply styling
+        if (isSelected) {
+            wattron(modal, COLOR_PAIR(COLOR_SELECTED) | A_BOLD);
+        } else {
+            wattron(modal, COLOR_PAIR(COLOR_NORMAL));
+        }
+
+        // Format: "* name (region)" or "  name (region)"
+        std::string prefix = isCurrent ? "* " : "  ";
+        std::string display = prefix + profile.name + " (" + profile.region + ")";
+        display = truncateString(display, listWidth);
+
+        mvwprintw(modal, i + 1, 2, "%-*s", listWidth, display.c_str());
+
+        if (isSelected) {
+            wattroff(modal, COLOR_PAIR(COLOR_SELECTED) | A_BOLD);
+        } else {
+            wattroff(modal, COLOR_PAIR(COLOR_NORMAL));
+        }
+    }
+
+    // Draw footer with controls
+    wattron(modal, COLOR_PAIR(COLOR_STATUS));
+    std::string footer = " Enter:Select  Esc:Cancel ";
+    mvwprintw(modal, modalHeight - 1, (modalWidth - footer.length()) / 2, "%s", footer.c_str());
+    wattroff(modal, COLOR_PAIR(COLOR_STATUS));
+
+    // Refresh and cleanup
+    wrefresh(modal);
+    delwin(modal);
 }
 
 // Helper functions
