@@ -28,7 +28,7 @@ AWS_DIR = $(SRC_DIR)/aws
 BUILD_DIR = build
 
 # Compiler flags for our source code
-CXXFLAGS = -std=c++17 -Wall -Wextra -O2
+CXXFLAGS = -std=c++17 -Wall -Wextra -Werror -O2
 CXXFLAGS += -I$(HOMEBREW_PREFIX)/include
 CXXFLAGS += -Iinclude
 CXXFLAGS += -I$(LIBS_DIR)
