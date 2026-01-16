@@ -1,9 +1,11 @@
 #pragma once
 
 #include "browser_model.h"
+#include "tui_preview_renderer.h"
 #include <ncurses.h>
 #include <string>
 #include <vector>
+#include <memory>
 
 // Text-mode UI (TUI) interface for the S3 browser using ncurses
 // Parallel to BrowserUI but renders to terminal instead of ImGui
@@ -28,6 +30,7 @@ private:
     void setupColors();
     void createWindows();
     void destroyWindows();
+    void initializeRenderers();
 
     // Window management
     void handleResize();
@@ -75,6 +78,10 @@ private:
     int m_previewScrollOffset = 0;
     bool m_shouldQuit = false;
     bool m_focusOnRight = false;  // false = left pane, true = right pane
+
+    // Preview renderers
+    std::vector<std::unique_ptr<TUIPreviewRenderer>> m_previewRenderers;
+    TUIPreviewRenderer* m_activeRenderer = nullptr;
 
     // Profile selector state
     bool m_showProfileSelector = false;

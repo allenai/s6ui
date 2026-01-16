@@ -1,4 +1,6 @@
 #include "browser_tui.h"
+#include "tui_text_preview.h"
+#include "tui_jsonl_preview.h"
 #include "loguru.hpp"
 #include <cstring>
 #include <cstdlib>
@@ -14,6 +16,7 @@ BrowserTUI::BrowserTUI(BrowserModel& model)
     initializeNcurses();
     setupColors();
     createWindows();
+    initializeRenderers();
 }
 
 BrowserTUI::~BrowserTUI()
@@ -92,6 +95,17 @@ void BrowserTUI::destroyWindows()
     if (m_leftPane) { delwin(m_leftPane); m_leftPane = nullptr; }
     if (m_rightPane) { delwin(m_rightPane); m_rightPane = nullptr; }
     if (m_statusBar) { delwin(m_statusBar); m_statusBar = nullptr; }
+}
+
+void BrowserTUI::initializeRenderers()
+{
+    // Create renderers in priority order
+    // JSONL renderer first (specific), text renderer last (fallback)
+
+    m_previewRenderers.push_back(std::make_unique<TUIJsonlRenderer>());
+    m_previewRenderers.push_back(std::make_unique<TUITextRenderer>());
+
+    LOG_F(INFO, "TUI renderers initialized (%zu renderers)", m_previewRenderers.size());
 }
 
 void BrowserTUI::handleResize()
@@ -421,42 +435,62 @@ void BrowserTUI::renderPreview()
         return;
     }
 
-    // Get preview content
-    std::string content = m_model.previewContent();
+    // Select appropriate renderer for the file
+    std::string selectedKey = m_model.selectedKey();
+    std::string selectedBucket = m_model.selectedBucket();
+    TUIPreviewRenderer* newRenderer = nullptr;
 
-    // Split into lines and render with scrolling
-    std::vector<std::string> lines;
-    std::istringstream iss(content);
-    std::string line;
-    while (std::getline(iss, line)) {
-        // Word wrap long lines
-        while ((int)line.length() > contentWidth) {
-            lines.push_back(line.substr(0, contentWidth));
-            line = line.substr(contentWidth);
+    // Check for fallback requests (e.g., JSONL renderer detected invalid JSON)
+    for (auto& renderer : m_previewRenderers) {
+        auto* jsonlRenderer = dynamic_cast<TUIJsonlRenderer*>(renderer.get());
+        if (jsonlRenderer && jsonlRenderer->wantsFallback(selectedBucket, selectedKey)) {
+            // Skip JSONL renderer and use text renderer instead
+            continue;
         }
-        lines.push_back(line);
-    }
 
-    // Adjust preview scroll offset
-    int numLines = lines.size();
-    if (m_previewScrollOffset >= numLines) {
-        m_previewScrollOffset = numLines > contentHeight ? numLines - contentHeight : 0;
-    }
-    if (m_previewScrollOffset < 0) {
-        m_previewScrollOffset = 0;
-    }
-
-    // Render visible lines
-    for (int i = 0; i < contentHeight && i + m_previewScrollOffset < numLines; ++i) {
-        int lineIdx = i + m_previewScrollOffset;
-        std::string displayLine = lines[lineIdx];
-        if ((int)displayLine.length() > contentWidth) {
-            displayLine = displayLine.substr(0, contentWidth);
+        if (renderer->canHandle(selectedKey)) {
+            newRenderer = renderer.get();
+            break;
         }
-        mvwprintw(m_rightPane, i + 1, 2, "%s", displayLine.c_str());
+    }
+
+    // If no renderer found (shouldn't happen with text fallback), show error
+    if (!newRenderer) {
+        mvwprintw(m_rightPane, 2, 2, "No renderer available");
+        return;
+    }
+
+    // Reset renderer state if switching renderers or files
+    static std::string lastKey;
+    if (m_activeRenderer != newRenderer || selectedKey != lastKey) {
+        if (m_activeRenderer) {
+            m_activeRenderer->reset();
+        }
+        newRenderer->reset();
+        m_activeRenderer = newRenderer;
+        lastKey = selectedKey;
+    }
+
+    // Build preview context
+    TUIPreviewContext ctx;
+    ctx.window = m_rightPane;
+    ctx.availHeight = contentHeight;
+    ctx.availWidth = contentWidth;
+    ctx.bucket = m_model.selectedBucket();
+    ctx.key = m_model.selectedKey();
+    ctx.filename = m_model.selectedKey();  // Could extract filename from key
+    ctx.streamingPreview = m_model.streamingPreview();
+
+    // Delegate rendering to active renderer
+    if (!m_activeRenderer->render(ctx)) {
+        mvwprintw(m_rightPane, 2, 2, "Renderer error");
+        return;
     }
 
     // Draw scrollbar on right edge if content is scrollable
+    int numLines = m_activeRenderer->totalLines();
+    int scrollOffset = m_activeRenderer->scrollOffset();
+
     if (numLines > contentHeight) {
         // Calculate scrollbar position and size
         int scrollbarHeight = contentHeight;
@@ -465,7 +499,7 @@ void BrowserTUI::renderPreview()
         int thumbPos = 0;
 
         if (numLines > contentHeight) {
-            thumbPos = (m_previewScrollOffset * scrollRange) / (numLines - contentHeight);
+            thumbPos = (scrollOffset * scrollRange) / (numLines - contentHeight);
         }
 
         // Draw scrollbar track and thumb
@@ -480,8 +514,10 @@ void BrowserTUI::renderPreview()
         }
 
         // Show scroll percentage indicator at bottom
-        int scrollPercent = (m_previewScrollOffset * 100) / (numLines - contentHeight);
-        mvwprintw(m_rightPane, height - 1, width - 8, " %3d%% ", scrollPercent);
+        if (numLines > contentHeight) {
+            int scrollPercent = (scrollOffset * 100) / (numLines - contentHeight);
+            mvwprintw(m_rightPane, height - 1, width - 8, " %3d%% ", scrollPercent);
+        }
     }
 }
 
@@ -529,6 +565,7 @@ bool BrowserTUI::handleInput(int ch)
         return handleProfileSelectorInput(ch);
     }
 
+    // Global commands that work regardless of focus
     switch (ch) {
         case 'q':
         case 'Q':
@@ -553,48 +590,64 @@ bool BrowserTUI::handleInput(int ch)
         case '\t':  // Tab key
             m_focusOnRight = !m_focusOnRight;
             return true;
+    }
 
+    // If focused on right pane and we have an active renderer, delegate input
+    if (m_focusOnRight && m_activeRenderer && m_model.hasSelection()) {
+        // Build preview context for input handler
+        int height, width;
+        getmaxyx(m_rightPane, height, width);
+        int contentHeight = height - 2;
+        int contentWidth = width - 4;
+
+        TUIPreviewContext ctx;
+        ctx.window = m_rightPane;
+        ctx.availHeight = contentHeight;
+        ctx.availWidth = contentWidth;
+        ctx.bucket = m_model.selectedBucket();
+        ctx.key = m_model.selectedKey();
+        ctx.filename = m_model.selectedKey();
+        ctx.streamingPreview = m_model.streamingPreview();
+
+        // Let renderer handle input first
+        if (m_activeRenderer->handleInput(ch, ctx)) {
+            return true;
+        }
+    }
+
+    // Default input handling for left pane or unhandled right pane input
+    switch (ch) {
         case KEY_UP:
         case 'k':
-            if (m_focusOnRight) {
-                m_previewScrollOffset--;
-                if (m_previewScrollOffset < 0) m_previewScrollOffset = 0;
-            } else {
+            if (!m_focusOnRight) {
                 moveSelection(-1);
             }
             return true;
 
         case KEY_DOWN:
         case 'j':
-            if (m_focusOnRight) {
-                m_previewScrollOffset++;
-            } else {
+            if (!m_focusOnRight) {
                 moveSelection(1);
             }
             return true;
 
         case KEY_PPAGE:  // Page Up
-            if (m_focusOnRight) {
-                int height = getmaxy(m_rightPane) - 2;
-                m_previewScrollOffset -= height;
-                if (m_previewScrollOffset < 0) m_previewScrollOffset = 0;
-            } else {
+            if (!m_focusOnRight) {
                 moveSelection(-10);
             }
             return true;
 
         case KEY_NPAGE:  // Page Down
-            if (m_focusOnRight) {
-                int height = getmaxy(m_rightPane) - 2;
-                m_previewScrollOffset += height;
-            } else {
+            if (!m_focusOnRight) {
                 moveSelection(10);
             }
             return true;
 
         case '\n':  // Enter
         case KEY_ENTER:
-            handleEnter();
+            if (!m_focusOnRight) {
+                handleEnter();
+            }
             return true;
 
         case KEY_BACKSPACE:
@@ -606,7 +659,9 @@ bool BrowserTUI::handleInput(int ch)
             return true;
 
         case KEY_LEFT:
-            handleBackspace();
+            if (!m_focusOnRight) {
+                handleBackspace();
+            }
             return true;
     }
 
