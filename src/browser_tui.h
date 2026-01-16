@@ -50,6 +50,7 @@ private:
     void moveSelection(int delta);
     void handleEnter();
     void handleBackspace();
+    void prefetchCurrentSelection();
 
     // Profile selector
     void renderProfileSelectorModal();

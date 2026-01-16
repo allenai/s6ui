@@ -685,6 +685,9 @@ void BrowserTUI::moveSelection(int delta)
     // Clamp
     if (m_selectedIndex < 0) m_selectedIndex = 0;
     if (m_selectedIndex > maxIndex) m_selectedIndex = maxIndex;
+
+    // Prefetch the newly selected item for instant preview/navigation
+    prefetchCurrentSelection();
 }
 
 void BrowserTUI::handleEnter()
@@ -696,6 +699,8 @@ void BrowserTUI::handleEnter()
             m_model.navigateInto(buckets[m_selectedIndex].name, "");
             m_selectedIndex = 0;
             m_scrollOffset = 0;
+            // Prefetch the first item in the new location
+            prefetchCurrentSelection();
         }
     } else {
         // Navigate into folder or select file
@@ -723,6 +728,8 @@ void BrowserTUI::handleEnter()
                 m_model.navigateInto(m_model.currentBucket(), obj.key);
                 m_selectedIndex = 0;
                 m_scrollOffset = 0;
+                // Prefetch the first item in the new location
+                prefetchCurrentSelection();
             } else {
                 // Select file for preview
                 m_model.selectFile(m_model.currentBucket(), obj.key);
@@ -738,6 +745,8 @@ void BrowserTUI::handleBackspace()
         m_model.navigateUp();
         m_selectedIndex = 0;
         m_scrollOffset = 0;
+        // Prefetch the first item in the parent folder
+        prefetchCurrentSelection();
     }
 }
 
@@ -807,6 +816,9 @@ void BrowserTUI::selectProfile()
         m_selectedIndex = 0;
         m_scrollOffset = 0;
         m_previewScrollOffset = 0;
+
+        // Prefetch the first item after profile switch
+        prefetchCurrentSelection();
     }
 
     // Close modal
@@ -898,6 +910,61 @@ void BrowserTUI::renderProfileSelectorModal()
     // Refresh and cleanup
     wrefresh(modal);
     delwin(modal);
+}
+
+void BrowserTUI::prefetchCurrentSelection()
+{
+    if (m_model.isAtRoot()) {
+        // At root - prefetch selected bucket as a folder
+        const auto& buckets = m_model.buckets();
+        if (m_selectedIndex >= 0 && m_selectedIndex < (int)buckets.size()) {
+            m_model.prefetchFolder(buckets[m_selectedIndex].name, "");
+        }
+    } else {
+        // In a folder - determine what's selected
+        const std::string& bucket = m_model.currentBucket();
+        const std::string& prefix = m_model.currentPrefix();
+        const FolderNode* node = m_model.getNode(bucket, prefix);
+
+        if (!node) return;
+
+        int itemIdx = m_selectedIndex;
+
+        // Check if [..] parent entry is selected
+        if (!m_model.isAtRoot() && itemIdx == 0) {
+            // Prefetch parent folder
+            std::string parentPrefix = prefix;
+            if (!parentPrefix.empty() && parentPrefix.back() == '/') {
+                parentPrefix.pop_back();
+            }
+            size_t lastSlash = parentPrefix.rfind('/');
+            if (lastSlash == std::string::npos) {
+                parentPrefix = "";
+            } else {
+                parentPrefix = parentPrefix.substr(0, lastSlash + 1);
+            }
+            m_model.prefetchFolder(bucket, parentPrefix);
+            return;
+        }
+
+        // Adjust index if [..] entry exists
+        if (!m_model.isAtRoot()) {
+            itemIdx--;
+        }
+
+        // Check if valid object is selected
+        if (itemIdx >= 0 && itemIdx < (int)node->objects.size()) {
+            const auto& obj = node->objects[itemIdx];
+
+            if (obj.is_folder) {
+                // Prefetch folder contents
+                m_model.prefetchFolder(bucket, obj.key);
+            } else {
+                // Prefetch file preview
+                m_model.prefetchFilePreview(bucket, obj.key);
+            }
+        }
+    }
 }
 
 // Helper functions
