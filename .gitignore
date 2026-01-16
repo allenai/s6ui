@@ -13,3 +13,8 @@ imgui.ini
 
 # macOS
 .DS_Store
+
+# Generated app bundle
+s6ui.app/
+resources/s6ui.iconset/
+resources/s6ui.icns
