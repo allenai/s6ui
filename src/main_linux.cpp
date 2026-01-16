@@ -11,6 +11,7 @@
 #include "browser_ui.h"
 #include "aws/s3_backend.h"
 #include "loguru.hpp"
+#include "version.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -33,6 +34,14 @@ static void glfw_error_callback(int error, const char* description)
 
 int main(int argc, char* argv[])
 {
+    // Check for --version flag first
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--version") == 0) {
+            printf("s6ui %s\n", VERSION_STRING);
+            return 0;
+        }
+    }
+
     // Check for verbose flag, debug flag, endpoint URL, and S3 path, filter before passing to loguru
     bool verbose = false;
     bool showDebugWindow = false;
