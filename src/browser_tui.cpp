@@ -550,7 +550,7 @@ void BrowserTUI::renderStatusBar()
     }
 
     // Add keyboard shortcuts
-    status += " | q:quit r:refresh p:profile Tab:switch";
+    status += " | q:quit p:profile Tab:switch";
     status = truncateString(status, m_termWidth - 2);
 
     mvwprintw(m_statusBar, 0, 1, "%s", status.c_str());
@@ -570,11 +570,6 @@ bool BrowserTUI::handleInput(int ch)
         case 'q':
         case 'Q':
             m_shouldQuit = true;
-            return true;
-
-        case 'r':
-        case 'R':
-            handleRefresh();
             return true;
 
         case 'p':
@@ -744,11 +739,6 @@ void BrowserTUI::handleBackspace()
         m_selectedIndex = 0;
         m_scrollOffset = 0;
     }
-}
-
-void BrowserTUI::handleRefresh()
-{
-    m_model.refresh();
 }
 
 bool BrowserTUI::handleProfileSelectorInput(int ch)
