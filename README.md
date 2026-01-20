@@ -12,7 +12,13 @@ There are some tools built-in to help with previewing large datasets. Click on a
 containing [Dolma documents](https://github.com/allenai/dolma), and you can quickly see a preview of the contents. .gz and .zstd decoders are included. You don't even need to wait to load a full 1GB file,
 everything is streamed to make this as fast as possible. It's a quick way to see what's inside your bucket or dataset.
 
-### How to build
+### How to intall from Homebrew (MacOSX)
+```bash
+brew tap allenai/s6ui
+brew install s6ui
+```
+
+### How to build from source
 Right now we support MacOSX, (soon Linux).
 
 Install dependencies with `brew install glfw`
