@@ -26,9 +26,9 @@ then just run `make`
 
 ### How to use
 
-Just type `./s6ui` to launch it.
+Just type `s6ui` to launch it.
 
-You can specify `./s6ui s3://my_bucket/path` to immediately jump to that path.
+You can specify `s6ui s3://my_bucket/path` to immediately jump to that path.
 
 ### AWS Authentication
 
