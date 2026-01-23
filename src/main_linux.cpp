@@ -110,7 +110,7 @@ int main(int argc, char* argv[])
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
 
     // Create window with graphics context
-    GLFWwindow* window = glfwCreateWindow(1200, 800, "S3 Browser", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(1200, 800, "s6ui", nullptr, nullptr);
     if (window == nullptr)
         return 1;
     glfwMakeContextCurrent(window);
