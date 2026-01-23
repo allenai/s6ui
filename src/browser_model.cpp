@@ -102,21 +102,31 @@ void BrowserModel::refresh() {
 void BrowserModel::loadFolder(const std::string& bucket, const std::string& prefix) {
     auto& node = getOrCreateNode(bucket, prefix);
 
-    // If already loaded or loading, don't reload
-    if (node.loaded || node.loading) return;
+    // If already loaded, don't reload
+    if (node.loaded) return;
 
+    // Try to boost any pending prefetch request to high priority.
+    // This makes it non-cancellable (cancel_flag is cleared on boost).
+    if (m_backend && m_backend->prioritizeRequest(bucket, prefix)) {
+        // Successfully boosted pending prefetch - mark as loading and it will complete
+        node.loading = true;
+        LOG_F(INFO, "Boosted pending prefetch for folder: bucket=%s prefix=%s",
+              bucket.c_str(), prefix.c_str());
+        return;
+    }
+
+    // No pending request to boost - make a new high-priority request.
+    // This handles:
+    // - First time loading this folder
+    // - Previous prefetch was cancelled (loading was true but request is gone)
+    // - Previous prefetch is in-flight (will get duplicate event, which is OK)
     LOG_F(INFO, "Loading folder: bucket=%s prefix=%s", bucket.c_str(), prefix.c_str());
     node.objects.clear();
     node.error.clear();
     node.loading = true;
 
     if (m_backend) {
-        // Check if there's already a prefetch request queued for this folder
-        // If so, prioritize it instead of making a new request
-        if (!m_backend->prioritizeRequest(bucket, prefix)) {
-            // No pending request, make a new high-priority one
-            m_backend->listObjects(bucket, prefix);
-        }
+        m_backend->listObjects(bucket, prefix);
     }
 }
 
