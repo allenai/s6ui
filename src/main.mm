@@ -131,7 +131,7 @@ int main(int argc, char* argv[])
 
     // Create window with no graphics API (we'll use Metal)
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    GLFWwindow* window = glfwCreateWindow(1200, 800, "s6ui", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(1200, 800, "s6ui " VERSION_STRING, nullptr, nullptr);
     if (window == nullptr)
         return 1;
 
