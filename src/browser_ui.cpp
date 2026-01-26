@@ -193,10 +193,10 @@ void BrowserUI::renderFolderContents() {
         return;
     }
 
-    // Show [..] to navigate up (outside clipper)
+    // Show [..] to navigate up - FIXED at top (outside scrolling region)
     if (ImGui::Selectable("[..]")) {
         m_model.navigateUp();
-        ImGui::SetScrollY(0);
+        m_folderScrollY = 0;  // Reset scroll position for new folder
         return;  // Return early to avoid rendering stale content
     }
     // Prefetch parent folder on hover for instant navigation
@@ -231,6 +231,15 @@ void BrowserUI::renderFolderContents() {
     // Rebuild sorted view if objects changed (e.g., pagination added more)
     node->rebuildSortedViewIfNeeded();
 
+    // Create scrollable child for file list (below the fixed [..] element)
+    ImVec2 availSize = ImGui::GetContentRegionAvail();
+    ImGui::BeginChild("FolderScrollRegion", availSize, false);
+
+    // Apply pending scroll reset
+    if (m_folderScrollY == 0 && ImGui::GetScrollY() != 0) {
+        ImGui::SetScrollY(0);
+    }
+
     // Use ImGuiListClipper for virtual scrolling - only render visible rows
     ImGuiListClipper clipper;
     clipper.Begin(static_cast<int>(node->sortedView.size()));
@@ -248,7 +257,7 @@ void BrowserUI::renderFolderContents() {
                 std::string label = "[D] " + obj.display_name;
                 if (ImGui::Selectable(label.c_str())) {
                     m_model.navigateInto(bucket, obj.key);
-                    ImGui::SetScrollY(0);
+                    m_folderScrollY = 0;  // Reset scroll for new folder
                 }
                 // Right-click context menu
                 if (ImGui::BeginPopupContextItem()) {
@@ -320,6 +329,11 @@ void BrowserUI::renderFolderContents() {
         ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
             "(%s items loaded)", formatNumber(node->objects.size()).c_str());
     }
+
+    // Track scroll position
+    m_folderScrollY = ImGui::GetScrollY();
+
+    ImGui::EndChild();
 }
 
 void BrowserUI::renderStatusBar() {

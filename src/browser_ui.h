@@ -35,4 +35,7 @@ private:
     // Preview renderers
     std::vector<std::unique_ptr<IPreviewRenderer>> m_previewRenderers;
     IPreviewRenderer* m_activeRenderer = nullptr;
+
+    // Scroll position for folder contents (for reset on navigation)
+    float m_folderScrollY = 0;
 };
