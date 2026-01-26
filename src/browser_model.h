@@ -21,6 +21,31 @@ struct FolderNode {
     bool loading = false;
     bool loaded = false;  // True if we've fetched this folder at least once
     std::string error;
+
+    // Cached view for virtual scrolling: indices into objects[]
+    // First folderCount indices are folders, rest are files
+    std::vector<size_t> sortedView;
+    size_t folderCount = 0;
+    size_t cachedObjectsSize = 0;  // Invalidation check
+
+    void rebuildSortedViewIfNeeded() {
+        if (cachedObjectsSize == objects.size()) return;
+
+        sortedView.clear();
+        sortedView.reserve(objects.size());
+
+        // Folders first
+        for (size_t i = 0; i < objects.size(); ++i) {
+            if (objects[i].is_folder) sortedView.push_back(i);
+        }
+        folderCount = sortedView.size();
+
+        // Files second
+        for (size_t i = 0; i < objects.size(); ++i) {
+            if (!objects[i].is_folder) sortedView.push_back(i);
+        }
+        cachedObjectsSize = objects.size();
+    }
 };
 
 // The browser model - owns state and processes commands
