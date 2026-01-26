@@ -11,6 +11,7 @@
 #include <deque>
 #include <condition_variable>
 #include <chrono>
+#include <curl/curl.h>
 
 // S3 data types (moved from s3_client.h)
 struct S3Bucket {
@@ -182,4 +183,18 @@ private:
     // Helper methods for region cache
     std::string getCachedRegion(const std::string& bucket) const;
     void cacheRegion(const std::string& bucket, const std::string& region);
+
+    // Shared CURL handle for connection pooling across all workers
+    CURLSH* m_curlShare = nullptr;
+    // Separate mutexes for each CURL lock data type to avoid deadlock
+    std::mutex m_curlShareMutexConnect;
+    std::mutex m_curlShareMutexDns;
+    std::mutex m_curlShareMutexSsl;
+
+    // Reset thread-local CURL handle (preserves connection cache via share)
+    void resetThreadCurl();
+
+    // Lock callbacks need access to the mutexes
+    friend void curlShareLock(CURL*, curl_lock_data, curl_lock_access, void*);
+    friend void curlShareUnlock(CURL*, curl_lock_data, void*);
 };
