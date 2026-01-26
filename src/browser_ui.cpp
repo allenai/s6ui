@@ -57,6 +57,30 @@ void BrowserUI::renderLeftPane(float width, float height) {
     float statusBarHeight = ImGui::GetFrameHeightWithSpacing() + 4;
     float contentHeight = height - statusBarHeight;
 
+    // Show [..] outside scrolling area when in a folder
+    if (!m_model.isAtRoot()) {
+        if (ImGui::Selectable("[..]")) {
+            m_model.navigateUp();
+        }
+        // Prefetch parent folder on hover for instant navigation
+        if (ImGui::IsItemHovered()) {
+            const std::string& bucket = m_model.currentBucket();
+            const std::string& prefix = m_model.currentPrefix();
+            std::string parentPrefix = prefix;
+            if (!parentPrefix.empty() && parentPrefix.back() == '/') {
+                parentPrefix.pop_back();
+            }
+            size_t lastSlash = parentPrefix.rfind('/');
+            if (lastSlash == std::string::npos) {
+                parentPrefix = "";
+            } else {
+                parentPrefix = parentPrefix.substr(0, lastSlash + 1);
+            }
+            m_model.prefetchFolder(bucket, parentPrefix);
+        }
+        contentHeight -= ImGui::GetFrameHeightWithSpacing();
+    }
+
     // File browser content
     ImGui::BeginChild("FileContent", ImVec2(width, contentHeight), true,
         ImGuiWindowFlags_HorizontalScrollbar);
@@ -191,28 +215,6 @@ void BrowserUI::renderFolderContents() {
         m_model.loadFolder(bucket, prefix);
         ImGui::TextColored(ImVec4(0.5f, 0.5f, 1.0f, 1.0f), "Loading...");
         return;
-    }
-
-    // Show [..] to navigate up (outside clipper)
-    if (ImGui::Selectable("[..]")) {
-        m_model.navigateUp();
-        ImGui::SetScrollY(0);
-        return;  // Return early to avoid rendering stale content
-    }
-    // Prefetch parent folder on hover for instant navigation
-    if (ImGui::IsItemHovered()) {
-        // Calculate parent prefix (same logic as navigateUp)
-        std::string parentPrefix = prefix;
-        if (!parentPrefix.empty() && parentPrefix.back() == '/') {
-            parentPrefix.pop_back();
-        }
-        size_t lastSlash = parentPrefix.rfind('/');
-        if (lastSlash == std::string::npos) {
-            parentPrefix = "";
-        } else {
-            parentPrefix = parentPrefix.substr(0, lastSlash + 1);
-        }
-        m_model.prefetchFolder(bucket, parentPrefix);
     }
 
     // Show loading indicator
