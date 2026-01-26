@@ -36,4 +36,7 @@ private:
     // Fallback tracking - stores bucket/key of files that failed JSON parsing
     std::string m_fallbackKey;
     bool m_validatedFirstLine = false;  // True once we've checked the first line
+
+    // Scroll reset: incrementing this changes widget IDs, resetting scroll state
+    int m_scrollGeneration = 0;
 };

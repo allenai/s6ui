@@ -59,6 +59,7 @@ void JsonlPreviewRenderer::render(const PreviewContext& ctx) {
         m_textFieldCache.clear();
         m_textFieldName.clear();
         m_validatedFirstLine = false;
+        m_scrollGeneration++;  // Reset scroll by changing widget IDs
         // Don't clear m_fallbackKey here - it's used by wantsFallback() which is called before render()
     }
 
@@ -146,64 +147,73 @@ void JsonlPreviewRenderer::render(const PreviewContext& ctx) {
 
             // Show partial content in raw form (don't try to parse incomplete JSON)
             ImVec2 availSize = ImGui::GetContentRegionAvail();
-            ImGui::BeginChild("PartialContent", availSize, false,
-                ImGuiWindowFlags_HorizontalScrollbar);
-            if (fileChanged) ImGui::SetScrollY(0);
             // Show first/last part of partial content
+            std::string displayContent;
             if (lineContent.size() > 1000) {
-                std::string preview = lineContent.substr(0, 500) + "\n...\n" +
-                                      lineContent.substr(lineContent.size() - 500);
-                ImGui::TextUnformatted(preview.c_str());
+                displayContent = lineContent.substr(0, 500) + "\n...\n" +
+                                 lineContent.substr(lineContent.size() - 500);
             } else {
-                ImGui::TextUnformatted(lineContent.c_str());
+                displayContent = lineContent;
             }
-            ImGui::EndChild();
+            // Style to match app background
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::GetStyleColorVec4(ImGuiCol_WindowBg));
+            ImGui::InputTextMultiline("##PartialContent",
+                const_cast<char*>(displayContent.c_str()), displayContent.size() + 1,
+                availSize, ImGuiInputTextFlags_ReadOnly);
+            ImGui::PopStyleColor();
         } else if (m_rawMode) {
             // Raw mode - show unformatted line in scrollable region
             ImVec2 availSize = ImGui::GetContentRegionAvail();
-            ImGui::BeginChild("RawContent", availSize, false,
-                ImGuiWindowFlags_HorizontalScrollbar);
-            if (fileChanged) ImGui::SetScrollY(0);
-            ImGui::TextUnformatted(lineContent.c_str());
-            ImGui::EndChild();
+            // Use scroll generation in ID to reset scroll when file/line changes
+            char widgetId[64];
+            snprintf(widgetId, sizeof(widgetId), "##RawContent_%d_%zu", m_scrollGeneration, m_currentLine);
+
+            // Style to match app background
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::GetStyleColorVec4(ImGuiCol_WindowBg));
+            ImGui::InputTextMultiline(widgetId,
+                const_cast<char*>(lineContent.c_str()), lineContent.size() + 1,
+                availSize, ImGuiInputTextFlags_ReadOnly);
+            ImGui::PopStyleColor();
         } else {
             // Formatted mode - show pretty-printed JSON (and extract text field)
-            bool lineChanged = (m_formattedLineIndex != m_currentLine);
-            if (lineChanged) {
+            if (m_formattedLineIndex != m_currentLine) {
                 updateCache(lineContent);
                 m_formattedLineIndex = m_currentLine;
+                m_scrollGeneration++;  // Reset scroll when line changes
             }
-            bool resetScroll = fileChanged || lineChanged;
 
             ImVec2 availSize = ImGui::GetContentRegionAvail();
+
+            // Use scroll generation in IDs to reset scroll when content changes
+            char jsonWidgetId[64];
+            snprintf(jsonWidgetId, sizeof(jsonWidgetId), "##FormattedContent_%d_%zu", m_scrollGeneration, m_currentLine);
+
+            // Style to match app background
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::GetStyleColorVec4(ImGuiCol_WindowBg));
 
             // If we have a text field, split the view horizontally
             if (!m_textFieldCache.empty()) {
                 float halfHeight = availSize.y * 0.5f - 4;
 
                 // Top pane: formatted JSON
-                ImGui::BeginChild("FormattedContent", ImVec2(availSize.x, halfHeight), true,
-                    ImGuiWindowFlags_HorizontalScrollbar);
-                if (resetScroll) ImGui::SetScrollY(0);
-                ImGui::TextUnformatted(m_formattedCache.c_str());
-                ImGui::EndChild();
+                ImGui::InputTextMultiline(jsonWidgetId,
+                    const_cast<char*>(m_formattedCache.c_str()), m_formattedCache.size() + 1,
+                    ImVec2(availSize.x, halfHeight), ImGuiInputTextFlags_ReadOnly);
 
-                // Bottom pane: text field with word wrap
-                ImGui::BeginChild("TextFieldContent", ImVec2(availSize.x, halfHeight), true);
-                if (resetScroll) ImGui::SetScrollY(0);
-                // Render text with word wrap
-                ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x);
-                ImGui::TextUnformatted(m_textFieldCache.c_str());
-                ImGui::PopTextWrapPos();
-                ImGui::EndChild();
+                // Bottom pane: text field
+                char textWidgetId[64];
+                snprintf(textWidgetId, sizeof(textWidgetId), "##TextFieldContent_%d_%zu", m_scrollGeneration, m_currentLine);
+                ImGui::InputTextMultiline(textWidgetId,
+                    const_cast<char*>(m_textFieldCache.c_str()), m_textFieldCache.size() + 1,
+                    ImVec2(availSize.x, halfHeight), ImGuiInputTextFlags_ReadOnly);
             } else {
                 // No text field - show JSON only
-                ImGui::BeginChild("FormattedContent", availSize, false,
-                    ImGuiWindowFlags_HorizontalScrollbar);
-                if (resetScroll) ImGui::SetScrollY(0);
-                ImGui::TextUnformatted(m_formattedCache.c_str());
-                ImGui::EndChild();
+                ImGui::InputTextMultiline(jsonWidgetId,
+                    const_cast<char*>(m_formattedCache.c_str()), m_formattedCache.size() + 1,
+                    availSize, ImGuiInputTextFlags_ReadOnly);
             }
+
+            ImGui::PopStyleColor();
         }
     } else {
         ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "No lines loaded yet...");
@@ -221,6 +231,7 @@ void JsonlPreviewRenderer::reset() {
     // Don't clear m_fallbackKey - it needs to persist so wantsFallback() works
     // across renderer switches. It will naturally expire when a different file is selected.
     m_validatedFirstLine = false;
+    m_scrollGeneration++;
 }
 
 bool JsonlPreviewRenderer::wantsFallback(const std::string& bucket, const std::string& key) const {
