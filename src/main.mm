@@ -95,6 +95,10 @@ int main(int argc, char* argv[])
         model.refresh();
     }
 
+    // Load settings (for recent paths and session restore)
+    AppSettings savedSettings = loadSettings();
+    model.setSettings(std::move(savedSettings));
+
     // Navigate to initial path if provided, otherwise restore from settings
     LOG_F(INFO, "Initial path from args: '%s' (empty=%d)", initialPath.c_str(), initialPath.empty());
     if (!initialPath.empty()) {
@@ -102,7 +106,7 @@ int main(int argc, char* argv[])
         model.navigateTo(initialPath);
     } else {
         // Try to restore previous session state
-        AppSettings settings = loadSettings();
+        const auto& settings = model.settings();
         if (!settings.profile_name.empty()) {
             // Find profile by name
             const auto& profiles = model.profiles();
@@ -256,7 +260,7 @@ int main(int argc, char* argv[])
 
     // Save current state for next session
     {
-        AppSettings settings;
+        AppSettings& settings = model.settings();
         if (model.selectedProfileIndex() >= 0 &&
             model.selectedProfileIndex() < static_cast<int>(model.profiles().size())) {
             settings.profile_name = model.profiles()[model.selectedProfileIndex()].name;

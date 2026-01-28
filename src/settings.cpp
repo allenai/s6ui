@@ -73,6 +73,23 @@ AppSettings loadSettings() {
         settings.profile_name = j.value("profile", "");
         settings.bucket = j.value("bucket", "");
         settings.prefix = j.value("prefix", "");
+        if (j.contains("frecent_paths") && j["frecent_paths"].is_object()) {
+            for (auto& [profile, entries] : j["frecent_paths"].items()) {
+                if (entries.is_array()) {
+                    for (auto& e : entries) {
+                        if (e.is_object() && e.contains("path")) {
+                            PathEntry entry;
+                            entry.path = e.value("path", "");
+                            entry.score = e.value("score", 0.0);
+                            entry.last_accessed = e.value("last_accessed", static_cast<int64_t>(0));
+                            if (!entry.path.empty()) {
+                                settings.frecent_paths[profile].push_back(std::move(entry));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         LOG_F(INFO, "Loaded settings: profile=%s bucket=%s prefix=%s",
               settings.profile_name.c_str(), settings.bucket.c_str(), settings.prefix.c_str());
     } catch (const json::exception& e) {
@@ -105,6 +122,14 @@ void saveSettings(const AppSettings& settings) {
     j["profile"] = settings.profile_name;
     j["bucket"] = settings.bucket;
     j["prefix"] = settings.prefix;
+    j["frecent_paths"] = json::object();
+    for (const auto& [profile, entries] : settings.frecent_paths) {
+        json arr = json::array();
+        for (const auto& e : entries) {
+            arr.push_back({{"path", e.path}, {"score", e.score}, {"last_accessed", e.last_accessed}});
+        }
+        j["frecent_paths"][profile] = arr;
+    }
 
     file << j.dump(2) << std::endl;
     LOG_F(INFO, "Saved settings to %s", path.c_str());

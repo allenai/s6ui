@@ -4,6 +4,7 @@
 #include "aws/s3_backend.h"
 #include "aws/aws_credentials.h"
 #include "streaming_preview.h"
+#include "settings.h"
 #include <string>
 #include <vector>
 #include <map>
@@ -63,6 +64,12 @@ public:
     int selectedProfileIndex() const { return m_selectedProfileIdx; }
     const std::vector<AWSProfile>& profiles() const { return m_profiles; }
     std::vector<AWSProfile>& profiles() { return m_profiles; }
+
+    // Settings (frecent paths persistence)
+    void setSettings(AppSettings settings);
+    AppSettings& settings() { return m_settings; }
+    void recordRecentPath(const std::string& path);
+    std::vector<std::string> topFrecentPaths(size_t count = 20) const;
 
     // Commands (call from UI thread)
     void refresh();
@@ -129,6 +136,7 @@ private:
     void triggerPrefetch(const std::string& bucket, const std::vector<S3Object>& objects);
 
     std::unique_ptr<IBackend> m_backend;
+    AppSettings m_settings;
 
     // Profiles
     std::vector<AWSProfile> m_profiles;

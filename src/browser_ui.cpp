@@ -138,7 +138,8 @@ void BrowserUI::renderTopBar() {
     ImGui::SameLine();
 
     float refreshButtonWidth = 70;
-    float pathInputWidth = ImGui::GetWindowWidth() - ImGui::GetCursorPosX() - refreshButtonWidth - 20;
+    float arrowButtonWidth = ImGui::GetFrameHeight();  // Square button
+    float pathInputWidth = ImGui::GetWindowWidth() - ImGui::GetCursorPosX() - refreshButtonWidth - arrowButtonWidth - 24;
     ImGui::SetNextItemWidth(pathInputWidth);
 
     if (ImGui::InputText("##path", m_pathInput, sizeof(m_pathInput),
@@ -151,6 +152,28 @@ void BrowserUI::renderTopBar() {
     if (currentPath != m_pathInput && !ImGui::IsItemActive()) {
         std::strncpy(m_pathInput, currentPath.c_str(), sizeof(m_pathInput) - 1);
         m_pathInput[sizeof(m_pathInput) - 1] = '\0';
+    }
+
+    // Recent paths dropdown arrow
+    ImGui::SameLine(0, 0);
+    if (ImGui::ArrowButton("##recent_paths", ImGuiDir_Down)) {
+        ImGui::OpenPopup("RecentPathsPopup");
+    }
+
+    if (ImGui::BeginPopup("RecentPathsPopup")) {
+        auto topPaths = m_model.topFrecentPaths(20);
+        if (topPaths.empty()) {
+            ImGui::TextDisabled("No recent paths");
+        } else {
+            for (const auto& path : topPaths) {
+                if (ImGui::Selectable(path.c_str())) {
+                    std::strncpy(m_pathInput, path.c_str(), sizeof(m_pathInput) - 1);
+                    m_pathInput[sizeof(m_pathInput) - 1] = '\0';
+                    m_model.navigateTo(path);
+                }
+            }
+        }
+        ImGui::EndPopup();
     }
 
     ImGui::SameLine();

@@ -1,7 +1,9 @@
 #include "browser_model.h"
 #include "loguru.hpp"
 #include <unordered_set>
+#include <algorithm>
 #include <cstdlib>
+#include <ctime>
 
 BrowserModel::BrowserModel() = default;
 
@@ -15,6 +17,95 @@ BrowserModel::~BrowserModel() {
     if (m_paginationCancelFlag) {
         m_paginationCancelFlag->store(true);
     }
+}
+
+void BrowserModel::setSettings(AppSettings settings) {
+    m_settings = std::move(settings);
+}
+
+void BrowserModel::recordRecentPath(const std::string& path) {
+    if (path.empty() || path == "s3://") return;
+
+    std::string profileName;
+    if (m_selectedProfileIdx >= 0 && m_selectedProfileIdx < static_cast<int>(m_profiles.size())) {
+        profileName = m_profiles[m_selectedProfileIdx].name;
+    }
+    if (profileName.empty()) return;
+
+    auto& entries = m_settings.frecent_paths[profileName];
+    int64_t now = static_cast<int64_t>(std::time(nullptr));
+
+    // Find existing entry or create new one
+    auto it = std::find_if(entries.begin(), entries.end(),
+        [&path](const PathEntry& e) { return e.path == path; });
+
+    if (it != entries.end()) {
+        it->score += 1.0;
+        it->last_accessed = now;
+    } else {
+        PathEntry entry;
+        entry.path = path;
+        entry.score = 1.0;
+        entry.last_accessed = now;
+        entries.push_back(std::move(entry));
+    }
+
+    // Cap at 500 stored entries - remove lowest-scoring entries
+    if (entries.size() > 500) {
+        std::sort(entries.begin(), entries.end(),
+            [](const PathEntry& a, const PathEntry& b) { return a.score > b.score; });
+        entries.resize(500);
+    }
+}
+
+// Compute effective frecency score using time-decay buckets (z/zoxide style)
+static double frecencyScore(const PathEntry& entry, int64_t now) {
+    int64_t age = now - entry.last_accessed;
+    double weight;
+    if (age < 3600) {           // last hour
+        weight = 4.0;
+    } else if (age < 86400) {   // last day
+        weight = 2.0;
+    } else if (age < 604800) {  // last week
+        weight = 1.0;
+    } else {
+        weight = 0.5;
+    }
+    return entry.score * weight;
+}
+
+std::vector<std::string> BrowserModel::topFrecentPaths(size_t count) const {
+    std::string profileName;
+    if (m_selectedProfileIdx >= 0 && m_selectedProfileIdx < static_cast<int>(m_profiles.size())) {
+        profileName = m_profiles[m_selectedProfileIdx].name;
+    }
+
+    auto it = m_settings.frecent_paths.find(profileName);
+    if (it == m_settings.frecent_paths.end() || it->second.empty()) {
+        return {};
+    }
+
+    int64_t now = static_cast<int64_t>(std::time(nullptr));
+    const auto& entries = it->second;
+
+    // Build scored index pairs
+    std::vector<std::pair<double, size_t>> scored;
+    scored.reserve(entries.size());
+    for (size_t i = 0; i < entries.size(); ++i) {
+        scored.push_back({frecencyScore(entries[i], now), i});
+    }
+
+    // Partial sort for top N
+    size_t n = std::min(count, scored.size());
+    std::partial_sort(scored.begin(), scored.begin() + static_cast<ptrdiff_t>(n), scored.end(),
+        [](const auto& a, const auto& b) { return a.first > b.first; });
+
+    std::vector<std::string> result;
+    result.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        result.push_back(entries[scored[i].second].path);
+    }
+    return result;
 }
 
 void BrowserModel::setBackend(std::unique_ptr<IBackend> backend) {
@@ -205,6 +296,12 @@ void BrowserModel::navigateInto(const std::string& bucket, const std::string& pr
     clearSelection();  // Clear any selected file when navigating
     setCurrentPath(bucket, prefix);
     loadFolder(bucket, prefix);
+
+    // Record in recent paths
+    if (!bucket.empty()) {
+        std::string path = "s3://" + bucket + "/" + prefix;
+        recordRecentPath(path);
+    }
 
     // If folder is already loaded (e.g. from prefetch or returning to a previous folder)
     const auto* node = getNode(bucket, prefix);
