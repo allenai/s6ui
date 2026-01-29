@@ -195,6 +195,7 @@ void JsonlPreviewRenderer::render(const PreviewContext& ctx) {
                     m_textSP = std::make_unique<StreamingFilePreview>("", "", m_textFieldCache, m_textFieldCache.size());
                     m_textViewer.close();
                     m_textViewer.open(m_textSP.get());
+                    m_textViewer.setWordWrap(true);
                     m_textViewerLine = m_currentLine;
                 } else {
                     m_textViewer.close();
