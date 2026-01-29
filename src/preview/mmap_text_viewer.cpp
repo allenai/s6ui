@@ -611,8 +611,6 @@ void MmapTextViewer::render(float width, float height) {
     ImGui::InvisibleButton("##viewer_input", ImVec2(width, height));
     bool viewerFocused = ImGui::IsItemFocused();
 
-    ImGui::SetCursorScreenPos(windowPos);
-
     bool mouseInArea = mousePos.x >= windowPos.x && mousePos.x < windowPos.x + width &&
                        mousePos.y >= windowPos.y && mousePos.y < windowPos.y + height;
     bool mouseInTextArea = mousePos.x >= windowPos.x && mousePos.x < windowPos.x + width - SCROLLBAR_WIDTH &&
