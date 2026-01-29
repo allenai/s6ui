@@ -1,9 +1,13 @@
 #pragma once
 
 #include "preview_renderer.h"
+#include "mmap_text_viewer.h"
 #include <string>
+#include <memory>
 #include <climits>
 #include <cstdint>
+
+class StreamingFilePreview;
 
 class JsonlPreviewRenderer : public IPreviewRenderer {
 public:
@@ -37,6 +41,19 @@ private:
     std::string m_fallbackKey;
     bool m_validatedFirstLine = false;  // True once we've checked the first line
 
-    // Scroll reset: incrementing this changes widget IDs, resetting scroll state
-    int m_scrollGeneration = 0;
+    // MmapTextViewer instances for each display panel
+    MmapTextViewer m_rawViewer;        // Raw mode (full file, scroll to line)
+    MmapTextViewer m_jsonViewer;       // Formatted JSON display
+    MmapTextViewer m_textViewer;       // Text field display
+
+    // StreamingFilePreview instances for formatted content
+    std::unique_ptr<StreamingFilePreview> m_jsonSP;
+    std::unique_ptr<StreamingFilePreview> m_textSP;
+    std::unique_ptr<StreamingFilePreview> m_incompleteSP;
+
+    // Track what's currently loaded in viewers
+    std::string m_rawViewerKey;
+    size_t m_jsonViewerLine = SIZE_MAX;
+    size_t m_textViewerLine = SIZE_MAX;
+    size_t m_rawViewerLine = SIZE_MAX;
 };

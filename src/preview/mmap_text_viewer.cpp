@@ -1,4 +1,5 @@
 #include "mmap_text_viewer.h"
+#include "streaming_preview.h"
 #include "imgui/imgui.h"
 
 #include <sys/mman.h>
@@ -15,29 +16,28 @@ MmapTextViewer::~MmapTextViewer() {
     close();
 }
 
-bool MmapTextViewer::open(const std::string& filePath) {
+void MmapTextViewer::open(StreamingFilePreview* source) {
     close();
 
-    m_fd = ::open(filePath.c_str(), O_RDONLY);
+    if (!source)
+        return;
+
+    m_source = source;
+    const std::string& path = source->tempFilePath();
+    if (path.empty())
+        return;
+
+    m_fd = ::open(path.c_str(), O_RDONLY);
     if (m_fd < 0)
-        return false;
+        return;
 
-    struct stat st;
-    if (fstat(m_fd, &st) < 0) {
-        ::close(m_fd);
-        m_fd = -1;
-        return false;
-    }
-
-    m_fileSize = static_cast<uint64_t>(st.st_size);
-    m_filePath = filePath;
+    uint64_t size = source->bytesWritten();
+    m_fileSize = size;
 
     if (m_fileSize == 0) {
-        // Empty file - valid but nothing to map
-        m_indexingDone = true;
-        m_indexedBytes = 0;
-        m_indexedLineCount = 0;
-        return true;
+        // Valid but empty so far - will get data on refresh
+        m_lineOffsets.push_back(0);
+        return;
     }
 
     m_mapBase = mmap(nullptr, m_fileSize, PROT_READ, MAP_PRIVATE, m_fd, 0);
@@ -45,27 +45,65 @@ bool MmapTextViewer::open(const std::string& filePath) {
         m_mapBase = nullptr;
         ::close(m_fd);
         m_fd = -1;
-        return false;
+        return;
     }
 
-    // Advise the kernel we'll read sequentially during indexing
-    madvise(m_mapBase, m_fileSize, MADV_SEQUENTIAL);
+    madvise(m_mapBase, m_fileSize, MADV_RANDOM);
 
-    // Launch background indexing thread
-    m_indexingDone = false;
-    m_indexedBytes = 0;
-    m_indexedLineCount = 0;
-    m_indexThread = std::thread(&MmapTextViewer::buildNewlineIndex, this);
+    // Index newlines synchronously
+    m_lineOffsets.push_back(0);
+    indexNewlinesFrom(0);
+}
 
-    return true;
+void MmapTextViewer::refresh() {
+    if (!m_source || m_fd < 0)
+        return;
+
+    uint64_t newSize = m_source->bytesWritten();
+    if (newSize <= m_fileSize)
+        return;
+
+    // Unmap old mapping
+    if (m_mapBase && m_mapBase != MAP_FAILED) {
+        munmap(m_mapBase, m_fileSize);
+        m_mapBase = nullptr;
+    }
+
+    uint64_t oldSize = m_fileSize;
+    m_fileSize = newSize;
+
+    m_mapBase = mmap(nullptr, m_fileSize, PROT_READ, MAP_PRIVATE, m_fd, 0);
+    if (m_mapBase == MAP_FAILED) {
+        m_mapBase = nullptr;
+        return;
+    }
+
+    madvise(m_mapBase, m_fileSize, MADV_RANDOM);
+
+    // If this is the first data (was empty before), add initial line offset
+    if (oldSize == 0 && m_lineOffsets.empty()) {
+        m_lineOffsets.push_back(0);
+    }
+
+    // Index newlines from where we left off
+    indexNewlinesFrom(oldSize);
+
+    // Invalidate wrap cache for the last line (it may have grown)
+    if (!m_wrapCache.empty() && !m_lineOffsets.empty()) {
+        uint64_t lastLine = m_lineOffsets.size() - 1;
+        // Remove any cached wrap info for the last line at any width
+        auto it = m_wrapCache.begin();
+        while (it != m_wrapCache.end()) {
+            if (it->first.line == lastLine) {
+                it = m_wrapCache.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
 }
 
 void MmapTextViewer::close() {
-    // Wait for indexing thread to finish
-    if (m_indexThread.joinable()) {
-        m_indexThread.join();
-    }
-
     if (m_mapBase && m_mapBase != MAP_FAILED) {
         munmap(m_mapBase, m_fileSize);
         m_mapBase = nullptr;
@@ -75,12 +113,10 @@ void MmapTextViewer::close() {
         m_fd = -1;
     }
 
+    m_source = nullptr;
     m_fileSize = 0;
-    m_filePath.clear();
     m_lineOffsets.clear();
-    m_indexingDone = false;
     m_indexedBytes = 0;
-    m_indexedLineCount = 0;
     m_anchorLine = 0;
     m_anchorSubRow = 0;
     m_smoothOffsetY = 0.0f;
@@ -101,9 +137,7 @@ uint64_t MmapTextViewer::fileSize() const {
 }
 
 uint64_t MmapTextViewer::lineCount() const {
-    if (m_indexingDone)
-        return m_lineOffsets.size();
-    return m_indexedLineCount.load();
+    return m_lineOffsets.size();
 }
 
 void MmapTextViewer::setWordWrap(bool enabled) {
@@ -127,7 +161,6 @@ void MmapTextViewer::scrollToTop() {
 void MmapTextViewer::scrollToBottom() {
     uint64_t lc = lineCount();
     if (lc == 0) return;
-    // Set anchor near the end; render() will clamp as needed
     m_anchorLine = (lc > 100) ? lc - 100 : 0;
     m_anchorSubRow = 0;
     m_smoothOffsetY = 0.0f;
@@ -141,79 +174,46 @@ void MmapTextViewer::scrollToLine(uint64_t line) {
     m_smoothOffsetY = 0.0f;
 }
 
-void MmapTextViewer::buildNewlineIndex() {
-    // First line always starts at offset 0
-    {
-        std::lock_guard<std::mutex> lock(m_lineOffsetsMutex);
-        m_lineOffsets.push_back(0);
-    }
-    m_indexedLineCount = 1;
+void MmapTextViewer::indexNewlinesFrom(uint64_t fromByte) {
+    if (!m_mapBase || m_fileSize == 0)
+        return;
 
     const char* base = static_cast<const char*>(m_mapBase);
-    uint64_t size = m_fileSize;
-    uint64_t pos = 0;
+    uint64_t pos = fromByte;
 
-    while (pos < size) {
-        const void* found = memchr(base + pos, '\n', size - pos);
+    while (pos < m_fileSize) {
+        const void* found = memchr(base + pos, '\n', m_fileSize - pos);
         if (!found)
             break;
 
         uint64_t nlPos = static_cast<uint64_t>(static_cast<const char*>(found) - base);
         uint64_t nextLineStart = nlPos + 1;
 
-        if (nextLineStart < size) {
-            std::lock_guard<std::mutex> lock(m_lineOffsetsMutex);
+        if (nextLineStart < m_fileSize) {
             m_lineOffsets.push_back(nextLineStart);
-            m_indexedLineCount.store(m_lineOffsets.size(), std::memory_order_relaxed);
         }
 
         pos = nextLineStart;
-        m_indexedBytes.store(pos, std::memory_order_relaxed);
     }
 
-    m_indexedBytes.store(size, std::memory_order_relaxed);
-
-    // Switch madvise to random access for viewing
-    madvise(m_mapBase, m_fileSize, MADV_RANDOM);
-
-    m_indexingDone = true;
+    m_indexedBytes = m_fileSize;
 }
 
 MmapTextViewer::LineData MmapTextViewer::getLineData(uint64_t lineIndex) const {
     const char* base = static_cast<const char*>(m_mapBase);
+    if (!base) return {nullptr, 0};
 
-    uint64_t lc;
-    uint64_t start;
-    {
-        // We only need the lock during indexing; after done, no contention
-        if (!m_indexingDone) {
-            // During indexing, safely read
-            std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(m_lineOffsetsMutex));
-            lc = m_lineOffsets.size();
-            if (lineIndex >= lc)
-                return {nullptr, 0};
-            start = m_lineOffsets[lineIndex];
-        } else {
-            lc = m_lineOffsets.size();
-            if (lineIndex >= lc)
-                return {nullptr, 0};
-            start = m_lineOffsets[lineIndex];
-        }
-    }
+    uint64_t lc = m_lineOffsets.size();
+    if (lineIndex >= lc)
+        return {nullptr, 0};
+
+    uint64_t start = m_lineOffsets[lineIndex];
 
     uint64_t end;
     if (lineIndex + 1 < lc) {
-        if (!m_indexingDone) {
-            std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(m_lineOffsetsMutex));
-            end = m_lineOffsets[lineIndex + 1];
-        } else {
-            end = m_lineOffsets[lineIndex + 1];
-        }
+        end = m_lineOffsets[lineIndex + 1];
     } else {
-        // Last line (or last indexed line) extends to either:
-        // - end of indexed region during indexing
-        // - end of file when done
-        end = m_indexingDone ? m_fileSize : m_indexedBytes.load(std::memory_order_relaxed);
+        end = m_fileSize;
     }
 
     // Strip trailing \n and \r
@@ -259,10 +259,8 @@ MmapTextViewer::WrapInfo MmapTextViewer::computeWrapInfo(uint64_t lineIndex, flo
         float charWidth = font->GetCharAdvance(static_cast<ImWchar>(c));
 
         if (x + charWidth > wrapWidth && x > 0.0f) {
-            // Need to break - find last space for word wrap
             uint32_t breakAt = i;
 
-            // Look back for a word boundary
             if (lastBreakOffset > info.rowStartOffsets.back()) {
                 breakAt = lastBreakOffset;
             }
@@ -271,7 +269,6 @@ MmapTextViewer::WrapInfo MmapTextViewer::computeWrapInfo(uint64_t lineIndex, flo
             info.visualRowCount++;
             x = 0.0f;
 
-            // If we broke at a previous position, rewind
             if (breakAt < i) {
                 i = breakAt;
                 continue;
@@ -297,7 +294,6 @@ float MmapTextViewer::estimateAverageVisualRowsPerLine() {
     if (lc == 0)
         return 1.0f;
 
-    // Sample up to 1000 lines evenly distributed
     uint64_t sampleCount = std::min(lc, static_cast<uint64_t>(1000));
     float totalRows = 0.0f;
 
@@ -317,7 +313,6 @@ void MmapTextViewer::scrollByVisualRows(int64_t rows) {
     if (lc == 0) return;
 
     if (rows > 0) {
-        // Scroll down
         for (int64_t r = 0; r < rows; ++r) {
             if (m_wordWrap) {
                 WrapInfo wi = computeWrapInfo(m_anchorLine, m_lastWrapWidth);
@@ -336,7 +331,6 @@ void MmapTextViewer::scrollByVisualRows(int64_t rows) {
             }
         }
     } else {
-        // Scroll up
         int64_t remaining = -rows;
         for (int64_t r = 0; r < remaining; ++r) {
             if (m_wordWrap) {
@@ -364,17 +358,14 @@ void MmapTextViewer::renderScrollbar(float x, float y, float height, float total
     float viewportRows = height / lineHeight;
 
     if (totalVisualRows <= viewportRows) {
-        // Everything fits - no scrollbar needed, just draw background
         dl->AddRectFilled(ImVec2(x, y), ImVec2(x + SCROLLBAR_WIDTH, y + height),
                           IM_COL32(30, 30, 30, 255));
         return;
     }
 
-    // Scrollbar background
     dl->AddRectFilled(ImVec2(x, y), ImVec2(x + SCROLLBAR_WIDTH, y + height),
                       IM_COL32(30, 30, 30, 255));
 
-    // Thumb size and position
     float thumbRatio = viewportRows / totalVisualRows;
     float thumbH = std::max(20.0f, height * thumbRatio);
     float currentVisualRow = static_cast<float>(m_anchorLine) * avg + m_anchorSubRow;
@@ -382,19 +373,16 @@ void MmapTextViewer::renderScrollbar(float x, float y, float height, float total
     scrollFraction = std::clamp(scrollFraction, 0.0f, 1.0f);
     float thumbY = y + scrollFraction * (height - thumbH);
 
-    // Handle mouse interaction
     ImGuiIO& io = ImGui::GetIO();
     ImVec2 mousePos = io.MousePos;
     bool mouseInScrollbar = mousePos.x >= x && mousePos.x <= x + SCROLLBAR_WIDTH &&
                             mousePos.y >= y && mousePos.y <= y + height;
 
     if (mouseInScrollbar && ImGui::IsMouseClicked(0)) {
-        // Check if clicking on the thumb or track
         if (mousePos.y >= thumbY && mousePos.y <= thumbY + thumbH) {
             m_scrollbarDragging = true;
             m_scrollbarDragStartY = mousePos.y - thumbY;
         } else {
-            // Click on track - jump to position
             float clickFraction = (mousePos.y - y) / height;
             uint64_t targetLine = static_cast<uint64_t>(clickFraction * totalLines);
             scrollToLine(targetLine);
@@ -415,7 +403,6 @@ void MmapTextViewer::renderScrollbar(float x, float y, float height, float total
         }
     }
 
-    // Draw thumb
     ImU32 thumbColor = m_scrollbarDragging ? IM_COL32(180, 180, 180, 255) :
                        mouseInScrollbar ? IM_COL32(140, 140, 140, 255) :
                        IM_COL32(100, 100, 100, 255);
@@ -428,12 +415,10 @@ TextPosition MmapTextViewer::hitTest(float mouseX, float mouseY, float /*startX*
     uint64_t lc = lineCount();
     if (lc == 0) return result;
 
-    // How many visual rows down from top of viewport
     float relY = mouseY - startY;
     if (relY < 0.0f) relY = 0.0f;
     int visualRow = static_cast<int>(relY / lineHeight);
 
-    // Walk from anchor to find the logical line + sub-row
     uint64_t curLine = m_anchorLine;
     uint32_t curSubRow = m_anchorSubRow;
     int rowsToSkip = visualRow;
@@ -473,7 +458,6 @@ TextPosition MmapTextViewer::hitTest(float mouseX, float mouseY, float /*startX*
 
     result.line = curLine;
 
-    // Now find the byte offset from X position
     LineData ld = getLineData(curLine);
     if (!ld.ptr || ld.length == 0) {
         result.byteOffset = 0;
@@ -482,7 +466,6 @@ TextPosition MmapTextViewer::hitTest(float mouseX, float mouseY, float /*startX*
 
     uint32_t lineLen = static_cast<uint32_t>(std::min(ld.length, static_cast<uint64_t>(MAX_DISPLAY_LINE_BYTES)));
 
-    // Determine the byte range for this sub-row
     uint32_t rowStart = 0;
     uint32_t rowEnd = lineLen;
 
@@ -501,7 +484,6 @@ TextPosition MmapTextViewer::hitTest(float mouseX, float mouseY, float /*startX*
         }
     }
 
-    // Walk characters to find byte offset
     ImFontBaked* font = ImGui::GetFontBaked();
     float x = 0.0f;
     float targetX = mouseX - textX;
@@ -550,7 +532,6 @@ std::string MmapTextViewer::getSelectedText() const {
         return result;
     }
 
-    // First line: from start.byteOffset to end of line
     {
         LineData ld = getLineData(start.line);
         if (ld.ptr && start.byteOffset < ld.length) {
@@ -559,7 +540,6 @@ std::string MmapTextViewer::getSelectedText() const {
         result += '\n';
     }
 
-    // Middle lines
     for (uint64_t line = start.line + 1; line < end.line; ++line) {
         LineData ld = getLineData(line);
         if (ld.ptr && ld.length > 0) {
@@ -568,7 +548,6 @@ std::string MmapTextViewer::getSelectedText() const {
         result += '\n';
     }
 
-    // Last line: from beginning to end.byteOffset
     {
         LineData ld = getLineData(end.line);
         if (ld.ptr) {
@@ -588,26 +567,24 @@ void MmapTextViewer::copySelection() {
 }
 
 void MmapTextViewer::render(float width, float height) {
+    // Push a unique ID scope so multiple MmapTextViewer instances
+    // can render in the same frame without ImGui ID conflicts
+    ImGui::PushID(this);
+
     if (!isOpen()) {
         ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "(no file open)");
+        ImGui::PopID();
         return;
     }
 
     if (m_fileSize == 0) {
         ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "(empty file)");
+        ImGui::PopID();
         return;
     }
 
-    // Show progress during indexing
-    if (!m_indexingDone) {
-        float progress = static_cast<float>(m_indexedBytes.load(std::memory_order_relaxed)) /
-                         static_cast<float>(m_fileSize);
-        ImGui::ProgressBar(progress, ImVec2(width, 0.0f));
-        ImGui::Text("Indexing... %llu lines found", static_cast<unsigned long long>(m_indexedLineCount.load()));
-    }
-
     uint64_t lc = lineCount();
-    if (lc == 0) return;
+    if (lc == 0) { ImGui::PopID(); return; }
 
     // Clamp anchor
     if (m_anchorLine >= lc)
@@ -630,32 +607,26 @@ void MmapTextViewer::render(float width, float height) {
     ImVec2 windowPos = ImGui::GetCursorScreenPos();
     ImVec2 mousePos = io.MousePos;
 
-    // Register an invisible button so the viewer participates in ImGui's
-    // keyboard navigation (Tab to focus, arrow keys only when focused).
     ImGui::SetNextItemAllowOverlap();
     ImGui::InvisibleButton("##viewer_input", ImVec2(width, height));
     bool viewerFocused = ImGui::IsItemFocused();
 
-    // Reset cursor so subsequent drawing happens at the right position
     ImGui::SetCursorScreenPos(windowPos);
 
     bool mouseInArea = mousePos.x >= windowPos.x && mousePos.x < windowPos.x + width &&
                        mousePos.y >= windowPos.y && mousePos.y < windowPos.y + height;
-    // Text area excludes scrollbar for click/drag
     bool mouseInTextArea = mousePos.x >= windowPos.x && mousePos.x < windowPos.x + width - SCROLLBAR_WIDTH &&
                            mousePos.y >= windowPos.y && mousePos.y < windowPos.y + height;
 
     bool popupOpen = ImGui::IsPopupOpen("##textviewer_ctx");
 
     if ((mouseInArea || m_scrollbarDragging) && !popupOpen) {
-        // Mouse wheel
         if (io.MouseWheel != 0.0f) {
             int rows = static_cast<int>(-io.MouseWheel * 3.0f);
             scrollByVisualRows(rows);
         }
     }
 
-    // Keyboard handling (only when the viewer item has focus)
     if (viewerFocused) {
         if (ImGui::IsKeyPressed(ImGuiKey_DownArrow))
             scrollByVisualRows(1);
@@ -673,13 +644,11 @@ void MmapTextViewer::render(float width, float height) {
         if (ImGui::IsKeyPressed(ImGuiKey_End))
             scrollToBottom();
 
-        // Cmd+C (macOS) / Ctrl+C copy
         if (m_selectionActive && ImGui::IsKeyPressed(ImGuiKey_C) && (io.KeySuper || io.KeyCtrl)) {
             copySelection();
         }
     }
 
-    // Right-click context menu
     if (mouseInTextArea && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
         ImGui::OpenPopup("##textviewer_ctx");
     }
@@ -697,7 +666,7 @@ void MmapTextViewer::render(float width, float height) {
     float startY = windowPos.y;
     float textX = startX + LINE_NUMBER_GUTTER_WIDTH + 4.0f;
 
-    // Mouse click/drag handling for text selection (skip when popup is open)
+    // Mouse click/drag handling for text selection
     if (mouseInTextArea && ImGui::IsMouseClicked(0) && !m_scrollbarDragging && !popupOpen) {
         TextPosition pos = hitTest(mousePos.x, mousePos.y, startX, startY, textX, lineHeight);
         m_selectionAnchor = pos;
@@ -760,14 +729,12 @@ void MmapTextViewer::render(float width, float height) {
     ImU32 textColor = IM_COL32(220, 220, 220, 255);
     ImU32 gutterColor = IM_COL32(120, 120, 120, 255);
 
-    // Format buffer for line numbers
     char lineNumBuf[24];
 
     while (cursorY < startY + height && currentLine < lc) {
         LineData ld = getLineData(currentLine);
 
         if (m_wordWrap && textAreaWidth > 0.0f) {
-            // Check wrap cache
             WrapCacheKey key{currentLine, textAreaWidth};
             auto cacheIt = m_wrapCache.find(key);
             WrapInfo wi;
@@ -782,7 +749,6 @@ void MmapTextViewer::render(float width, float height) {
             }
 
             for (uint32_t row = currentSubRow; row < wi.visualRowCount && cursorY < startY + height; ++row) {
-                // Draw line number only on first sub-row
                 if (row == 0) {
                     snprintf(lineNumBuf, sizeof(lineNumBuf), "%llu", static_cast<unsigned long long>(currentLine + 1));
                     float numWidth = ImGui::CalcTextSize(lineNumBuf).x;
@@ -790,7 +756,6 @@ void MmapTextViewer::render(float width, float height) {
                                 gutterColor, lineNumBuf);
                 }
 
-                // Get sub-row text range
                 uint32_t rowStart = wi.rowStartOffsets[row];
                 uint32_t rowEnd = (row + 1 < wi.visualRowCount) ? wi.rowStartOffsets[row + 1]
                                                                  : static_cast<uint32_t>(std::min(ld.length, static_cast<uint64_t>(MAX_DISPLAY_LINE_BYTES)));
@@ -861,4 +826,6 @@ void MmapTextViewer::render(float width, float height) {
         estimateAverageVisualRowsPerLine();
     }
     renderScrollbar(startX + width - SCROLLBAR_WIDTH, startY, height, static_cast<float>(lc));
+
+    ImGui::PopID();
 }

@@ -2,11 +2,10 @@
 
 #include <string>
 #include <vector>
-#include <atomic>
-#include <thread>
-#include <mutex>
 #include <unordered_map>
 #include <cstdint>
+
+class StreamingFilePreview;
 
 struct TextPosition {
     uint64_t line = 0;
@@ -24,7 +23,12 @@ public:
     MmapTextViewer(const MmapTextViewer&) = delete;
     MmapTextViewer& operator=(const MmapTextViewer&) = delete;
 
-    bool open(const std::string& filePath);
+    // Open from a StreamingFilePreview (mmaps its temp file)
+    void open(StreamingFilePreview* source);
+
+    // Refresh mapping if source has new data (call each frame while streaming)
+    void refresh();
+
     void close();
     bool isOpen() const;
     uint64_t fileSize() const;
@@ -47,8 +51,8 @@ private:
     };
     LineData getLineData(uint64_t lineIndex) const;
 
-    // Newline indexing (runs on background thread)
-    void buildNewlineIndex();
+    // Newline indexing (synchronous, called in open/refresh)
+    void indexNewlinesFrom(uint64_t fromByte);
 
     // Word wrap
     struct WrapInfo {
@@ -81,19 +85,17 @@ private:
     // Scroll helpers
     void scrollByVisualRows(int64_t rows);
 
+    // Data source
+    StreamingFilePreview* m_source = nullptr;
+
     // File mapping
     int m_fd = -1;
     void* m_mapBase = nullptr;
     uint64_t m_fileSize = 0;
-    std::string m_filePath;
 
     // Newline index
     std::vector<uint64_t> m_lineOffsets;
-    std::thread m_indexThread;
-    std::atomic<bool> m_indexingDone{false};
-    std::atomic<uint64_t> m_indexedBytes{0};
-    std::atomic<uint64_t> m_indexedLineCount{0};
-    std::mutex m_lineOffsetsMutex;
+    uint64_t m_indexedBytes = 0;
 
     // Scroll state
     uint64_t m_anchorLine = 0;

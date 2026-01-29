@@ -6,9 +6,6 @@
 #include <cctype>
 
 bool JsonlPreviewRenderer::isJsonlFile(const std::string& key) {
-    // Check for .jsonl, .ndjson, or .json extension (also handles compressed variants)
-    // Note: .json files are included because they might be newline-delimited JSON
-    // The renderer will validate the first line and fall back if it's not valid JSONL
     size_t dotPos = key.rfind('.');
     if (dotPos == std::string::npos) return false;
 
@@ -32,16 +29,12 @@ bool JsonlPreviewRenderer::isJsonlFile(const std::string& key) {
 }
 
 bool JsonlPreviewRenderer::canHandle(const std::string& key) const {
-    // Only handle JSONL files that have streaming preview available
-    // The streaming preview check will be done at render time
     return isJsonlFile(key);
 }
 
 void JsonlPreviewRenderer::render(const PreviewContext& ctx) {
     auto* sp = ctx.streamingPreview;
     if (!sp) {
-        // No streaming preview - shouldn't happen if canHandle was called correctly
-        // but fall through gracefully
         ImGui::Text("Preview: %s", ctx.filename.c_str());
         ImGui::Separator();
         ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Loading...");
@@ -59,8 +52,17 @@ void JsonlPreviewRenderer::render(const PreviewContext& ctx) {
         m_textFieldCache.clear();
         m_textFieldName.clear();
         m_validatedFirstLine = false;
-        m_scrollGeneration++;  // Reset scroll by changing widget IDs
-        // Don't clear m_fallbackKey here - it's used by wantsFallback() which is called before render()
+        // Close all viewers
+        m_rawViewer.close();
+        m_jsonViewer.close();
+        m_textViewer.close();
+        m_jsonSP.reset();
+        m_textSP.reset();
+        m_incompleteSP.reset();
+        m_rawViewerKey.clear();
+        m_jsonViewerLine = SIZE_MAX;
+        m_textViewerLine = SIZE_MAX;
+        m_rawViewerLine = SIZE_MAX;
     }
 
     // Validate first line once it's complete - if not valid JSON, trigger fallback
@@ -68,15 +70,13 @@ void JsonlPreviewRenderer::render(const PreviewContext& ctx) {
         m_validatedFirstLine = true;
         std::string firstLine = sp->getLine(0);
         if (!isValidJsonLine(firstLine)) {
-            // First line isn't valid JSON - mark this file for fallback
             m_fallbackKey = fullKey;
-            // Return early - UI will switch to text renderer on next frame
             ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Not valid JSONL, switching to text view...");
             return;
         }
     }
 
-    // If this file was marked for fallback, don't render (UI should have caught this)
+    // If this file was marked for fallback, don't render
     if (m_fallbackKey == fullKey) {
         return;
     }
@@ -103,23 +103,19 @@ void JsonlPreviewRenderer::render(const PreviewContext& ctx) {
     // Navigation controls
     ImGui::BeginGroup();
 
-    // Left arrow button
     if (ImGui::Button("<") || (ImGui::IsKeyPressed(ImGuiKey_LeftArrow) && !ImGui::GetIO().WantTextInput)) {
         navigateLine(-1, ctx);
     }
     ImGui::SameLine();
 
-    // Line counter
     ImGui::Text("Line %zu / %zu", m_currentLine + 1, lineCount);
     ImGui::SameLine();
 
-    // Right arrow button
     if (ImGui::Button(">") || (ImGui::IsKeyPressed(ImGuiKey_RightArrow) && !ImGui::GetIO().WantTextInput)) {
         navigateLine(1, ctx);
     }
     ImGui::SameLine();
 
-    // Toggle raw/formatted
     if (ImGui::Checkbox("Raw", &m_rawMode)) {
         m_formattedLineIndex = SIZE_MAX;  // Force refresh
     }
@@ -135,19 +131,16 @@ void JsonlPreviewRenderer::render(const PreviewContext& ctx) {
         if (lineContent.empty()) {
             ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "(empty line)");
         } else if (!lineComplete) {
-            // Line is still being downloaded - invalidate cache so it re-formats when complete
+            // Line is still being downloaded - invalidate cache
             if (m_formattedLineIndex == m_currentLine) {
                 m_formattedLineIndex = SIZE_MAX;
             }
 
-            // Show partial content with indicator
             ImGui::TextColored(ImVec4(0.5f, 0.5f, 1.0f, 1.0f),
                 "Line incomplete (%zu bytes loaded so far)...", lineContent.size());
             ImGui::Spacing();
 
-            // Show partial content in raw form (don't try to parse incomplete JSON)
-            ImVec2 availSize = ImGui::GetContentRegionAvail();
-            // Show first/last part of partial content
+            // Show partial content with MmapTextViewer
             std::string displayContent;
             if (lineContent.size() > 1000) {
                 displayContent = lineContent.substr(0, 500) + "\n...\n" +
@@ -155,65 +148,83 @@ void JsonlPreviewRenderer::render(const PreviewContext& ctx) {
             } else {
                 displayContent = lineContent;
             }
-            // Style to match app background
-            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::GetStyleColorVec4(ImGuiCol_WindowBg));
-            ImGui::InputTextMultiline("##PartialContent",
-                const_cast<char*>(displayContent.c_str()), displayContent.size() + 1,
-                availSize, ImGuiInputTextFlags_ReadOnly);
-            ImGui::PopStyleColor();
-        } else if (m_rawMode) {
-            // Raw mode - show unformatted line in scrollable region
-            ImVec2 availSize = ImGui::GetContentRegionAvail();
-            // Use scroll generation in ID to reset scroll when file/line changes
-            char widgetId[64];
-            snprintf(widgetId, sizeof(widgetId), "##RawContent_%d_%zu", m_scrollGeneration, m_currentLine);
 
-            // Style to match app background
-            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::GetStyleColorVec4(ImGuiCol_WindowBg));
-            ImGui::InputTextMultiline(widgetId,
-                const_cast<char*>(lineContent.c_str()), lineContent.size() + 1,
-                availSize, ImGuiInputTextFlags_ReadOnly);
-            ImGui::PopStyleColor();
+            m_incompleteSP = std::make_unique<StreamingFilePreview>("", "", displayContent, displayContent.size());
+            MmapTextViewer incompleteViewer;
+            incompleteViewer.open(m_incompleteSP.get());
+
+            ImVec2 availSize = ImGui::GetContentRegionAvail();
+            if (availSize.y > 0.0f) {
+                incompleteViewer.render(availSize.x, availSize.y);
+            }
+        } else if (m_rawMode) {
+            // Raw mode - open the main streaming temp file and scroll to current line
+            if (m_rawViewerKey != fullKey) {
+                m_rawViewer.close();
+                m_rawViewer.open(sp);
+                m_rawViewerKey = fullKey;
+            }
+
+            // Refresh mapping if source has new data (no-op when size unchanged)
+            m_rawViewer.refresh();
+
+            // Scroll to current line if it changed
+            if (m_rawViewerLine != m_currentLine) {
+                m_rawViewer.scrollToLine(static_cast<uint64_t>(m_currentLine));
+                m_rawViewerLine = m_currentLine;
+            }
+
+            ImVec2 availSize = ImGui::GetContentRegionAvail();
+            if (availSize.y > 0.0f) {
+                m_rawViewer.render(availSize.x, availSize.y);
+            }
         } else {
             // Formatted mode - show pretty-printed JSON (and extract text field)
             if (m_formattedLineIndex != m_currentLine) {
                 updateCache(lineContent);
                 m_formattedLineIndex = m_currentLine;
-                m_scrollGeneration++;  // Reset scroll when line changes
+
+                // Create StreamingFilePreview for formatted JSON
+                m_jsonSP = std::make_unique<StreamingFilePreview>("", "", m_formattedCache, m_formattedCache.size());
+                m_jsonViewer.close();
+                m_jsonViewer.open(m_jsonSP.get());
+                m_jsonViewerLine = m_currentLine;
+
+                // Create StreamingFilePreview for text field if present
+                if (!m_textFieldCache.empty()) {
+                    m_textSP = std::make_unique<StreamingFilePreview>("", "", m_textFieldCache, m_textFieldCache.size());
+                    m_textViewer.close();
+                    m_textViewer.open(m_textSP.get());
+                    m_textViewerLine = m_currentLine;
+                } else {
+                    m_textViewer.close();
+                    m_textSP.reset();
+                    m_textViewerLine = SIZE_MAX;
+                }
             }
 
             ImVec2 availSize = ImGui::GetContentRegionAvail();
 
-            // Use scroll generation in IDs to reset scroll when content changes
-            char jsonWidgetId[64];
-            snprintf(jsonWidgetId, sizeof(jsonWidgetId), "##FormattedContent_%d_%zu", m_scrollGeneration, m_currentLine);
-
-            // Style to match app background
-            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::GetStyleColorVec4(ImGuiCol_WindowBg));
-
-            // If we have a text field, split the view horizontally
             if (!m_textFieldCache.empty()) {
                 float halfHeight = availSize.y * 0.5f - 4;
 
                 // Top pane: formatted JSON
-                ImGui::InputTextMultiline(jsonWidgetId,
-                    const_cast<char*>(m_formattedCache.c_str()), m_formattedCache.size() + 1,
-                    ImVec2(availSize.x, halfHeight), ImGuiInputTextFlags_ReadOnly);
+                if (halfHeight > 0.0f) {
+                    m_jsonViewer.render(availSize.x, halfHeight);
+                }
+
+                ImGui::Spacing();
 
                 // Bottom pane: text field
-                char textWidgetId[64];
-                snprintf(textWidgetId, sizeof(textWidgetId), "##TextFieldContent_%d_%zu", m_scrollGeneration, m_currentLine);
-                ImGui::InputTextMultiline(textWidgetId,
-                    const_cast<char*>(m_textFieldCache.c_str()), m_textFieldCache.size() + 1,
-                    ImVec2(availSize.x, halfHeight), ImGuiInputTextFlags_ReadOnly);
+                if (halfHeight > 0.0f) {
+                    m_textViewer.render(availSize.x, halfHeight);
+                }
             } else {
                 // No text field - show JSON only
-                ImGui::InputTextMultiline(jsonWidgetId,
-                    const_cast<char*>(m_formattedCache.c_str()), m_formattedCache.size() + 1,
-                    availSize, ImGuiInputTextFlags_ReadOnly);
+                if (availSize.y > 0.0f) {
+                    m_jsonViewer.render(availSize.x, availSize.y);
+                }
             }
-
-            ImGui::PopStyleColor();
         }
     } else {
         ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "No lines loaded yet...");
@@ -228,10 +239,18 @@ void JsonlPreviewRenderer::reset() {
     m_textFieldCache.clear();
     m_textFieldName.clear();
     m_formattedLineIndex = SIZE_MAX;
-    // Don't clear m_fallbackKey - it needs to persist so wantsFallback() works
-    // across renderer switches. It will naturally expire when a different file is selected.
     m_validatedFirstLine = false;
-    m_scrollGeneration++;
+
+    m_rawViewer.close();
+    m_jsonViewer.close();
+    m_textViewer.close();
+    m_jsonSP.reset();
+    m_textSP.reset();
+    m_incompleteSP.reset();
+    m_rawViewerKey.clear();
+    m_jsonViewerLine = SIZE_MAX;
+    m_textViewerLine = SIZE_MAX;
+    m_rawViewerLine = SIZE_MAX;
 }
 
 bool JsonlPreviewRenderer::wantsFallback(const std::string& bucket, const std::string& key) const {
@@ -242,8 +261,6 @@ bool JsonlPreviewRenderer::wantsFallback(const std::string& bucket, const std::s
 bool JsonlPreviewRenderer::isValidJsonLine(const std::string& line) {
     if (line.empty()) return false;
 
-    // Quick check: valid JSON objects/arrays start with { or [
-    // Skip leading whitespace
     size_t start = 0;
     while (start < line.size() && std::isspace(static_cast<unsigned char>(line[start]))) {
         ++start;
@@ -252,10 +269,9 @@ bool JsonlPreviewRenderer::isValidJsonLine(const std::string& line) {
 
     char firstChar = line[start];
     if (firstChar != '{' && firstChar != '[') {
-        return false;  // JSONL lines should be objects or arrays
+        return false;
     }
 
-    // Try to parse as JSON
     try {
         (void)nlohmann::json::parse(line);
         return true;
@@ -291,10 +307,9 @@ void JsonlPreviewRenderer::navigateLine(int delta, const PreviewContext& ctx) {
 void JsonlPreviewRenderer::updateCache(const std::string& rawJson) {
     try {
         auto parsed = nlohmann::json::parse(rawJson);
-        m_formattedCache = parsed.dump(2);  // Pretty-print with 2-space indent
+        m_formattedCache = parsed.dump(2);
         m_textFieldCache = extractTextField(rawJson, m_textFieldName);
     } catch (const nlohmann::json::parse_error& e) {
-        // Not valid JSON - return original with error message
         m_formattedCache = std::string("(Invalid JSON: ") + e.what() + ")\n\n" + rawJson;
         m_textFieldCache.clear();
         m_textFieldName.clear();
@@ -310,7 +325,6 @@ std::string JsonlPreviewRenderer::extractTextField(const std::string& json, std:
             return "";
         }
 
-        // Only look for "text" field
         if (parsed.contains("text") && parsed["text"].is_string()) {
             outFieldName = "text";
             return parsed["text"].get<std::string>();

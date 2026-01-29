@@ -374,12 +374,8 @@ void BrowserModel::selectFile(const std::string& bucket, const std::string& key)
             m_previewContent = it->second;
             m_previewLoading = false;
 
-            // Start streaming for gzipped files or large files
-            bool needsStreaming = isCompressed(key) ||
-                static_cast<size_t>(m_selectedFileSize) > STREAMING_THRESHOLD;
-            if (needsStreaming) {
-                startStreamingDownload(static_cast<size_t>(m_selectedFileSize));
-            }
+            // Always create StreamingFilePreview for unified data access
+            startStreamingDownload(static_cast<size_t>(m_selectedFileSize));
             return;
         }
 
@@ -705,16 +701,8 @@ bool BrowserModel::processEvents() {
                     m_previewLoading = false;
                     m_previewError.clear();
 
-                    // Start streaming for:
-                    // 1. Gzipped files (always, for transparent decompression)
-                    // 2. Large files that need more data
-                    bool needsStreaming = isCompressed(payload.key) ||
-                        (static_cast<size_t>(m_selectedFileSize) > STREAMING_THRESHOLD &&
-                         static_cast<size_t>(m_selectedFileSize) > payload.content.size());
-
-                    if (needsStreaming) {
-                        startStreamingDownload(static_cast<size_t>(m_selectedFileSize));
-                    }
+                    // Always create StreamingFilePreview for unified data access
+                    startStreamingDownload(static_cast<size_t>(m_selectedFileSize));
                 }
                 break;
             }
