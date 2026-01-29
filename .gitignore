@@ -1,6 +1,7 @@
 # Compiled binaries
 imgui_demo
 s6ui
+test_viewer
 
 # Logs
 s6ui.log

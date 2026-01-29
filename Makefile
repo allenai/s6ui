@@ -252,7 +252,32 @@ app:
 	@echo "App bundles are only supported on macOS"
 endif
 
-.PHONY: all clean debug asan deps app
+# Test viewer
+TEST_VIEWER_OBJS = $(BUILD_DIR)/tests/test_viewer_main.o \
+                   $(BUILD_DIR)/src/preview/mmap_text_viewer.o
+
+TEST_LDFLAGS = -L$(HOMEBREW_PREFIX)/lib -lglfw
+ifeq ($(UNAME_S), Darwin)
+TEST_LDFLAGS += -framework Metal -framework MetalKit -framework Cocoa \
+                -framework IOKit -framework CoreVideo -framework QuartzCore
+endif
+
+test_viewer: $(TEST_VIEWER_OBJS) $(IMGUI_OBJS) $(IMGUI_METAL_OBJS) $(IMGUI_OPENGL_OBJS)
+ifeq ($(UNAME_S), Darwin)
+	$(OBJCXX) $^ $(TEST_LDFLAGS) -o $@
+else
+	$(CXX) $^ $(TEST_LDFLAGS) -o $@
+endif
+
+$(BUILD_DIR)/tests/%.o: tests/%.mm
+	@mkdir -p $(dir $@)
+	$(OBJCXX) $(OBJCXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/src/preview/mmap_text_viewer.o: $(SRC_DIR)/preview/mmap_text_viewer.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+.PHONY: all clean debug asan deps app test_viewer
 
 # Debug build with symbols and no optimization
 debug: CXXFLAGS = -std=c++17 -Wall -Wextra -g -O0
