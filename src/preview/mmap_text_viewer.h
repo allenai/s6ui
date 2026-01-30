@@ -1,5 +1,6 @@
 #pragma once
 
+#include <memory>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -24,7 +25,7 @@ public:
     MmapTextViewer& operator=(const MmapTextViewer&) = delete;
 
     // Open from a StreamingFilePreview (mmaps its temp file)
-    void open(StreamingFilePreview* source);
+    void open(std::shared_ptr<StreamingFilePreview> source);
 
     // Refresh mapping if source has new data (call each frame while streaming)
     void refresh();
@@ -86,7 +87,7 @@ private:
     void scrollByVisualRows(int64_t rows);
 
     // Data source
-    StreamingFilePreview* m_source = nullptr;
+    std::shared_ptr<StreamingFilePreview> m_source;
 
     // File mapping
     int m_fd = -1;

@@ -47,9 +47,9 @@ private:
     MmapTextViewer m_textViewer;       // Text field display
 
     // StreamingFilePreview instances for formatted content
-    std::unique_ptr<StreamingFilePreview> m_jsonSP;
-    std::unique_ptr<StreamingFilePreview> m_textSP;
-    std::unique_ptr<StreamingFilePreview> m_incompleteSP;
+    std::shared_ptr<StreamingFilePreview> m_jsonSP;
+    std::shared_ptr<StreamingFilePreview> m_textSP;
+    std::shared_ptr<StreamingFilePreview> m_incompleteSP;
 
     // Track what's currently loaded in viewers
     std::string m_rawViewerKey;

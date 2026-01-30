@@ -104,8 +104,8 @@ public:
 
     // Streaming preview accessors
     bool hasStreamingPreview() const { return m_streamingPreview != nullptr; }
-    StreamingFilePreview* streamingPreview() { return m_streamingPreview.get(); }
-    const StreamingFilePreview* streamingPreview() const { return m_streamingPreview.get(); }
+    std::shared_ptr<StreamingFilePreview> streamingPreview() { return m_streamingPreview; }
+    std::shared_ptr<const StreamingFilePreview> streamingPreview() const { return m_streamingPreview; }
     bool isStreamingEnabled() const { return m_streamingEnabled; }
     int64_t selectedFileSize() const { return m_selectedFileSize; }
 
@@ -164,7 +164,7 @@ private:
     std::string m_previewError;
 
     // Streaming preview for large files
-    std::unique_ptr<StreamingFilePreview> m_streamingPreview;
+    std::shared_ptr<StreamingFilePreview> m_streamingPreview;
     std::shared_ptr<std::atomic<bool>> m_streamingCancelFlag;
     bool m_streamingEnabled = false;  // Whether we're in streaming mode
     void startStreamingDownload(size_t totalFileSize);

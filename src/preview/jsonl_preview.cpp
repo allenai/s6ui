@@ -33,7 +33,7 @@ bool JsonlPreviewRenderer::canHandle(const std::string& key) const {
 }
 
 void JsonlPreviewRenderer::render(const PreviewContext& ctx) {
-    auto* sp = ctx.streamingPreview;
+    auto* sp = ctx.streamingPreview.get();
     if (!sp) {
         ImGui::Text("Preview: %s", ctx.filename.c_str());
         ImGui::Separator();
@@ -149,9 +149,9 @@ void JsonlPreviewRenderer::render(const PreviewContext& ctx) {
                 displayContent = lineContent;
             }
 
-            m_incompleteSP = std::make_unique<StreamingFilePreview>("", "", displayContent, displayContent.size());
+            m_incompleteSP = std::make_shared<StreamingFilePreview>("", "", displayContent, displayContent.size());
             MmapTextViewer incompleteViewer;
-            incompleteViewer.open(m_incompleteSP.get());
+            incompleteViewer.open(m_incompleteSP);
 
             ImVec2 availSize = ImGui::GetContentRegionAvail();
             if (availSize.y > 0.0f) {
@@ -161,7 +161,7 @@ void JsonlPreviewRenderer::render(const PreviewContext& ctx) {
             // Raw mode - open the main streaming temp file and scroll to current line
             if (m_rawViewerKey != fullKey) {
                 m_rawViewer.close();
-                m_rawViewer.open(sp);
+                m_rawViewer.open(ctx.streamingPreview);
                 m_rawViewerKey = fullKey;
             }
 
@@ -185,16 +185,16 @@ void JsonlPreviewRenderer::render(const PreviewContext& ctx) {
                 m_formattedLineIndex = m_currentLine;
 
                 // Create StreamingFilePreview for formatted JSON
-                m_jsonSP = std::make_unique<StreamingFilePreview>("", "", m_formattedCache, m_formattedCache.size());
+                m_jsonSP = std::make_shared<StreamingFilePreview>("", "", m_formattedCache, m_formattedCache.size());
                 m_jsonViewer.close();
-                m_jsonViewer.open(m_jsonSP.get());
+                m_jsonViewer.open(m_jsonSP);
                 m_jsonViewerLine = m_currentLine;
 
                 // Create StreamingFilePreview for text field if present
                 if (!m_textFieldCache.empty()) {
-                    m_textSP = std::make_unique<StreamingFilePreview>("", "", m_textFieldCache, m_textFieldCache.size());
+                    m_textSP = std::make_shared<StreamingFilePreview>("", "", m_textFieldCache, m_textFieldCache.size());
                     m_textViewer.close();
-                    m_textViewer.open(m_textSP.get());
+                    m_textViewer.open(m_textSP);
                     m_textViewer.setWordWrap(true);
                     m_textViewerLine = m_currentLine;
                 } else {
@@ -282,7 +282,7 @@ bool JsonlPreviewRenderer::isValidJsonLine(const std::string& line) {
 }
 
 void JsonlPreviewRenderer::navigateLine(int delta, const PreviewContext& ctx) {
-    auto* sp = ctx.streamingPreview;
+    auto* sp = ctx.streamingPreview.get();
     if (!sp) return;
 
     size_t lineCount = sp->lineCount();

@@ -899,7 +899,7 @@ void BrowserModel::startStreamingDownload(size_t totalFileSize) {
     }
 
     // Create streaming preview with the initial preview content
-    m_streamingPreview = std::make_unique<StreamingFilePreview>(
+    m_streamingPreview = std::make_shared<StreamingFilePreview>(
         m_selectedBucket, m_selectedKey, m_previewContent, totalFileSize, std::move(transform));
 
     m_streamingEnabled = true;

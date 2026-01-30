@@ -1,5 +1,6 @@
 #pragma once
 
+#include <memory>
 #include <string>
 
 class BrowserModel;
@@ -11,7 +12,7 @@ struct PreviewContext {
     const std::string& bucket;
     const std::string& key;
     const std::string& filename;
-    StreamingFilePreview* streamingPreview;  // May be null
+    std::shared_ptr<StreamingFilePreview> streamingPreview;  // May be null
     float width;
     float height;
 };

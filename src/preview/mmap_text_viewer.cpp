@@ -16,14 +16,14 @@ MmapTextViewer::~MmapTextViewer() {
     close();
 }
 
-void MmapTextViewer::open(StreamingFilePreview* source) {
+void MmapTextViewer::open(std::shared_ptr<StreamingFilePreview> source) {
     close();
 
     if (!source)
         return;
 
-    m_source = source;
-    const std::string& path = source->tempFilePath();
+    m_source = std::move(source);
+    const std::string& path = m_source->tempFilePath();
     if (path.empty())
         return;
 
@@ -31,7 +31,7 @@ void MmapTextViewer::open(StreamingFilePreview* source) {
     if (m_fd < 0)
         return;
 
-    uint64_t size = source->bytesWritten();
+    uint64_t size = m_source->bytesWritten();
     m_fileSize = size;
 
     if (m_fileSize == 0) {
@@ -113,7 +113,7 @@ void MmapTextViewer::close() {
         m_fd = -1;
     }
 
-    m_source = nullptr;
+    m_source.reset();
     m_fileSize = 0;
     m_lineOffsets.clear();
     m_indexedBytes = 0;
