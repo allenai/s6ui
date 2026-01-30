@@ -177,7 +177,8 @@ void BrowserUI::renderTopBar() {
     }
 
     ImGui::SameLine();
-    if (ImGui::Button("Refresh")) {
+    bool cmdR = ImGui::GetIO().KeySuper && ImGui::IsKeyPressed(ImGuiKey_R);
+    if (ImGui::Button("Refresh") || cmdR) {
         m_model.refresh();
     }
 }
