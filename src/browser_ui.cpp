@@ -57,6 +57,30 @@ void BrowserUI::renderLeftPane(float width, float height) {
     float statusBarHeight = ImGui::GetFrameHeightWithSpacing() + 4;
     float contentHeight = height - statusBarHeight;
 
+    // Show [..] outside scrolling area when in a folder
+    if (!m_model.isAtRoot()) {
+        if (ImGui::Selectable("[..]")) {
+            m_model.navigateUp();
+        }
+        // Prefetch parent folder on hover for instant navigation
+        if (ImGui::IsItemHovered()) {
+            const std::string& bucket = m_model.currentBucket();
+            const std::string& prefix = m_model.currentPrefix();
+            std::string parentPrefix = prefix;
+            if (!parentPrefix.empty() && parentPrefix.back() == '/') {
+                parentPrefix.pop_back();
+            }
+            size_t lastSlash = parentPrefix.rfind('/');
+            if (lastSlash == std::string::npos) {
+                parentPrefix = "";
+            } else {
+                parentPrefix = parentPrefix.substr(0, lastSlash + 1);
+            }
+            m_model.prefetchFolder(bucket, parentPrefix);
+        }
+        contentHeight -= ImGui::GetFrameHeightWithSpacing();
+    }
+
     // File browser content
     ImGui::BeginChild("FileContent", ImVec2(width, contentHeight), true,
         ImGuiWindowFlags_HorizontalScrollbar);
@@ -114,7 +138,8 @@ void BrowserUI::renderTopBar() {
     ImGui::SameLine();
 
     float refreshButtonWidth = 70;
-    float pathInputWidth = ImGui::GetWindowWidth() - ImGui::GetCursorPosX() - refreshButtonWidth - 20;
+    float arrowButtonWidth = ImGui::GetFrameHeight();  // Square button
+    float pathInputWidth = ImGui::GetWindowWidth() - ImGui::GetCursorPosX() - refreshButtonWidth - arrowButtonWidth - 24;
     ImGui::SetNextItemWidth(pathInputWidth);
 
     if (ImGui::InputText("##path", m_pathInput, sizeof(m_pathInput),
@@ -129,8 +154,31 @@ void BrowserUI::renderTopBar() {
         m_pathInput[sizeof(m_pathInput) - 1] = '\0';
     }
 
+    // Recent paths dropdown arrow
+    ImGui::SameLine(0, 0);
+    if (ImGui::ArrowButton("##recent_paths", ImGuiDir_Down)) {
+        ImGui::OpenPopup("RecentPathsPopup");
+    }
+
+    if (ImGui::BeginPopup("RecentPathsPopup")) {
+        auto topPaths = m_model.topFrecentPaths(20);
+        if (topPaths.empty()) {
+            ImGui::TextDisabled("No recent paths");
+        } else {
+            for (const auto& path : topPaths) {
+                if (ImGui::Selectable(path.c_str())) {
+                    std::strncpy(m_pathInput, path.c_str(), sizeof(m_pathInput) - 1);
+                    m_pathInput[sizeof(m_pathInput) - 1] = '\0';
+                    m_model.navigateTo(path);
+                }
+            }
+        }
+        ImGui::EndPopup();
+    }
+
     ImGui::SameLine();
-    if (ImGui::Button("Refresh")) {
+    bool cmdR = ImGui::GetIO().KeySuper && ImGui::IsKeyPressed(ImGuiKey_R);
+    if (ImGui::Button("Refresh") || cmdR) {
         m_model.refresh();
     }
 }
@@ -193,28 +241,6 @@ void BrowserUI::renderFolderContents() {
         return;
     }
 
-    // Show [..] to navigate up
-    if (ImGui::Selectable("[..]")) {
-        m_model.navigateUp();
-        ImGui::SetScrollY(0);
-        return;  // Return early to avoid rendering stale content
-    }
-    // Prefetch parent folder on hover for instant navigation
-    if (ImGui::IsItemHovered()) {
-        // Calculate parent prefix (same logic as navigateUp)
-        std::string parentPrefix = prefix;
-        if (!parentPrefix.empty() && parentPrefix.back() == '/') {
-            parentPrefix.pop_back();
-        }
-        size_t lastSlash = parentPrefix.rfind('/');
-        if (lastSlash == std::string::npos) {
-            parentPrefix = "";
-        } else {
-            parentPrefix = parentPrefix.substr(0, lastSlash + 1);
-        }
-        m_model.prefetchFolder(bucket, parentPrefix);
-    }
-
     // Show loading indicator
     if (node->loading && node->objects.empty()) {
         ImGui::TextColored(ImVec4(0.5f, 0.5f, 1.0f, 1.0f), "Loading...");
@@ -228,76 +254,89 @@ void BrowserUI::renderFolderContents() {
         return;
     }
 
-    // Render folders first
-    for (const auto& obj : node->objects) {
-        if (!obj.is_folder) continue;
+    // Rebuild sorted view if objects changed (e.g., pagination added more)
+    node->rebuildSortedViewIfNeeded();
 
-        std::string label = "[D] " + obj.display_name;
-        if (ImGui::Selectable(label.c_str())) {
-            m_model.navigateInto(bucket, obj.key);
-            ImGui::SetScrollY(0);
-        }
-        // Right-click context menu
-        if (ImGui::BeginPopupContextItem()) {
-            if (ImGui::MenuItem("Copy path")) {
-                std::string path = "s3://" + bucket + "/" + obj.key;
-                ImGui::SetClipboardText(path.c_str());
-            }
-            ImGui::EndPopup();
-        }
-        // Prefetch folder contents on hover for instant navigation
-        if (ImGui::IsItemHovered()) {
-            m_model.prefetchFolder(bucket, obj.key);
-        }
-    }
+    // Use ImGuiListClipper for virtual scrolling - only render visible rows
+    ImGuiListClipper clipper;
+    clipper.Begin(static_cast<int>(node->sortedView.size()));
 
-    // Render files
-    for (const auto& obj : node->objects) {
-        if (obj.is_folder) continue;
+    while (clipper.Step()) {
+        for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
+            size_t objIndex = node->sortedView[i];
+            const auto& obj = node->objects[objIndex];
+            bool isFolder = (static_cast<size_t>(i) < node->folderCount);
 
-        std::string label = "    " + obj.display_name + "  (" + formatSize(obj.size) + ")";
-        // Check if this file is selected
-        bool isSelected = (m_model.selectedBucket() == bucket && m_model.selectedKey() == obj.key);
-        if (ImGui::Selectable(label.c_str(), isSelected)) {
-            m_model.selectFile(bucket, obj.key);
-        }
-        // Right-click context menu
-        if (ImGui::BeginPopupContextItem()) {
-            if (ImGui::MenuItem("Copy path")) {
-                std::string path = "s3://" + bucket + "/" + obj.key;
-                ImGui::SetClipboardText(path.c_str());
-            }
-            if (ImGui::MenuItem("Copy pre-signed URL (7 days)")) {
-                const auto& profiles = m_model.profiles();
-                int idx = m_model.selectedProfileIndex();
-                if (idx >= 0 && idx < static_cast<int>(profiles.size())) {
-                    const auto& profile = profiles[idx];
-                    std::string url = aws_generate_presigned_url(
-                        bucket,
-                        obj.key,
-                        profile.region,
-                        profile.access_key_id,
-                        profile.secret_access_key,
-                        profile.session_token,
-                        604800  // 7 days in seconds
-                    );
-                    ImGui::SetClipboardText(url.c_str());
+            ImGui::PushID(static_cast<int>(objIndex));
+
+            if (isFolder) {
+                // Render folder
+                std::string label = "[D] " + obj.display_name;
+                if (ImGui::Selectable(label.c_str())) {
+                    m_model.navigateInto(bucket, obj.key);
+                    ImGui::SetScrollY(0);
+                }
+                // Right-click context menu
+                if (ImGui::BeginPopupContextItem()) {
+                    if (ImGui::MenuItem("Copy path")) {
+                        std::string path = "s3://" + bucket + "/" + obj.key;
+                        ImGui::SetClipboardText(path.c_str());
+                    }
+                    ImGui::EndPopup();
+                }
+                // Prefetch folder contents on hover for instant navigation
+                if (ImGui::IsItemHovered()) {
+                    m_model.prefetchFolder(bucket, obj.key);
+                }
+            } else {
+                // Render file
+                std::string label = "    " + obj.display_name + "  (" + formatSize(obj.size) + ")";
+                // Check if this file is selected
+                bool isSelected = (m_model.selectedBucket() == bucket && m_model.selectedKey() == obj.key);
+                if (ImGui::Selectable(label.c_str(), isSelected)) {
+                    m_model.selectFile(bucket, obj.key);
+                }
+                // Right-click context menu
+                if (ImGui::BeginPopupContextItem()) {
+                    if (ImGui::MenuItem("Copy path")) {
+                        std::string path = "s3://" + bucket + "/" + obj.key;
+                        ImGui::SetClipboardText(path.c_str());
+                    }
+                    if (ImGui::MenuItem("Copy pre-signed URL (7 days)")) {
+                        const auto& profiles = m_model.profiles();
+                        int idx = m_model.selectedProfileIndex();
+                        if (idx >= 0 && idx < static_cast<int>(profiles.size())) {
+                            const auto& profile = profiles[idx];
+                            std::string url = aws_generate_presigned_url(
+                                bucket,
+                                obj.key,
+                                profile.region,
+                                profile.access_key_id,
+                                profile.secret_access_key,
+                                profile.session_token,
+                                604800  // 7 days in seconds
+                            );
+                            ImGui::SetClipboardText(url.c_str());
+                        }
+                    }
+                    ImGui::EndPopup();
+                }
+                // Prefetch preview content on hover for instant preview when clicked
+                if (ImGui::IsItemHovered()) {
+                    m_model.prefetchFilePreview(bucket, obj.key);
                 }
             }
-            ImGui::EndPopup();
-        }
-        // Prefetch preview content on hover for instant preview when clicked
-        if (ImGui::IsItemHovered()) {
-            m_model.prefetchFilePreview(bucket, obj.key);
+
+            ImGui::PopID();
         }
     }
 
-    // Show inline loading indicator if loading more
+    // Show inline loading indicator if loading more (outside clipper)
     if (node->loading) {
         ImGui::TextColored(ImVec4(0.5f, 0.5f, 1.0f, 1.0f), "Loading more...");
     }
 
-    // Show "Load more" button if truncated
+    // Show "Load more" button if truncated (outside clipper)
     if (node->is_truncated && !node->loading && !node->next_continuation_token.empty()) {
         ImGui::Spacing();
         if (ImGui::Button("Load more")) {

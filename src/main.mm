@@ -17,6 +17,7 @@
 #include "browser_ui.h"
 #include "browser_tui.h"
 #include "aws/s3_backend.h"
+#include "settings.h"
 #include "loguru.hpp"
 #include "version.h"
 
@@ -99,11 +100,34 @@ int main(int argc, char* argv[])
         model.refresh();
     }
 
-    // Navigate to initial path if provided
+    // Load settings (for recent paths and session restore)
+    AppSettings savedSettings = loadSettings();
+    model.setSettings(std::move(savedSettings));
+
+    // Navigate to initial path if provided, otherwise restore from settings
     LOG_F(INFO, "Initial path from args: '%s' (empty=%d)", initialPath.c_str(), initialPath.empty());
     if (!initialPath.empty()) {
         LOG_F(INFO, "Navigating to initial path: %s", initialPath.c_str());
         model.navigateTo(initialPath);
+    } else {
+        // Try to restore previous session state
+        const auto& settings = model.settings();
+        if (!settings.profile_name.empty()) {
+            // Find profile by name
+            const auto& profiles = model.profiles();
+            for (int i = 0; i < static_cast<int>(profiles.size()); ++i) {
+                if (profiles[i].name == settings.profile_name) {
+                    LOG_F(INFO, "Restoring profile: %s", settings.profile_name.c_str());
+                    model.selectProfile(i);
+                    break;
+                }
+            }
+        }
+        if (!settings.bucket.empty()) {
+            std::string path = "s3://" + settings.bucket + "/" + settings.prefix;
+            LOG_F(INFO, "Restoring path from settings: %s", path.c_str());
+            model.navigateTo(path);
+        }
     }
 
     // Launch TUI mode if requested
@@ -143,7 +167,7 @@ int main(int argc, char* argv[])
 
     // Create window with no graphics API (we'll use Metal)
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    GLFWwindow* window = glfwCreateWindow(1200, 800, "S3 Browser", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(1200, 800, "s6ui " VERSION_STRING, nullptr, nullptr);
     if (window == nullptr)
         return 1;
 
@@ -264,6 +288,18 @@ int main(int argc, char* argv[])
                           io.MouseClicked[0] || io.MouseReleased[0] ||
                           io.MouseClicked[1] || io.MouseReleased[1];
         }
+    }
+
+    // Save current state for next session
+    {
+        AppSettings& settings = model.settings();
+        if (model.selectedProfileIndex() >= 0 &&
+            model.selectedProfileIndex() < static_cast<int>(model.profiles().size())) {
+            settings.profile_name = model.profiles()[model.selectedProfileIndex()].name;
+        }
+        settings.bucket = model.currentBucket();
+        settings.prefix = model.currentPrefix();
+        saveSettings(settings);
     }
 
     // Cleanup

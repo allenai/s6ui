@@ -108,9 +108,6 @@ endif
 LOGURU_DIR = $(LIBS_DIR)/loguru
 LOGURU_SOURCES = $(LOGURU_DIR)/loguru.cpp
 
-TEXTEDIT_DIR = $(LIBS_DIR)/imguicolortextedit
-TEXTEDIT_SOURCES = $(TEXTEDIT_DIR)/TextEditor.cpp
-
 ZSTD_DIR = $(LIBS_DIR)/zstd
 ZSTD_SOURCES = $(ZSTD_DIR)/zstddeclib.c
 
@@ -124,7 +121,8 @@ AWS_SOURCES = $(AWS_DIR)/aws_credentials.cpp \
 PREVIEW_DIR = $(SRC_DIR)/preview
 PREVIEW_SOURCES = $(PREVIEW_DIR)/text_preview.cpp \
                   $(PREVIEW_DIR)/jsonl_preview.cpp \
-                  $(PREVIEW_DIR)/image_preview.cpp
+                  $(PREVIEW_DIR)/image_preview.cpp \
+                  $(PREVIEW_DIR)/mmap_text_viewer.cpp
 
 # Platform-specific image texture sources
 ifeq ($(UNAME_S), Darwin)
@@ -141,6 +139,7 @@ APP_SOURCES = $(SRC_DIR)/browser_model.cpp \
               $(SRC_DIR)/browser_tui.cpp \
               $(SRC_DIR)/streaming_preview.cpp \
               $(TUI_PREVIEW_SOURCES) \
+              $(SRC_DIR)/settings.cpp \
               $(PREVIEW_SOURCES)
 
 # Platform-specific main file
@@ -155,7 +154,6 @@ IMGUI_OBJS = $(patsubst $(LIBS_DIR)/%.cpp,$(BUILD_DIR)/libs/%.o,$(IMGUI_SOURCES)
 IMGUI_METAL_OBJS = $(patsubst $(LIBS_DIR)/%.mm,$(BUILD_DIR)/libs/%.o,$(IMGUI_METAL_SOURCES))
 IMGUI_OPENGL_OBJS = $(patsubst $(LIBS_DIR)/%.cpp,$(BUILD_DIR)/libs/%.o,$(IMGUI_OPENGL_SOURCES))
 LOGURU_OBJS = $(patsubst $(LIBS_DIR)/%.cpp,$(BUILD_DIR)/libs/%.o,$(LOGURU_SOURCES))
-TEXTEDIT_OBJS = $(patsubst $(LIBS_DIR)/%.cpp,$(BUILD_DIR)/libs/%.o,$(TEXTEDIT_SOURCES))
 ZSTD_OBJS = $(patsubst $(LIBS_DIR)/%.c,$(BUILD_DIR)/libs/%.o,$(ZSTD_SOURCES))
 STB_OBJS = $(patsubst $(LIBS_DIR)/%.c,$(BUILD_DIR)/libs/%.o,$(STB_SOURCES))
 AWS_OBJS = $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/src/%.o,$(AWS_SOURCES))
@@ -170,7 +168,7 @@ else
 	IMAGE_TEXTURE_OBJS = $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/src/%.o,$(IMAGE_TEXTURE_SOURCES))
 endif
 
-ALL_OBJS = $(IMGUI_OBJS) $(IMGUI_METAL_OBJS) $(IMGUI_OPENGL_OBJS) $(LOGURU_OBJS) $(TEXTEDIT_OBJS) $(ZSTD_OBJS) $(STB_OBJS) $(AWS_OBJS) $(APP_OBJS) $(IMAGE_TEXTURE_OBJS) $(MAIN_OBJS)
+ALL_OBJS = $(IMGUI_OBJS) $(IMGUI_METAL_OBJS) $(IMGUI_OPENGL_OBJS) $(LOGURU_OBJS) $(ZSTD_OBJS) $(STB_OBJS) $(AWS_OBJS) $(APP_OBJS) $(IMAGE_TEXTURE_OBJS) $(MAIN_OBJS)
 
 # Output
 TARGET = s6ui
@@ -186,11 +184,11 @@ else
 endif
 
 # Create build directories
-$(BUILD_DIR)/libs/imgui $(BUILD_DIR)/libs/loguru $(BUILD_DIR)/libs/imguicolortextedit $(BUILD_DIR)/src/aws $(BUILD_DIR)/src/preview:
+$(BUILD_DIR)/libs/imgui $(BUILD_DIR)/libs/loguru $(BUILD_DIR)/src/aws $(BUILD_DIR)/src/preview:
 	mkdir -p $@
 
 # Compile libs C++ files (with warnings suppressed)
-$(BUILD_DIR)/libs/%.o: $(LIBS_DIR)/%.cpp | $(BUILD_DIR)/libs/imgui $(BUILD_DIR)/libs/loguru $(BUILD_DIR)/libs/imguicolortextedit
+$(BUILD_DIR)/libs/%.o: $(LIBS_DIR)/%.cpp | $(BUILD_DIR)/libs/imgui $(BUILD_DIR)/libs/loguru
 	@mkdir -p $(dir $@)
 	$(CXX) $(LIBS_CXXFLAGS) -c $< -o $@
 
@@ -258,7 +256,32 @@ app:
 	@echo "App bundles are only supported on macOS"
 endif
 
-.PHONY: all clean debug asan deps app
+# Test viewer
+TEST_VIEWER_OBJS = $(BUILD_DIR)/tests/test_viewer_main.o \
+                   $(BUILD_DIR)/src/preview/mmap_text_viewer.o
+
+TEST_LDFLAGS = -L$(HOMEBREW_PREFIX)/lib -lglfw
+ifeq ($(UNAME_S), Darwin)
+TEST_LDFLAGS += -framework Metal -framework MetalKit -framework Cocoa \
+                -framework IOKit -framework CoreVideo -framework QuartzCore
+endif
+
+test_viewer: $(TEST_VIEWER_OBJS) $(IMGUI_OBJS) $(IMGUI_METAL_OBJS) $(IMGUI_OPENGL_OBJS)
+ifeq ($(UNAME_S), Darwin)
+	$(OBJCXX) $^ $(TEST_LDFLAGS) -o $@
+else
+	$(CXX) $^ $(TEST_LDFLAGS) -o $@
+endif
+
+$(BUILD_DIR)/tests/%.o: tests/%.mm
+	@mkdir -p $(dir $@)
+	$(OBJCXX) $(OBJCXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/src/preview/mmap_text_viewer.o: $(SRC_DIR)/preview/mmap_text_viewer.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+.PHONY: all clean debug asan deps app test_viewer
 
 # Debug build with symbols and no optimization
 debug: CXXFLAGS = -std=c++17 -Wall -Wextra -g -O0

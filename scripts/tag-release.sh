@@ -41,5 +41,9 @@ git tag -a "$VERSION" -m "Release $VERSION"
 echo ""
 echo "Tag $VERSION created successfully!"
 echo ""
-echo "To push the tag and trigger the release workflow, run:"
-echo "  git push origin $VERSION"
+echo "Pushing to github"
+
+git push origin $VERSION
+
+echo ""
+echo "Done! Please check that CI ran successfully"

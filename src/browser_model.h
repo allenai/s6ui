@@ -4,6 +4,7 @@
 #include "aws/s3_backend.h"
 #include "aws/aws_credentials.h"
 #include "streaming_preview.h"
+#include "settings.h"
 #include <string>
 #include <vector>
 #include <map>
@@ -21,6 +22,31 @@ struct FolderNode {
     bool loading = false;
     bool loaded = false;  // True if we've fetched this folder at least once
     std::string error;
+
+    // Cached view for virtual scrolling: indices into objects[]
+    // First folderCount indices are folders, rest are files
+    std::vector<size_t> sortedView;
+    size_t folderCount = 0;
+    size_t cachedObjectsSize = 0;  // Invalidation check
+
+    void rebuildSortedViewIfNeeded() {
+        if (cachedObjectsSize == objects.size()) return;
+
+        sortedView.clear();
+        sortedView.reserve(objects.size());
+
+        // Folders first
+        for (size_t i = 0; i < objects.size(); ++i) {
+            if (objects[i].is_folder) sortedView.push_back(i);
+        }
+        folderCount = sortedView.size();
+
+        // Files second
+        for (size_t i = 0; i < objects.size(); ++i) {
+            if (!objects[i].is_folder) sortedView.push_back(i);
+        }
+        cachedObjectsSize = objects.size();
+    }
 };
 
 // The browser model - owns state and processes commands
@@ -38,6 +64,12 @@ public:
     int selectedProfileIndex() const { return m_selectedProfileIdx; }
     const std::vector<AWSProfile>& profiles() const { return m_profiles; }
     std::vector<AWSProfile>& profiles() { return m_profiles; }
+
+    // Settings (frecent paths persistence)
+    void setSettings(AppSettings settings);
+    AppSettings& settings() { return m_settings; }
+    void recordRecentPath(const std::string& path);
+    std::vector<std::string> topFrecentPaths(size_t count = 20) const;
 
     // Commands (call from UI thread)
     void refresh();
@@ -72,8 +104,8 @@ public:
 
     // Streaming preview accessors
     bool hasStreamingPreview() const { return m_streamingPreview != nullptr; }
-    StreamingFilePreview* streamingPreview() { return m_streamingPreview.get(); }
-    const StreamingFilePreview* streamingPreview() const { return m_streamingPreview.get(); }
+    std::shared_ptr<StreamingFilePreview> streamingPreview() { return m_streamingPreview; }
+    std::shared_ptr<const StreamingFilePreview> streamingPreview() const { return m_streamingPreview; }
     bool isStreamingEnabled() const { return m_streamingEnabled; }
     int64_t selectedFileSize() const { return m_selectedFileSize; }
 
@@ -104,6 +136,7 @@ private:
     void triggerPrefetch(const std::string& bucket, const std::vector<S3Object>& objects);
 
     std::unique_ptr<IBackend> m_backend;
+    AppSettings m_settings;
 
     // Profiles
     std::vector<AWSProfile> m_profiles;
@@ -131,7 +164,7 @@ private:
     std::string m_previewError;
 
     // Streaming preview for large files
-    std::unique_ptr<StreamingFilePreview> m_streamingPreview;
+    std::shared_ptr<StreamingFilePreview> m_streamingPreview;
     std::shared_ptr<std::atomic<bool>> m_streamingCancelFlag;
     bool m_streamingEnabled = false;  // Whether we're in streaming mode
     void startStreamingDownload(size_t totalFileSize);

@@ -121,6 +121,7 @@ public:
     // File identifiers
     const std::string& bucket() const { return m_bucket; }
     const std::string& key() const { return m_key; }
+    const std::string& tempFilePath() const { return m_tempFilePath; }
 
 private:
     void writeToTempFile(const char* data, size_t len);

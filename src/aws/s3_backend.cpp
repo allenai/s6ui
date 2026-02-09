@@ -39,6 +39,42 @@ static size_t writeCallback(void* contents, size_t size, size_t nmemb, std::stri
     return total;
 }
 
+// CURL share lock/unlock callbacks for thread-safe connection pooling
+// Uses separate mutexes per data type to avoid deadlock when CURL locks multiple types
+void curlShareLock(CURL*, curl_lock_data data, curl_lock_access, void* userptr) {
+    auto* backend = static_cast<S3Backend*>(userptr);
+    switch (data) {
+        case CURL_LOCK_DATA_CONNECT:
+            backend->m_curlShareMutexConnect.lock();
+            break;
+        case CURL_LOCK_DATA_DNS:
+            backend->m_curlShareMutexDns.lock();
+            break;
+        case CURL_LOCK_DATA_SSL_SESSION:
+            backend->m_curlShareMutexSsl.lock();
+            break;
+        default:
+            break;
+    }
+}
+
+void curlShareUnlock(CURL*, curl_lock_data data, void* userptr) {
+    auto* backend = static_cast<S3Backend*>(userptr);
+    switch (data) {
+        case CURL_LOCK_DATA_CONNECT:
+            backend->m_curlShareMutexConnect.unlock();
+            break;
+        case CURL_LOCK_DATA_DNS:
+            backend->m_curlShareMutexDns.unlock();
+            break;
+        case CURL_LOCK_DATA_SSL_SESSION:
+            backend->m_curlShareMutexSsl.unlock();
+            break;
+        default:
+            break;
+    }
+}
+
 // Thread-local CURL handle for connection reuse
 // Each worker thread gets its own handle, automatically cleaned up on thread exit
 struct ThreadCurlHandle {
@@ -71,13 +107,7 @@ static CURL* getThreadCurl() {
     return tlsCurl.handle;
 }
 
-// Reset the thread-local CURL handle for reuse (preserves connection cache)
-static void resetThreadCurl() {
-    CURL* curl = getThreadCurl();
-    if (curl) {
-        curl_easy_reset(curl);
-    }
-}
+// Member function resetThreadCurl is defined below S3Backend class methods
 
 // Header callback for capturing Content-Range header
 struct HttpResponseContext {
@@ -278,6 +308,20 @@ S3Backend::S3Backend(const AWSProfile& profile, size_t numWorkers)
           profile.name.c_str(), profile.region.c_str(), numWorkers);
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
+    // Initialize shared CURL handle for connection pooling across all workers
+    m_curlShare = curl_share_init();
+    if (m_curlShare) {
+        curl_share_setopt(m_curlShare, CURLSHOPT_SHARE, CURL_LOCK_DATA_CONNECT);
+        curl_share_setopt(m_curlShare, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
+        curl_share_setopt(m_curlShare, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
+        curl_share_setopt(m_curlShare, CURLSHOPT_LOCKFUNC, curlShareLock);
+        curl_share_setopt(m_curlShare, CURLSHOPT_UNLOCKFUNC, curlShareUnlock);
+        curl_share_setopt(m_curlShare, CURLSHOPT_USERDATA, this);
+        LOG_F(INFO, "S3Backend: initialized CURL share handle for connection pooling");
+    } else {
+        LOG_F(WARNING, "S3Backend: failed to initialize CURL share handle");
+    }
+
     // Spawn high-priority workers
     for (size_t i = 0; i < m_numWorkers; ++i) {
         m_highPriorityWorkers.emplace_back(&S3Backend::workerThread, this, WorkItem::Priority::High, i);
@@ -334,7 +378,26 @@ S3Backend::~S3Backend() {
         }
     }
 
+    // Cleanup shared CURL handle
+    if (m_curlShare) {
+        curl_share_cleanup(m_curlShare);
+        m_curlShare = nullptr;
+        LOG_F(INFO, "S3Backend: cleaned up CURL share handle");
+    }
+
     curl_global_cleanup();
+}
+
+// Reset the thread-local CURL handle for reuse (preserves connection cache via share)
+void S3Backend::resetThreadCurl() {
+    CURL* curl = getThreadCurl();
+    if (curl) {
+        curl_easy_reset(curl);
+        // Re-apply shared connection cache after reset
+        if (m_curlShare) {
+            curl_easy_setopt(curl, CURLOPT_SHARE, m_curlShare);
+        }
+    }
 }
 
 std::vector<StateEvent> S3Backend::takeEvents() {
@@ -645,9 +708,14 @@ void S3Backend::workerThread(WorkItem::Priority priority, size_t workerIndex) {
     LOG_F(INFO, "S3Backend: %s priority worker %zu started", priorityStr, workerIndex);
 
     // Warm up the connection pool by establishing a TCP connection to the S3 endpoint
+    // Configure shared connection cache so warmup connections are available to all workers
     {
         CURL* curl = getThreadCurl();
         if (curl) {
+            // Set shared connection cache before warmup so the connection is pooled
+            if (m_curlShare) {
+                curl_easy_setopt(curl, CURLOPT_SHARE, m_curlShare);
+            }
             std::string host;
             if (!m_profile.endpoint_url.empty()) {
                 host = m_profile.endpoint_url;

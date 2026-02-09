@@ -479,7 +479,7 @@ void BrowserTUI::renderPreview()
     ctx.bucket = m_model.selectedBucket();
     ctx.key = m_model.selectedKey();
     ctx.filename = m_model.selectedKey();  // Could extract filename from key
-    ctx.streamingPreview = m_model.streamingPreview();
+    ctx.streamingPreview = m_model.streamingPreview().get();
 
     // Delegate rendering to active renderer
     if (!m_activeRenderer->render(ctx)) {
@@ -602,7 +602,7 @@ bool BrowserTUI::handleInput(int ch)
         ctx.bucket = m_model.selectedBucket();
         ctx.key = m_model.selectedKey();
         ctx.filename = m_model.selectedKey();
-        ctx.streamingPreview = m_model.streamingPreview();
+        ctx.streamingPreview = m_model.streamingPreview().get();
 
         // Let renderer handle input first
         if (m_activeRenderer->handleInput(ch, ctx)) {

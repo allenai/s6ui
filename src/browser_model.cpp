@@ -1,7 +1,9 @@
 #include "browser_model.h"
 #include "loguru.hpp"
 #include <unordered_set>
+#include <algorithm>
 #include <cstdlib>
+#include <ctime>
 
 BrowserModel::BrowserModel() = default;
 
@@ -15,6 +17,95 @@ BrowserModel::~BrowserModel() {
     if (m_paginationCancelFlag) {
         m_paginationCancelFlag->store(true);
     }
+}
+
+void BrowserModel::setSettings(AppSettings settings) {
+    m_settings = std::move(settings);
+}
+
+void BrowserModel::recordRecentPath(const std::string& path) {
+    if (path.empty() || path == "s3://") return;
+
+    std::string profileName;
+    if (m_selectedProfileIdx >= 0 && m_selectedProfileIdx < static_cast<int>(m_profiles.size())) {
+        profileName = m_profiles[m_selectedProfileIdx].name;
+    }
+    if (profileName.empty()) return;
+
+    auto& entries = m_settings.frecent_paths[profileName];
+    int64_t now = static_cast<int64_t>(std::time(nullptr));
+
+    // Find existing entry or create new one
+    auto it = std::find_if(entries.begin(), entries.end(),
+        [&path](const PathEntry& e) { return e.path == path; });
+
+    if (it != entries.end()) {
+        it->score += 1.0;
+        it->last_accessed = now;
+    } else {
+        PathEntry entry;
+        entry.path = path;
+        entry.score = 1.0;
+        entry.last_accessed = now;
+        entries.push_back(std::move(entry));
+    }
+
+    // Cap at 500 stored entries - remove lowest-scoring entries
+    if (entries.size() > 500) {
+        std::sort(entries.begin(), entries.end(),
+            [](const PathEntry& a, const PathEntry& b) { return a.score > b.score; });
+        entries.resize(500);
+    }
+}
+
+// Compute effective frecency score using time-decay buckets (z/zoxide style)
+static double frecencyScore(const PathEntry& entry, int64_t now) {
+    int64_t age = now - entry.last_accessed;
+    double weight;
+    if (age < 3600) {           // last hour
+        weight = 4.0;
+    } else if (age < 86400) {   // last day
+        weight = 2.0;
+    } else if (age < 604800) {  // last week
+        weight = 1.0;
+    } else {
+        weight = 0.5;
+    }
+    return entry.score * weight;
+}
+
+std::vector<std::string> BrowserModel::topFrecentPaths(size_t count) const {
+    std::string profileName;
+    if (m_selectedProfileIdx >= 0 && m_selectedProfileIdx < static_cast<int>(m_profiles.size())) {
+        profileName = m_profiles[m_selectedProfileIdx].name;
+    }
+
+    auto it = m_settings.frecent_paths.find(profileName);
+    if (it == m_settings.frecent_paths.end() || it->second.empty()) {
+        return {};
+    }
+
+    int64_t now = static_cast<int64_t>(std::time(nullptr));
+    const auto& entries = it->second;
+
+    // Build scored index pairs
+    std::vector<std::pair<double, size_t>> scored;
+    scored.reserve(entries.size());
+    for (size_t i = 0; i < entries.size(); ++i) {
+        scored.push_back({frecencyScore(entries[i], now), i});
+    }
+
+    // Partial sort for top N
+    size_t n = std::min(count, scored.size());
+    std::partial_sort(scored.begin(), scored.begin() + static_cast<ptrdiff_t>(n), scored.end(),
+        [](const auto& a, const auto& b) { return a.first > b.first; });
+
+    std::vector<std::string> result;
+    result.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        result.push_back(entries[scored[i].second].path);
+    }
+    return result;
 }
 
 void BrowserModel::setBackend(std::unique_ptr<IBackend> backend) {
@@ -102,21 +193,31 @@ void BrowserModel::refresh() {
 void BrowserModel::loadFolder(const std::string& bucket, const std::string& prefix) {
     auto& node = getOrCreateNode(bucket, prefix);
 
-    // If already loaded or loading, don't reload
-    if (node.loaded || node.loading) return;
+    // If already loaded, don't reload
+    if (node.loaded) return;
 
+    // Try to boost any pending prefetch request to high priority.
+    // This makes it non-cancellable (cancel_flag is cleared on boost).
+    if (m_backend && m_backend->prioritizeRequest(bucket, prefix)) {
+        // Successfully boosted pending prefetch - mark as loading and it will complete
+        node.loading = true;
+        LOG_F(INFO, "Boosted pending prefetch for folder: bucket=%s prefix=%s",
+              bucket.c_str(), prefix.c_str());
+        return;
+    }
+
+    // No pending request to boost - make a new high-priority request.
+    // This handles:
+    // - First time loading this folder
+    // - Previous prefetch was cancelled (loading was true but request is gone)
+    // - Previous prefetch is in-flight (will get duplicate event, which is OK)
     LOG_F(INFO, "Loading folder: bucket=%s prefix=%s", bucket.c_str(), prefix.c_str());
     node.objects.clear();
     node.error.clear();
     node.loading = true;
 
     if (m_backend) {
-        // Check if there's already a prefetch request queued for this folder
-        // If so, prioritize it instead of making a new request
-        if (!m_backend->prioritizeRequest(bucket, prefix)) {
-            // No pending request, make a new high-priority one
-            m_backend->listObjects(bucket, prefix);
-        }
+        m_backend->listObjects(bucket, prefix);
     }
 }
 
@@ -196,6 +297,12 @@ void BrowserModel::navigateInto(const std::string& bucket, const std::string& pr
     setCurrentPath(bucket, prefix);
     loadFolder(bucket, prefix);
 
+    // Record in recent paths
+    if (!bucket.empty()) {
+        std::string path = "s3://" + bucket + "/" + prefix;
+        recordRecentPath(path);
+    }
+
     // If folder is already loaded (e.g. from prefetch or returning to a previous folder)
     const auto* node = getNode(bucket, prefix);
     if (node && node->loaded) {
@@ -267,22 +374,8 @@ void BrowserModel::selectFile(const std::string& bucket, const std::string& key)
             m_previewContent = it->second;
             m_previewLoading = false;
 
-            // Helper to check if file needs JSONL renderer (requires streaming)
-            auto needsJsonlRenderer = [](const std::string& k) -> bool {
-                size_t dotPos = k.rfind('.');
-                if (dotPos == std::string::npos) return false;
-                std::string ext = k.substr(dotPos);
-                for (char& c : ext) c = std::tolower(static_cast<unsigned char>(c));
-                return ext == ".jsonl" || ext == ".ndjson" || ext == ".json";
-            };
-
-            // Start streaming for compressed files, JSONL files, or large files
-            bool needsStreaming = isCompressed(key) ||
-                needsJsonlRenderer(key) ||
-                static_cast<size_t>(m_selectedFileSize) > STREAMING_THRESHOLD;
-            if (needsStreaming) {
-                startStreamingDownload(static_cast<size_t>(m_selectedFileSize));
-            }
+            // Always create StreamingFilePreview for unified data access
+            startStreamingDownload(static_cast<size_t>(m_selectedFileSize));
             return;
         }
 
@@ -608,25 +701,14 @@ bool BrowserModel::processEvents() {
                     m_previewLoading = false;
                     m_previewError.clear();
 
-                    // Helper to check if file needs JSONL renderer (requires streaming)
-                    auto needsJsonlRenderer = [](const std::string& key) -> bool {
-                        size_t dotPos = key.rfind('.');
-                        if (dotPos == std::string::npos) return false;
-                        std::string ext = key.substr(dotPos);
-                        for (char& c : ext) c = std::tolower(static_cast<unsigned char>(c));
-                        return ext == ".jsonl" || ext == ".ndjson" || ext == ".json";
-                    };
-
-                    // Start streaming for:
-                    // 1. Compressed files (always, for transparent decompression)
-                    // 2. Files needing JSONL renderer (.json/.jsonl/.ndjson)
-                    // 3. Large files that need more data
-                    bool needsStreaming = isCompressed(payload.key) ||
-                        needsJsonlRenderer(payload.key) ||
-                        (static_cast<size_t>(m_selectedFileSize) > STREAMING_THRESHOLD &&
-                         static_cast<size_t>(m_selectedFileSize) > payload.content.size());
-
-                    if (needsStreaming) {
+                    // Only start streaming if not already streaming this file.
+                    // Duplicate ObjectContentLoaded events can arrive when a prefetch
+                    // was already in-flight and a new high-priority request was also sent.
+                    // Restarting the stream would cancel the in-progress download and
+                    // cause data loss from already-queued chunk events.
+                    if (!m_streamingPreview ||
+                        m_streamingPreview->bucket() != payload.bucket ||
+                        m_streamingPreview->key() != payload.key) {
                         startStreamingDownload(static_cast<size_t>(m_selectedFileSize));
                     }
                 }
@@ -825,7 +907,7 @@ void BrowserModel::startStreamingDownload(size_t totalFileSize) {
     }
 
     // Create streaming preview with the initial preview content
-    m_streamingPreview = std::make_unique<StreamingFilePreview>(
+    m_streamingPreview = std::make_shared<StreamingFilePreview>(
         m_selectedBucket, m_selectedKey, m_previewContent, totalFileSize, std::move(transform));
 
     m_streamingEnabled = true;
