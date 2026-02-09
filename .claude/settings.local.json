@@ -16,7 +16,12 @@
       "Bash(ls:*)",
       "WebSearch",
       "WebFetch(domain:docs.rs)",
-      "Bash(cargo build:*)"
+      "Bash(cargo build:*)",
+      "Bash(cargo tree:*)",
+      "Bash(cargo test:*)",
+      "Bash(for i in 1 2 3)",
+      "Bash(do cargo test)",
+      "Bash(done)"
     ]
   }
 }

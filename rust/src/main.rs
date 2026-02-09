@@ -11,6 +11,12 @@ use winit::{
     window::{Window, WindowId},
 };
 
+use s6ui::aws::credentials::load_aws_profiles;
+use s6ui::aws::s3_backend::S3Backend;
+use s6ui::model::BrowserModel;
+use s6ui::settings::{load_settings, save_settings};
+use s6ui::ui::BrowserUI;
+
 struct ImguiState {
     context: Context,
     platform: WinitPlatform,
@@ -26,6 +32,8 @@ struct AppWindow {
     surface_desc: wgpu::SurfaceConfiguration,
     surface: wgpu::Surface<'static>,
     imgui: ImguiState,
+    model: BrowserModel,
+    browser_ui: BrowserUI,
 }
 
 #[derive(Default)]
@@ -110,6 +118,30 @@ impl AppWindow {
             last_frame: Instant::now(),
         };
 
+        // Initialize model and backend
+        let mut model = BrowserModel::new();
+        model.load_profiles();
+
+        // Load settings
+        let settings = load_settings();
+        model.set_settings(settings);
+
+        // Create backend with selected profile
+        let profiles = load_aws_profiles();
+        if !profiles.is_empty() {
+            let idx = model.selected_profile_index() as usize;
+            let profile = if idx < profiles.len() {
+                profiles[idx].clone()
+            } else {
+                profiles[0].clone()
+            };
+            let backend = S3Backend::new(profile, 5);
+            model.set_backend(Box::new(backend));
+            model.refresh();
+        }
+
+        let browser_ui = BrowserUI::new();
+
         Ok(Self {
             device,
             queue,
@@ -117,6 +149,8 @@ impl AppWindow {
             surface_desc,
             surface,
             imgui,
+            model,
+            browser_ui,
         })
     }
 
@@ -134,6 +168,9 @@ impl AppWindow {
         self.imgui.context.io_mut().set_delta_time(delta_time.as_secs_f32());
         self.imgui.last_frame = now;
 
+        // Process backend events
+        self.model.process_events();
+
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
@@ -149,18 +186,11 @@ impl AppWindow {
             .prepare_frame(&self.window, &mut self.imgui.context);
         let ui = self.imgui.context.frame();
 
-        // Main window
-        ui.window("s6ui")
-            .size([400.0, 200.0], Condition::FirstUseEver)
-            .build(|| {
-                ui.text("S3 Browser - Rust Port");
-                ui.separator();
-                ui.text(format!(
-                    "{:.1} FPS ({:.3} ms/frame)",
-                    ui.io().framerate(),
-                    1000.0 / ui.io().framerate(),
-                ));
-            });
+        // Get window dimensions for full-window rendering
+        let [window_width, window_height] = ui.io().display_size();
+
+        // Render the browser UI
+        self.browser_ui.render(ui, &mut self.model, window_width, window_height);
 
         let view = frame
             .texture
@@ -247,7 +277,13 @@ impl ApplicationHandler for App {
                 window.resize(new_size);
                 window.window.request_redraw();
             }
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                // Save settings before exiting
+                if let Some(w) = &self.window {
+                    save_settings(&w.model.settings);
+                }
+                event_loop.exit();
+            }
             WindowEvent::RedrawRequested => {
                 if let Err(e) = window.render() {
                     eprintln!("Render error: {e}");

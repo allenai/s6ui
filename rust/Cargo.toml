@@ -11,3 +11,23 @@ dear-imgui-winit = "0.8"
 wgpu = "28.0"
 winit = "0.30.12"
 pollster = "0.4"
+
+# Phase 1: Settings + serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+
+# Phase 2: AWS credentials + signing
+ring = "0.17"
+
+# Phase 3: S3 backend (async HTTP)
+reqwest = { version = "0.12", features = ["stream", "blocking"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+
+# Phase 5: Streaming decompression
+flate2 = "1"
+zstd = "0.13"
+
+# Phase 7: Preview renderers
+memmap2 = "0.9"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
