@@ -14,7 +14,9 @@
       "Bash(./s6ui:*)",
       "Bash(make:*)",
       "Bash(ls:*)",
-      "WebSearch"
+      "WebSearch",
+      "WebFetch(domain:docs.rs)",
+      "Bash(cargo build:*)"
     ]
   }
 }

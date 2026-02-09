@@ -1,0 +1,13 @@
+[package]
+name = "s6ui"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+
+[dependencies]
+dear-imgui-rs = "0.8"
+dear-imgui-wgpu = "0.8"
+dear-imgui-winit = "0.8"
+wgpu = "28.0"
+winit = "0.30.12"
+pollster = "0.4"
