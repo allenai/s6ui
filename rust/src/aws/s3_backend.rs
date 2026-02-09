@@ -6,6 +6,7 @@ use crate::events::{S3Bucket, S3Object, StateEvent};
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::sync::mpsc;
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
 use winit::event_loop::EventLoopProxy;
@@ -28,31 +29,22 @@ enum WorkItem {
 
 /// Shared inner state for S3Backend (accessed by tokio tasks)
 struct S3BackendInner {
-    profile: Mutex<AwsProfile>,
+    profile: AwsProfile,
     high_queue: Mutex<VecDeque<WorkItem>>,
     low_queue: Mutex<VecDeque<WorkItem>>,
     high_notify: Notify,
     low_notify: Notify,
-    events: Mutex<Vec<StateEvent>>,
+    event_tx: mpsc::Sender<StateEvent>,
+    event_proxy: EventLoopProxy<()>,
     region_cache: Mutex<HashMap<String, String>>,
     client: reqwest::Client,
-    event_proxy: Mutex<Option<EventLoopProxy<()>>>,
     shutdown: std::sync::atomic::AtomicBool,
 }
 
 impl S3BackendInner {
     fn push_event(&self, event: StateEvent) {
-        if self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            return;
-        }
-        {
-            let mut events = self.events.lock().unwrap();
-            events.push(event);
-        }
-        // Wake the main event loop so it processes this event
-        if let Some(proxy) = self.event_proxy.lock().unwrap().as_ref() {
-            let _ = proxy.send_event(());
-        }
+        let _ = self.event_tx.send(event);
+        let _ = self.event_proxy.send_event(());
     }
 
     fn get_cached_region(&self, bucket: &str) -> Option<String> {
@@ -69,6 +61,7 @@ impl S3BackendInner {
 /// S3 backend implementation using tokio tasks + reqwest
 pub struct S3Backend {
     inner: Arc<S3BackendInner>,
+    event_rx: mpsc::Receiver<StateEvent>,
     _runtime_handle: Handle,
 }
 
@@ -78,16 +71,17 @@ impl S3Backend {
         runtime_handle: Handle,
         event_proxy: EventLoopProxy<()>,
     ) -> Self {
+        let (event_tx, event_rx) = mpsc::channel();
         let inner = Arc::new(S3BackendInner {
-            profile: Mutex::new(profile),
+            profile,
             high_queue: Mutex::new(VecDeque::new()),
             low_queue: Mutex::new(VecDeque::new()),
             high_notify: Notify::new(),
             low_notify: Notify::new(),
-            events: Mutex::new(Vec::new()),
+            event_tx,
+            event_proxy,
             region_cache: Mutex::new(HashMap::new()),
             client: reqwest::Client::new(),
-            event_proxy: Mutex::new(Some(event_proxy)),
             shutdown: std::sync::atomic::AtomicBool::new(false),
         });
 
@@ -105,6 +99,7 @@ impl S3Backend {
 
         Self {
             inner,
+            event_rx,
             _runtime_handle: runtime_handle,
         }
     }
@@ -115,9 +110,6 @@ impl Drop for S3Backend {
         self.inner
             .shutdown
             .store(true, std::sync::atomic::Ordering::Relaxed);
-
-        // Clear the event proxy so workers don't try to wake a dead event loop
-        *self.inner.event_proxy.lock().unwrap() = None;
 
         // Enqueue shutdown items for all workers
         {
@@ -140,8 +132,7 @@ impl Drop for S3Backend {
 
 impl Backend for S3Backend {
     fn take_events(&self) -> Vec<StateEvent> {
-        let mut events = self.inner.events.lock().unwrap();
-        std::mem::take(&mut *events)
+        self.event_rx.try_iter().collect()
     }
 
     fn list_buckets(&self) {
@@ -301,36 +292,29 @@ fn resolve_region(inner: &S3BackendInner, bucket: &str) -> String {
     if let Some(cached) = inner.get_cached_region(bucket) {
         return cached;
     }
-    let profile = inner.profile.lock().unwrap();
-    if profile.region.is_empty() {
+    if inner.profile.region.is_empty() {
         "us-east-1".to_string()
     } else {
-        profile.region.clone()
+        inner.profile.region.clone()
     }
 }
 
 async fn process_list_buckets(inner: &S3BackendInner) {
-    let (host, region, access_key, secret_key, session_token, endpoint_url) = {
-        let profile = inner.profile.lock().unwrap();
-        let region = if profile.region.is_empty() {
-            "us-east-1".to_string()
-        } else {
-            profile.region.clone()
-        };
-        let host = if !profile.endpoint_url.is_empty() {
-            parse_endpoint_host(&profile.endpoint_url)
-        } else {
-            format!("s3.{}.amazonaws.com", region)
-        };
-        (
-            host,
-            region,
-            profile.access_key_id.clone(),
-            profile.secret_access_key.clone(),
-            profile.session_token.clone(),
-            profile.endpoint_url.clone(),
-        )
+    let profile = &inner.profile;
+    let region = if profile.region.is_empty() {
+        "us-east-1".to_string()
+    } else {
+        profile.region.clone()
     };
+    let host = if !profile.endpoint_url.is_empty() {
+        parse_endpoint_host(&profile.endpoint_url)
+    } else {
+        format!("s3.{}.amazonaws.com", region)
+    };
+    let access_key = &profile.access_key_id;
+    let secret_key = &profile.secret_access_key;
+    let session_token = &profile.session_token;
+    let endpoint_url = &profile.endpoint_url;
 
     let signed = signer::sign_request(
         "GET",
@@ -382,19 +366,10 @@ async fn process_list_objects(
 ) {
     let mut region = resolve_region(inner, bucket);
 
-    for attempt in 0..2 {
-        let (access_key, secret_key, session_token, endpoint_url) = {
-            let profile = inner.profile.lock().unwrap();
-            (
-                profile.access_key_id.clone(),
-                profile.secret_access_key.clone(),
-                profile.session_token.clone(),
-                profile.endpoint_url.clone(),
-            )
-        };
+    let profile = &inner.profile;
 
-        let profile_for_host = inner.profile.lock().unwrap().clone();
-        let (host, path) = build_host_path(&profile_for_host, bucket, "", &region);
+    for attempt in 0..2 {
+        let (host, path) = build_host_path(profile, bucket, "", &region);
 
         // Build query string
         let mut query = format!("delimiter={}&list-type=2&max-keys=1000", signer::url_encode("/"));
@@ -415,14 +390,14 @@ async fn process_list_objects(
             &query,
             &region,
             "s3",
-            &access_key,
-            &secret_key,
+            &profile.access_key_id,
+            &profile.secret_access_key,
             "",
-            &session_token,
+            &profile.session_token,
         );
 
-        let url = if !endpoint_url.is_empty() {
-            let scheme = if endpoint_url.starts_with("http://") {
+        let url = if !profile.endpoint_url.is_empty() {
+            let scheme = if profile.endpoint_url.starts_with("http://") {
                 "http"
             } else {
                 "https"
@@ -486,19 +461,10 @@ async fn process_list_objects(
 async fn process_get_object(inner: &S3BackendInner, bucket: &str, key: &str, max_bytes: usize) {
     let mut region = resolve_region(inner, bucket);
 
-    for attempt in 0..2 {
-        let (access_key, secret_key, session_token, endpoint_url) = {
-            let profile = inner.profile.lock().unwrap();
-            (
-                profile.access_key_id.clone(),
-                profile.secret_access_key.clone(),
-                profile.session_token.clone(),
-                profile.endpoint_url.clone(),
-            )
-        };
+    let profile = &inner.profile;
 
-        let profile_for_host = inner.profile.lock().unwrap().clone();
-        let (host, path) = build_host_path(&profile_for_host, bucket, key, &region);
+    for attempt in 0..2 {
+        let (host, path) = build_host_path(profile, bucket, key, &region);
 
         let signed = signer::sign_request(
             "GET",
@@ -507,14 +473,14 @@ async fn process_get_object(inner: &S3BackendInner, bucket: &str, key: &str, max
             "",
             &region,
             "s3",
-            &access_key,
-            &secret_key,
+            &profile.access_key_id,
+            &profile.secret_access_key,
             "",
-            &session_token,
+            &profile.session_token,
         );
 
-        let url = if !endpoint_url.is_empty() {
-            let scheme = if endpoint_url.starts_with("http://") {
+        let url = if !profile.endpoint_url.is_empty() {
+            let scheme = if profile.endpoint_url.starts_with("http://") {
                 "http"
             } else {
                 "https"
