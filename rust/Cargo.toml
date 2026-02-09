@@ -11,3 +11,7 @@ dear-imgui-winit = "0.8"
 wgpu = "28.0"
 winit = "0.30.12"
 pollster = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1"
+aws-smithy-types = "1"

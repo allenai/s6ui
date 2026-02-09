@@ -1,3 +1,9 @@
+mod browser_model;
+mod browser_ui;
+mod events;
+mod s3_backend;
+
+use browser_model::BrowserModel;
 use dear_imgui_rs::*;
 use dear_imgui_wgpu::WgpuRenderer;
 use dear_imgui_winit::WinitPlatform;
@@ -28,9 +34,9 @@ struct AppWindow {
     imgui: ImguiState,
 }
 
-#[derive(Default)]
 struct App {
     window: Option<AppWindow>,
+    model: BrowserModel,
 }
 
 impl AppWindow {
@@ -128,10 +134,13 @@ impl AppWindow {
         }
     }
 
-    fn render(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    fn render(&mut self, model: &mut BrowserModel) -> Result<(), Box<dyn std::error::Error>> {
         let now = Instant::now();
         let delta_time = now - self.imgui.last_frame;
-        self.imgui.context.io_mut().set_delta_time(delta_time.as_secs_f32());
+        self.imgui
+            .context
+            .io_mut()
+            .set_delta_time(delta_time.as_secs_f32());
         self.imgui.last_frame = now;
 
         let frame = match self.surface.get_current_texture() {
@@ -149,18 +158,7 @@ impl AppWindow {
             .prepare_frame(&self.window, &mut self.imgui.context);
         let ui = self.imgui.context.frame();
 
-        // Main window
-        ui.window("s6ui")
-            .size([400.0, 200.0], Condition::FirstUseEver)
-            .build(|| {
-                ui.text("S3 Browser - Rust Port");
-                ui.separator();
-                ui.text(format!(
-                    "{:.1} FPS ({:.3} ms/frame)",
-                    ui.io().framerate(),
-                    1000.0 / ui.io().framerate(),
-                ));
-            });
+        browser_ui::render(ui, model);
 
         let view = frame
             .texture
@@ -226,33 +224,38 @@ impl ApplicationHandler for App {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
-        let window = match self.window.as_mut() {
+        let App {
+            window: ref mut app_window,
+            ref mut model,
+        } = *self;
+
+        let app_window = match app_window.as_mut() {
             Some(w) => w,
             None => return,
         };
 
-        window.imgui.platform.handle_window_event(
-            &mut window.imgui.context,
-            &window.window,
+        app_window.imgui.platform.handle_window_event(
+            &mut app_window.imgui.context,
+            &app_window.window,
             &event,
         );
 
         match event {
             WindowEvent::Resized(size) => {
-                window.resize(size);
-                window.window.request_redraw();
+                app_window.resize(size);
+                app_window.window.request_redraw();
             }
             WindowEvent::ScaleFactorChanged { .. } => {
-                let new_size = window.window.inner_size();
-                window.resize(new_size);
-                window.window.request_redraw();
+                let new_size = app_window.window.inner_size();
+                app_window.resize(new_size);
+                app_window.window.request_redraw();
             }
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => {
-                if let Err(e) = window.render() {
+                if let Err(e) = app_window.render(model) {
                     eprintln!("Render error: {e}");
                 }
-                window.window.request_redraw();
+                app_window.window.request_redraw();
             }
             _ => {}
         }
@@ -268,6 +271,9 @@ impl ApplicationHandler for App {
 fn main() {
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::default();
+    let mut app = App {
+        window: None,
+        model: BrowserModel::new(),
+    };
     event_loop.run_app(&mut app).unwrap();
 }
