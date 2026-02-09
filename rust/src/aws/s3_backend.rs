@@ -11,51 +11,34 @@ use std::sync::{mpsc, Arc, Mutex};
 // WorkItem
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq)]
-enum WorkItemType {
+enum WorkItem {
     ListBuckets,
-    ListObjects,
-    GetObject,
-    GetObjectRange,
-    GetObjectStreaming,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum Priority {
-    High,
-    Low,
-}
-
-struct WorkItem {
-    item_type: WorkItemType,
-    priority: Priority,
-    bucket: String,
-    prefix: String,
-    continuation_token: String,
-    key: String,
-    max_bytes: usize,
-    start_byte: usize,
-    end_byte: usize,
-    total_size: usize,
-    cancel_flag: Option<CancelFlag>,
-}
-
-impl WorkItem {
-    fn new(item_type: WorkItemType, priority: Priority) -> Self {
-        Self {
-            item_type,
-            priority,
-            bucket: String::new(),
-            prefix: String::new(),
-            continuation_token: String::new(),
-            key: String::new(),
-            max_bytes: 0,
-            start_byte: 0,
-            end_byte: 0,
-            total_size: 0,
-            cancel_flag: None,
-        }
-    }
+    ListObjects {
+        bucket: String,
+        prefix: String,
+        continuation_token: String,
+        cancel_flag: Option<CancelFlag>,
+    },
+    GetObject {
+        bucket: String,
+        key: String,
+        max_bytes: Option<usize>,
+        cancel_flag: Option<CancelFlag>,
+    },
+    GetObjectRange {
+        bucket: String,
+        key: String,
+        start_byte: usize,
+        end_byte: usize,
+        cancel_flag: Option<CancelFlag>,
+    },
+    GetObjectStreaming {
+        bucket: String,
+        key: String,
+        start_byte: usize,
+        total_size: usize,
+        cancel_flag: Option<CancelFlag>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -420,6 +403,19 @@ fn resolve_redirect_region(response_body: &str, bucket: &str, current_region: &s
     }
 }
 
+/// Clear the cancel flag on a WorkItem (used when boosting from low to high priority).
+fn clear_cancel_flag(item: &mut WorkItem) {
+    match item {
+        WorkItem::ListBuckets => {}
+        WorkItem::ListObjects { cancel_flag, .. }
+        | WorkItem::GetObject { cancel_flag, .. }
+        | WorkItem::GetObjectRange { cancel_flag, .. }
+        | WorkItem::GetObjectStreaming { cancel_flag, .. } => {
+            *cancel_flag = None;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Async worker / work-item processing
 // ---------------------------------------------------------------------------
@@ -583,21 +579,21 @@ async fn process_work_item(
         }
     }
 
-    match item.item_type {
-        WorkItemType::ListBuckets => {
-            process_list_buckets(&item, client, profile, event_tx).await;
+    match item {
+        WorkItem::ListBuckets => {
+            process_list_buckets(client, profile, event_tx).await;
         }
-        WorkItemType::ListObjects => {
-            process_list_objects(&item, client, profile, event_tx, region_cache).await;
+        WorkItem::ListObjects { bucket, prefix, continuation_token, cancel_flag } => {
+            process_list_objects(&bucket, &prefix, &continuation_token, &cancel_flag, client, profile, event_tx, region_cache).await;
         }
-        WorkItemType::GetObject => {
-            process_get_object(&item, client, profile, event_tx, region_cache).await;
+        WorkItem::GetObject { bucket, key, max_bytes, cancel_flag } => {
+            process_get_object(&bucket, &key, max_bytes, &cancel_flag, client, profile, event_tx, region_cache).await;
         }
-        WorkItemType::GetObjectRange => {
-            process_get_object_range(&item, client, profile, event_tx, region_cache).await;
+        WorkItem::GetObjectRange { bucket, key, start_byte, end_byte, cancel_flag } => {
+            process_get_object_range(&bucket, &key, start_byte, end_byte, &cancel_flag, client, profile, event_tx, region_cache).await;
         }
-        WorkItemType::GetObjectStreaming => {
-            process_get_object_streaming(&item, client, profile, event_tx, region_cache).await;
+        WorkItem::GetObjectStreaming { bucket, key, start_byte, total_size, cancel_flag } => {
+            process_get_object_streaming(&bucket, &key, start_byte, total_size, &cancel_flag, client, profile, event_tx, region_cache).await;
         }
     }
 }
@@ -605,7 +601,6 @@ async fn process_work_item(
 // ---- ListBuckets ----------------------------------------------------------
 
 async fn process_list_buckets(
-    _item: &WorkItem,
     client: &reqwest::Client,
     profile: &Arc<Mutex<AWSProfile>>,
     event_tx: &mpsc::Sender<StateEvent>,
@@ -663,14 +658,17 @@ async fn process_list_buckets(
 // ---- ListObjects ----------------------------------------------------------
 
 async fn process_list_objects(
-    item: &WorkItem,
+    bucket: &str,
+    prefix: &str,
+    continuation_token: &str,
+    cancel_flag: &Option<CancelFlag>,
     client: &reqwest::Client,
     profile: &Arc<Mutex<AWSProfile>>,
     event_tx: &mpsc::Sender<StateEvent>,
     region_cache: &Arc<Mutex<HashMap<String, String>>>,
 ) {
     let snap = snapshot_profile(profile);
-    let cached = get_cached_region(region_cache, &item.bucket);
+    let cached = get_cached_region(region_cache, bucket);
     let mut region = if cached.is_empty() {
         snap.region.clone()
     } else {
@@ -681,8 +679,8 @@ async fn process_list_objects(
         push_event(
             event_tx,
             StateEvent::ObjectsLoadError {
-                bucket: item.bucket.clone(),
-                prefix: item.prefix.clone(),
+                bucket: bucket.to_string(),
+                prefix: prefix.to_string(),
                 error_message: "ERROR: Region not configured. Please ensure your AWS profile has a valid region.".to_string(),
             },
         );
@@ -692,20 +690,20 @@ async fn process_list_objects(
     let fake_profile = snapshot_as_profile(&snap);
 
     for attempt in 0..2 {
-        let (host, path) = build_host_path(&fake_profile, &region, &item.bucket, "");
+        let (host, path) = build_host_path(&fake_profile, &region, bucket, "");
 
         // Build query string
         let mut query = String::from("list-type=2");
         write!(query, "&delimiter={}", url_encode("/")).unwrap();
         write!(query, "&max-keys=1000").unwrap();
-        if !item.prefix.is_empty() {
-            write!(query, "&prefix={}", url_encode(&item.prefix)).unwrap();
+        if !prefix.is_empty() {
+            write!(query, "&prefix={}", url_encode(prefix)).unwrap();
         }
-        if !item.continuation_token.is_empty() {
+        if !continuation_token.is_empty() {
             write!(
                 query,
                 "&continuation-token={}",
-                url_encode(&item.continuation_token)
+                url_encode(continuation_token)
             )
             .unwrap();
         }
@@ -724,12 +722,12 @@ async fn process_list_objects(
         );
 
         let empty_headers = BTreeMap::new();
-        let response = http_get(client, &signed, &empty_headers, &item.cancel_flag).await;
+        let response = http_get(client, &signed, &empty_headers, cancel_flag).await;
 
         if response == "CANCELLED" {
             eprintln!(
                 "S3Backend: listObjects cancelled bucket={} prefix={}",
-                item.bucket, item.prefix
+                bucket, prefix
             );
             return;
         }
@@ -739,8 +737,8 @@ async fn process_list_objects(
             push_event(
                 event_tx,
                 StateEvent::ObjectsLoadError {
-                    bucket: item.bucket.clone(),
-                    prefix: item.prefix.clone(),
+                    bucket: bucket.to_string(),
+                    prefix: prefix.to_string(),
                     error_message: response,
                 },
             );
@@ -753,10 +751,10 @@ async fn process_list_objects(
             // PermanentRedirect handling
             let error_code = extract_tag(&response, "Code");
             if error_code == "PermanentRedirect" && attempt == 0 {
-                if let Some(new_region) = resolve_redirect_region(&response, &item.bucket, &region)
+                if let Some(new_region) = resolve_redirect_region(&response, bucket, &region)
                 {
                     region = new_region.clone();
-                    cache_region(region_cache, &item.bucket, &new_region);
+                    cache_region(region_cache, bucket, &new_region);
                     continue; // retry
                 }
             }
@@ -765,8 +763,8 @@ async fn process_list_objects(
             push_event(
                 event_tx,
                 StateEvent::ObjectsLoadError {
-                    bucket: item.bucket.clone(),
-                    prefix: item.prefix.clone(),
+                    bucket: bucket.to_string(),
+                    prefix: prefix.to_string(),
                     error_message: result.error,
                 },
             );
@@ -774,12 +772,12 @@ async fn process_list_objects(
         }
 
         // Cache region on success
-        cache_region(region_cache, &item.bucket, &region);
+        cache_region(region_cache, bucket, &region);
 
         eprintln!(
             "S3Backend: listObjects success bucket={} prefix={} count={} truncated={}",
-            item.bucket,
-            item.prefix,
+            bucket,
+            prefix,
             result.objects.len(),
             result.is_truncated
         );
@@ -787,9 +785,9 @@ async fn process_list_objects(
         push_event(
             event_tx,
             StateEvent::ObjectsLoaded {
-                bucket: item.bucket.clone(),
-                prefix: item.prefix.clone(),
-                continuation_token: item.continuation_token.clone(),
+                bucket: bucket.to_string(),
+                prefix: prefix.to_string(),
+                continuation_token: continuation_token.to_string(),
                 objects: result.objects,
                 next_continuation_token: result.next_continuation_token,
                 is_truncated: result.is_truncated,
@@ -802,14 +800,17 @@ async fn process_list_objects(
 // ---- GetObject ------------------------------------------------------------
 
 async fn process_get_object(
-    item: &WorkItem,
+    bucket: &str,
+    key: &str,
+    max_bytes: Option<usize>,
+    cancel_flag: &Option<CancelFlag>,
     client: &reqwest::Client,
     profile: &Arc<Mutex<AWSProfile>>,
     event_tx: &mpsc::Sender<StateEvent>,
     region_cache: &Arc<Mutex<HashMap<String, String>>>,
 ) {
     let snap = snapshot_profile(profile);
-    let cached = get_cached_region(region_cache, &item.bucket);
+    let cached = get_cached_region(region_cache, bucket);
     let mut region = if cached.is_empty() {
         snap.region.clone()
     } else {
@@ -820,8 +821,8 @@ async fn process_get_object(
         push_event(
             event_tx,
             StateEvent::ObjectContentLoadError {
-                bucket: item.bucket.clone(),
-                key: item.key.clone(),
+                bucket: bucket.to_string(),
+                key: key.to_string(),
                 error_message: "ERROR: Region not configured. Please ensure your AWS profile has a valid region.".to_string(),
             },
         );
@@ -831,7 +832,7 @@ async fn process_get_object(
     let fake_profile = snapshot_as_profile(&snap);
 
     for attempt in 0..2 {
-        let (host, path) = build_host_path(&fake_profile, &region, &item.bucket, &item.key);
+        let (host, path) = build_host_path(&fake_profile, &region, bucket, key);
 
         let signed = aws_sign_request(
             "GET",
@@ -848,19 +849,19 @@ async fn process_get_object(
 
         // Optional Range header (not signed)
         let mut extra_headers = BTreeMap::new();
-        if item.max_bytes > 0 {
+        if let Some(mb) = max_bytes {
             extra_headers.insert(
                 "Range".to_string(),
-                format!("bytes=0-{}", item.max_bytes - 1),
+                format!("bytes=0-{}", mb - 1),
             );
         }
 
-        let response = http_get(client, &signed, &extra_headers, &item.cancel_flag).await;
+        let response = http_get(client, &signed, &extra_headers, cancel_flag).await;
 
         if response == "CANCELLED" {
             eprintln!(
                 "S3Backend: getObject cancelled bucket={} key={}",
-                item.bucket, item.key
+                bucket, key
             );
             return;
         }
@@ -870,8 +871,8 @@ async fn process_get_object(
             push_event(
                 event_tx,
                 StateEvent::ObjectContentLoadError {
-                    bucket: item.bucket.clone(),
-                    key: item.key.clone(),
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
                     error_message: response,
                 },
             );
@@ -885,10 +886,10 @@ async fn process_get_object(
 
             // PermanentRedirect retry
             if error_code == "PermanentRedirect" && attempt == 0 {
-                if let Some(new_region) = resolve_redirect_region(&response, &item.bucket, &region)
+                if let Some(new_region) = resolve_redirect_region(&response, bucket, &region)
                 {
                     region = new_region.clone();
-                    cache_region(region_cache, &item.bucket, &new_region);
+                    cache_region(region_cache, bucket, &new_region);
                     continue;
                 }
             }
@@ -897,13 +898,13 @@ async fn process_get_object(
             if error_code == "InvalidRange" {
                 eprintln!(
                     "S3Backend: getObject empty file (InvalidRange) bucket={} key={}",
-                    item.bucket, item.key
+                    bucket, key
                 );
                 push_event(
                     event_tx,
                     StateEvent::ObjectContentLoaded {
-                        bucket: item.bucket.clone(),
-                        key: item.key.clone(),
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
                         content: Vec::new(),
                     },
                 );
@@ -914,8 +915,8 @@ async fn process_get_object(
             push_event(
                 event_tx,
                 StateEvent::ObjectContentLoadError {
-                    bucket: item.bucket.clone(),
-                    key: item.key.clone(),
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
                     error_message: error,
                 },
             );
@@ -923,19 +924,19 @@ async fn process_get_object(
         }
 
         // Cache region on success
-        cache_region(region_cache, &item.bucket, &region);
+        cache_region(region_cache, bucket, &region);
 
         eprintln!(
             "S3Backend: getObject success bucket={} key={} size={}",
-            item.bucket,
-            item.key,
+            bucket,
+            key,
             response.len()
         );
         push_event(
             event_tx,
             StateEvent::ObjectContentLoaded {
-                bucket: item.bucket.clone(),
-                key: item.key.clone(),
+                bucket: bucket.to_string(),
+                key: key.to_string(),
                 content: response.into_bytes(),
             },
         );
@@ -946,14 +947,18 @@ async fn process_get_object(
 // ---- GetObjectRange -------------------------------------------------------
 
 async fn process_get_object_range(
-    item: &WorkItem,
+    bucket: &str,
+    key: &str,
+    start_byte: usize,
+    end_byte: usize,
+    cancel_flag: &Option<CancelFlag>,
     client: &reqwest::Client,
     profile: &Arc<Mutex<AWSProfile>>,
     event_tx: &mpsc::Sender<StateEvent>,
     region_cache: &Arc<Mutex<HashMap<String, String>>>,
 ) {
     let snap = snapshot_profile(profile);
-    let cached = get_cached_region(region_cache, &item.bucket);
+    let cached = get_cached_region(region_cache, bucket);
     let mut region = if cached.is_empty() {
         snap.region.clone()
     } else {
@@ -964,9 +969,9 @@ async fn process_get_object_range(
         push_event(
             event_tx,
             StateEvent::ObjectRangeLoadError {
-                bucket: item.bucket.clone(),
-                key: item.key.clone(),
-                start_byte: item.start_byte,
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                start_byte,
                 error_message: "ERROR: Region not configured. Please ensure your AWS profile has a valid region.".to_string(),
             },
         );
@@ -976,7 +981,7 @@ async fn process_get_object_range(
     let fake_profile = snapshot_as_profile(&snap);
 
     for attempt in 0..2 {
-        let (host, path) = build_host_path(&fake_profile, &region, &item.bucket, &item.key);
+        let (host, path) = build_host_path(&fake_profile, &region, bucket, key);
 
         let signed = aws_sign_request(
             "GET",
@@ -995,15 +1000,15 @@ async fn process_get_object_range(
         let mut extra_headers = BTreeMap::new();
         extra_headers.insert(
             "Range".to_string(),
-            format!("bytes={}-{}", item.start_byte, item.end_byte),
+            format!("bytes={}-{}", start_byte, end_byte),
         );
 
         // Check cancel before request
-        if let Some(cf) = &item.cancel_flag {
+        if let Some(cf) = cancel_flag {
             if cf.load(Ordering::Relaxed) {
                 eprintln!(
                     "S3Backend: getObjectRange cancelled bucket={} key={}",
-                    item.bucket, item.key
+                    bucket, key
                 );
                 return;
             }
@@ -1017,9 +1022,9 @@ async fn process_get_object_range(
                 push_event(
                     event_tx,
                     StateEvent::ObjectRangeLoadError {
-                        bucket: item.bucket.clone(),
-                        key: item.key.clone(),
-                        start_byte: item.start_byte,
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                        start_byte,
                         error_message: format!("ERROR: {}", e),
                     },
                 );
@@ -1047,9 +1052,9 @@ async fn process_get_object_range(
                 push_event(
                     event_tx,
                     StateEvent::ObjectRangeLoadError {
-                        bucket: item.bucket.clone(),
-                        key: item.key.clone(),
-                        start_byte: item.start_byte,
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                        start_byte,
                         error_message: format!("ERROR: {}", e),
                     },
                 );
@@ -1066,10 +1071,10 @@ async fn process_get_object_range(
 
             if error_code == "PermanentRedirect" && attempt == 0 {
                 if let Some(new_region) =
-                    resolve_redirect_region(&body_str, &item.bucket, &region)
+                    resolve_redirect_region(&body_str, bucket, &region)
                 {
                     region = new_region.clone();
-                    cache_region(region_cache, &item.bucket, &new_region);
+                    cache_region(region_cache, bucket, &new_region);
                     continue;
                 }
             }
@@ -1078,9 +1083,9 @@ async fn process_get_object_range(
             push_event(
                 event_tx,
                 StateEvent::ObjectRangeLoadError {
-                    bucket: item.bucket.clone(),
-                    key: item.key.clone(),
-                    start_byte: item.start_byte,
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    start_byte,
                     error_message: error,
                 },
             );
@@ -1088,14 +1093,14 @@ async fn process_get_object_range(
         }
 
         // Cache region on success
-        cache_region(region_cache, &item.bucket, &region);
+        cache_region(region_cache, bucket, &region);
 
         eprintln!(
             "S3Backend: getObjectRange success bucket={} key={} range={}-{} got={} total={}",
-            item.bucket,
-            item.key,
-            item.start_byte,
-            item.end_byte,
+            bucket,
+            key,
+            start_byte,
+            end_byte,
             body.len(),
             content_range_total
         );
@@ -1103,9 +1108,9 @@ async fn process_get_object_range(
         push_event(
             event_tx,
             StateEvent::ObjectRangeLoaded {
-                bucket: item.bucket.clone(),
-                key: item.key.clone(),
-                start_byte: item.start_byte,
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                start_byte,
                 total_size: content_range_total,
                 data: body.to_vec(),
             },
@@ -1119,14 +1124,18 @@ async fn process_get_object_range(
 const STREAMING_CHUNK_SIZE: usize = 256 * 1024; // 256 KB
 
 async fn process_get_object_streaming(
-    item: &WorkItem,
+    bucket: &str,
+    key: &str,
+    start_byte: usize,
+    total_size: usize,
+    cancel_flag: &Option<CancelFlag>,
     client: &reqwest::Client,
     profile: &Arc<Mutex<AWSProfile>>,
     event_tx: &mpsc::Sender<StateEvent>,
     region_cache: &Arc<Mutex<HashMap<String, String>>>,
 ) {
     let snap = snapshot_profile(profile);
-    let cached = get_cached_region(region_cache, &item.bucket);
+    let cached = get_cached_region(region_cache, bucket);
     let mut region = if cached.is_empty() {
         snap.region.clone()
     } else {
@@ -1137,9 +1146,9 @@ async fn process_get_object_streaming(
         push_event(
             event_tx,
             StateEvent::ObjectRangeLoadError {
-                bucket: item.bucket.clone(),
-                key: item.key.clone(),
-                start_byte: item.start_byte,
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                start_byte,
                 error_message: "ERROR: Region not configured. Please ensure your AWS profile has a valid region.".to_string(),
             },
         );
@@ -1149,7 +1158,7 @@ async fn process_get_object_streaming(
     let fake_profile = snapshot_as_profile(&snap);
 
     for attempt in 0..2 {
-        let (host, path) = build_host_path(&fake_profile, &region, &item.bucket, &item.key);
+        let (host, path) = build_host_path(&fake_profile, &region, bucket, key);
 
         let signed = aws_sign_request(
             "GET",
@@ -1165,19 +1174,19 @@ async fn process_get_object_streaming(
         );
 
         let mut extra_headers = BTreeMap::new();
-        if item.start_byte > 0 {
+        if start_byte > 0 {
             extra_headers.insert(
                 "Range".to_string(),
-                format!("bytes={}-", item.start_byte),
+                format!("bytes={}-", start_byte),
             );
         }
 
         // Check cancel before request
-        if let Some(cf) = &item.cancel_flag {
+        if let Some(cf) = cancel_flag {
             if cf.load(Ordering::Relaxed) {
                 eprintln!(
                     "S3Backend: getObjectStreaming cancelled bucket={} key={}",
-                    item.bucket, item.key
+                    bucket, key
                 );
                 return;
             }
@@ -1191,9 +1200,9 @@ async fn process_get_object_streaming(
                 push_event(
                     event_tx,
                     StateEvent::ObjectRangeLoadError {
-                        bucket: item.bucket.clone(),
-                        key: item.key.clone(),
-                        start_byte: item.start_byte,
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                        start_byte,
                         error_message: format!("ERROR: {}", e),
                     },
                 );
@@ -1208,7 +1217,7 @@ async fn process_get_object_streaming(
         // Stream chunks from the response
         loop {
             // Check cancellation before each chunk
-            if let Some(cf) = &item.cancel_flag {
+            if let Some(cf) = cancel_flag {
                 if cf.load(Ordering::Relaxed) {
                     cancelled = true;
                     break;
@@ -1223,16 +1232,16 @@ async fn process_get_object_streaming(
                     while buffer.len() >= STREAMING_CHUNK_SIZE {
                         let chunk_data: Vec<u8> =
                             buffer.drain(..STREAMING_CHUNK_SIZE).collect();
-                        let chunk_offset = item.start_byte + bytes_received;
+                        let chunk_offset = start_byte + bytes_received;
                         bytes_received += chunk_data.len();
 
                         push_event(
                             event_tx,
                             StateEvent::ObjectRangeLoaded {
-                                bucket: item.bucket.clone(),
-                                key: item.key.clone(),
+                                bucket: bucket.to_string(),
+                                key: key.to_string(),
                                 start_byte: chunk_offset,
-                                total_size: item.total_size,
+                                total_size,
                                 data: chunk_data,
                             },
                         );
@@ -1247,9 +1256,9 @@ async fn process_get_object_streaming(
                     push_event(
                         event_tx,
                         StateEvent::ObjectRangeLoadError {
-                            bucket: item.bucket.clone(),
-                            key: item.key.clone(),
-                            start_byte: item.start_byte,
+                            bucket: bucket.to_string(),
+                            key: key.to_string(),
+                            start_byte,
                             error_message: format!("ERROR: {}", e),
                         },
                     );
@@ -1261,7 +1270,7 @@ async fn process_get_object_streaming(
         if cancelled {
             eprintln!(
                 "S3Backend: getObjectStreaming cancelled bucket={} key={}",
-                item.bucket, item.key
+                bucket, key
             );
             return;
         }
@@ -1273,10 +1282,10 @@ async fn process_get_object_streaming(
             let error_code = extract_tag(&buffer_str, "Code");
             if error_code == "PermanentRedirect" && attempt == 0 {
                 if let Some(new_region) =
-                    resolve_redirect_region(&buffer_str, &item.bucket, &region)
+                    resolve_redirect_region(&buffer_str, bucket, &region)
                 {
                     region = new_region.clone();
-                    cache_region(region_cache, &item.bucket, &new_region);
+                    cache_region(region_cache, bucket, &new_region);
                     continue;
                 }
             }
@@ -1285,9 +1294,9 @@ async fn process_get_object_streaming(
             push_event(
                 event_tx,
                 StateEvent::ObjectRangeLoadError {
-                    bucket: item.bucket.clone(),
-                    key: item.key.clone(),
-                    start_byte: item.start_byte,
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    start_byte,
                     error_message: error,
                 },
             );
@@ -1295,11 +1304,11 @@ async fn process_get_object_streaming(
         }
 
         // Cache region on success
-        cache_region(region_cache, &item.bucket, &region);
+        cache_region(region_cache, bucket, &region);
 
         // Emit any remaining data in the buffer as the final chunk
         if !buffer.is_empty() {
-            let chunk_offset = item.start_byte + bytes_received;
+            let chunk_offset = start_byte + bytes_received;
             eprintln!(
                 "S3Backend: emitting final chunk of {} bytes at offset {}",
                 buffer.len(),
@@ -1308,10 +1317,10 @@ async fn process_get_object_streaming(
             push_event(
                 event_tx,
                 StateEvent::ObjectRangeLoaded {
-                    bucket: item.bucket.clone(),
-                    key: item.key.clone(),
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
                     start_byte: chunk_offset,
-                    total_size: item.total_size,
+                    total_size,
                     data: buffer,
                 },
             );
@@ -1319,7 +1328,7 @@ async fn process_get_object_streaming(
 
         eprintln!(
             "S3Backend: getObjectStreaming complete bucket={} key={}",
-            item.bucket, item.key
+            bucket, key
         );
         return;
     }
@@ -1473,19 +1482,15 @@ impl S3Backend {
 
     // -- Private helpers --
 
-    fn enqueue(&self, item: WorkItem) {
-        if item.priority == Priority::High {
-            {
-                self.high_queue.lock().unwrap().push_back(item);
-            }
-            self.high_notify.notify_one();
-        } else {
-            {
-                // Push to front so most recent prefetch request is served first
-                self.low_queue.lock().unwrap().push_front(item);
-            }
-            self.low_notify.notify_one();
-        }
+    fn enqueue_high(&self, item: WorkItem) {
+        self.high_queue.lock().unwrap().push_back(item);
+        self.high_notify.notify_one();
+    }
+
+    fn enqueue_low(&self, item: WorkItem) {
+        // Push to front so most recent prefetch request is served first
+        self.low_queue.lock().unwrap().push_front(item);
+        self.low_notify.notify_one();
     }
 
     /// Search both queues for an item matching the predicate.
@@ -1493,23 +1498,8 @@ impl S3Backend {
     where
         P: Fn(&WorkItem) -> bool,
     {
-        {
-            let q = self.high_queue.lock().unwrap();
-            for item in q.iter() {
-                if pred(item) {
-                    return true;
-                }
-            }
-        }
-        {
-            let q = self.low_queue.lock().unwrap();
-            for item in q.iter() {
-                if pred(item) {
-                    return true;
-                }
-            }
-        }
-        false
+        self.high_queue.lock().unwrap().iter().any(&pred)
+            || self.low_queue.lock().unwrap().iter().any(&pred)
     }
 
     /// Move a matching item from the low-priority queue to the front of the
@@ -1519,38 +1509,26 @@ impl S3Backend {
     where
         P: Fn(&WorkItem) -> bool,
     {
-        let mut found_item: Option<WorkItem> = None;
-
         // Try to extract from low queue
-        {
+        let found_item = {
             let mut q = self.low_queue.lock().unwrap();
             if let Some(pos) = q.iter().position(|item| pred(item)) {
-                found_item = q.remove(pos);
+                q.remove(pos)
+            } else {
+                None
             }
-        }
+        };
 
         if let Some(mut item) = found_item {
-            item.priority = Priority::High;
             // Clear cancel flag so boosted requests aren't cancelled by hover
-            item.cancel_flag = None;
-            {
-                self.high_queue.lock().unwrap().push_front(item);
-            }
+            clear_cancel_flag(&mut item);
+            self.high_queue.lock().unwrap().push_front(item);
             self.high_notify.notify_one();
             return true;
         }
 
         // Check if already in high queue
-        {
-            let q = self.high_queue.lock().unwrap();
-            for item in q.iter() {
-                if pred(item) {
-                    return true;
-                }
-            }
-        }
-
-        false
+        self.high_queue.lock().unwrap().iter().any(&pred)
     }
 }
 
@@ -1569,8 +1547,7 @@ impl Backend for S3Backend {
 
     fn list_buckets(&self) {
         eprintln!("S3Backend: queuing listBuckets request");
-        let item = WorkItem::new(WorkItemType::ListBuckets, Priority::High);
-        self.enqueue(item);
+        self.enqueue_high(WorkItem::ListBuckets);
     }
 
     fn list_objects(
@@ -1590,29 +1567,24 @@ impl Backend for S3Backend {
                 &continuation_token[..continuation_token.len().min(20)]
             }
         );
-        let mut item = WorkItem::new(WorkItemType::ListObjects, Priority::High);
-        item.bucket = bucket.to_string();
-        item.prefix = prefix.to_string();
-        item.continuation_token = continuation_token.to_string();
-        item.cancel_flag = cancel_flag;
-        self.enqueue(item);
+        self.enqueue_high(WorkItem::ListObjects {
+            bucket: bucket.to_string(),
+            prefix: prefix.to_string(),
+            continuation_token: continuation_token.to_string(),
+            cancel_flag,
+        });
     }
 
     fn get_object(
         &self,
         bucket: &str,
         key: &str,
-        max_bytes: usize,
+        max_bytes: Option<usize>,
         low_priority: bool,
         cancellable: bool,
     ) {
-        let priority = if low_priority {
-            Priority::Low
-        } else {
-            Priority::High
-        };
         eprintln!(
-            "S3Backend: queuing getObject bucket={} key={} max_bytes={} priority={} cancellable={}",
+            "S3Backend: queuing getObject bucket={} key={} max_bytes={:?} priority={} cancellable={}",
             bucket,
             key,
             max_bytes,
@@ -1620,22 +1592,31 @@ impl Backend for S3Backend {
             cancellable
         );
 
-        let mut item = WorkItem::new(WorkItemType::GetObject, priority);
-        item.bucket = bucket.to_string();
-        item.key = key.to_string();
-        item.max_bytes = max_bytes;
-
-        if cancellable {
+        let cancel_flag = if cancellable {
             let mut hover = self.hover_cancel.lock().unwrap();
             if let Some(ref prev) = *hover {
                 prev.store(true, Ordering::SeqCst);
             }
             let flag = Arc::new(AtomicBool::new(false));
-            item.cancel_flag = Some(Arc::clone(&flag));
+            let cf = Some(Arc::clone(&flag));
             *hover = Some(flag);
-        }
+            cf
+        } else {
+            None
+        };
 
-        self.enqueue(item);
+        let item = WorkItem::GetObject {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            max_bytes,
+            cancel_flag,
+        };
+
+        if low_priority {
+            self.enqueue_low(item);
+        } else {
+            self.enqueue_high(item);
+        }
     }
 
     fn get_object_range(
@@ -1650,13 +1631,13 @@ impl Backend for S3Backend {
             "S3Backend: queuing getObjectRange bucket={} key={} range={}-{}",
             bucket, key, start_byte, end_byte
         );
-        let mut item = WorkItem::new(WorkItemType::GetObjectRange, Priority::High);
-        item.bucket = bucket.to_string();
-        item.key = key.to_string();
-        item.start_byte = start_byte;
-        item.end_byte = end_byte;
-        item.cancel_flag = cancel_flag;
-        self.enqueue(item);
+        self.enqueue_high(WorkItem::GetObjectRange {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            start_byte,
+            end_byte,
+            cancel_flag,
+        });
     }
 
     fn get_object_streaming(
@@ -1671,13 +1652,13 @@ impl Backend for S3Backend {
             "S3Backend: queuing getObjectStreaming bucket={} key={} startByte={} totalSize={}",
             bucket, key, start_byte, total_size
         );
-        let mut item = WorkItem::new(WorkItemType::GetObjectStreaming, Priority::High);
-        item.bucket = bucket.to_string();
-        item.key = key.to_string();
-        item.start_byte = start_byte;
-        item.total_size = total_size;
-        item.cancel_flag = cancel_flag;
-        self.enqueue(item);
+        self.enqueue_high(WorkItem::GetObjectStreaming {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            start_byte,
+            total_size,
+            cancel_flag,
+        });
     }
 
     fn cancel_all(&self) {
@@ -1690,28 +1671,31 @@ impl Backend for S3Backend {
             "S3Backend: queuing prefetch bucket={} prefix={} cancellable={}",
             bucket, prefix, cancellable
         );
-        let mut item = WorkItem::new(WorkItemType::ListObjects, Priority::Low);
-        item.bucket = bucket.to_string();
-        item.prefix = prefix.to_string();
 
-        if cancellable {
+        let cancel_flag = if cancellable {
             let mut hover = self.hover_cancel.lock().unwrap();
             if let Some(ref prev) = *hover {
                 prev.store(true, Ordering::SeqCst);
             }
             let flag = Arc::new(AtomicBool::new(false));
-            item.cancel_flag = Some(Arc::clone(&flag));
+            let cf = Some(Arc::clone(&flag));
             *hover = Some(flag);
-        }
+            cf
+        } else {
+            None
+        };
 
-        self.enqueue(item);
+        self.enqueue_low(WorkItem::ListObjects {
+            bucket: bucket.to_string(),
+            prefix: prefix.to_string(),
+            continuation_token: String::new(),
+            cancel_flag,
+        });
     }
 
     fn prioritize_request(&self, bucket: &str, prefix: &str) -> bool {
         let result = self.boost_from_low_to_high(|item| {
-            item.item_type == WorkItemType::ListObjects
-                && item.bucket == bucket
-                && item.prefix == prefix
+            matches!(item, WorkItem::ListObjects { bucket: b, prefix: p, .. } if b == bucket && p == prefix)
         });
         if result {
             eprintln!(
@@ -1724,25 +1708,19 @@ impl Backend for S3Backend {
 
     fn has_pending_request(&self, bucket: &str, prefix: &str) -> bool {
         self.find_in_queues(|item| {
-            item.item_type == WorkItemType::ListObjects
-                && item.bucket == bucket
-                && item.prefix == prefix
+            matches!(item, WorkItem::ListObjects { bucket: b, prefix: p, .. } if b == bucket && p == prefix)
         })
     }
 
     fn has_pending_object_request(&self, bucket: &str, key: &str) -> bool {
         self.find_in_queues(|item| {
-            item.item_type == WorkItemType::GetObject
-                && item.bucket == bucket
-                && item.key == key
+            matches!(item, WorkItem::GetObject { bucket: b, key: k, .. } if b == bucket && k == key)
         })
     }
 
     fn prioritize_object_request(&self, bucket: &str, key: &str) -> bool {
         let result = self.boost_from_low_to_high(|item| {
-            item.item_type == WorkItemType::GetObject
-                && item.bucket == bucket
-                && item.key == key
+            matches!(item, WorkItem::GetObject { bucket: b, key: k, .. } if b == bucket && k == key)
         });
         if result {
             eprintln!(

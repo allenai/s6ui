@@ -25,10 +25,6 @@ pub struct AWSProfile {
 
 type IniSections = HashMap<String, HashMap<String, String>>;
 
-fn trim(s: &str) -> &str {
-    s.trim_matches(|c: char| c == ' ' || c == '\t' || c == '\r' || c == '\n')
-}
-
 fn parse_ini_file(path: &Path) -> IniSections {
     let mut sections = IniSections::new();
     let file = match fs::File::open(path) {
@@ -44,7 +40,7 @@ fn parse_ini_file(path: &Path) -> IniSections {
             Ok(l) => l,
             Err(_) => continue,
         };
-        let line = trim(&line);
+        let line = line.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
         }
@@ -55,11 +51,11 @@ fn parse_ini_file(path: &Path) -> IniSections {
             if let Some(stripped) = section.strip_prefix("profile ") {
                 section = stripped;
             }
-            current_section = trim(section).to_string();
+            current_section = section.trim().to_string();
         } else if let Some(eq_pos) = line.find('=') {
             if !current_section.is_empty() {
-                let key = trim(&line[..eq_pos]).to_string();
-                let value = trim(&line[eq_pos + 1..]).to_string();
+                let key = line[..eq_pos].trim().to_string();
+                let value = line[eq_pos + 1..].trim().to_string();
                 sections
                     .entry(current_section.clone())
                     .or_default()

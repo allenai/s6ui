@@ -2,10 +2,51 @@ use std::fs;
 use std::io::{Read, Write};
 use std::sync::Mutex;
 
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+
 /// Abstract interface for data transformation (decompression, etc.)
 pub trait StreamTransform: Send {
     fn transform(&mut self, data: &[u8]) -> Vec<u8>;
     fn flush(&mut self) -> Vec<u8>;
+}
+
+/// Shared transform/flush logic for buffered decompression transforms.
+/// Buffers all compressed data and re-decompresses from scratch each time,
+/// emitting only the newly decompressed bytes.
+macro_rules! impl_buffered_transform {
+    ($ty:ty) => {
+        impl StreamTransform for $ty {
+            fn transform(&mut self, data: &[u8]) -> Vec<u8> {
+                if self.error || data.is_empty() {
+                    return vec![];
+                }
+                self.buffer.extend_from_slice(data);
+                let all = self.decompress_all();
+                if all.len() > self.emitted {
+                    let new_data = all[self.emitted..].to_vec();
+                    self.emitted = all.len();
+                    new_data
+                } else {
+                    vec![]
+                }
+            }
+
+            fn flush(&mut self) -> Vec<u8> {
+                if self.error {
+                    return vec![];
+                }
+                let all = self.decompress_all();
+                if all.len() > self.emitted {
+                    let new_data = all[self.emitted..].to_vec();
+                    self.emitted = all.len();
+                    new_data
+                } else {
+                    vec![]
+                }
+            }
+        }
+    };
 }
 
 /// Pass-through transform (no transformation)
@@ -52,36 +93,7 @@ impl GzipTransform {
     }
 }
 
-impl StreamTransform for GzipTransform {
-    fn transform(&mut self, data: &[u8]) -> Vec<u8> {
-        if self.error || data.is_empty() {
-            return vec![];
-        }
-        self.buffer.extend_from_slice(data);
-        let all = self.decompress_all();
-        if all.len() > self.emitted {
-            let new_data = all[self.emitted..].to_vec();
-            self.emitted = all.len();
-            new_data
-        } else {
-            vec![]
-        }
-    }
-
-    fn flush(&mut self) -> Vec<u8> {
-        if self.error {
-            return vec![];
-        }
-        let all = self.decompress_all();
-        if all.len() > self.emitted {
-            let new_data = all[self.emitted..].to_vec();
-            self.emitted = all.len();
-            new_data
-        } else {
-            vec![]
-        }
-    }
-}
+impl_buffered_transform!(GzipTransform);
 
 /// Zstd decompression transform.
 /// Same approach: buffer all compressed data, decompress from scratch.
@@ -116,36 +128,7 @@ impl ZstdTransform {
     }
 }
 
-impl StreamTransform for ZstdTransform {
-    fn transform(&mut self, data: &[u8]) -> Vec<u8> {
-        if self.error || data.is_empty() {
-            return vec![];
-        }
-        self.buffer.extend_from_slice(data);
-        let all = self.decompress_all();
-        if all.len() > self.emitted {
-            let new_data = all[self.emitted..].to_vec();
-            self.emitted = all.len();
-            new_data
-        } else {
-            vec![]
-        }
-    }
-
-    fn flush(&mut self) -> Vec<u8> {
-        if self.error {
-            return vec![];
-        }
-        let all = self.decompress_all();
-        if all.len() > self.emitted {
-            let new_data = all[self.emitted..].to_vec();
-            self.emitted = all.len();
-            new_data
-        } else {
-            vec![]
-        }
-    }
-}
+impl_buffered_transform!(ZstdTransform);
 
 /// Manages streaming download of a file to a temp file with newline indexing.
 pub struct StreamingFilePreview {
@@ -277,7 +260,7 @@ impl StreamingFilePreview {
             // We need to write to the file but self.file is behind &self.
             // Use the file handle via unsafe raw fd for pwrite, or just accept the limitation.
             // Actually, File::write_all needs &mut File, but we can use write on &File on unix.
-            use std::os::unix::fs::FileExt;
+
             if let Some(ref f) = self.file {
                 let base_offset = inner.bytes_written;
                 let _ = f.write_all_at(&transformed, base_offset as u64);
@@ -293,7 +276,7 @@ impl StreamingFilePreview {
             if !inner.complete {
                 let remaining = inner.transform.flush();
                 if !remaining.is_empty() {
-                    use std::os::unix::fs::FileExt;
+        
                     if let Some(ref f) = self.file {
                         let base_offset = inner.bytes_written;
                         let _ = f.write_all_at(&remaining, base_offset as u64);
@@ -353,7 +336,7 @@ impl StreamingFilePreview {
         let line_len = (end_offset - start_offset).min(10 * 1024 * 1024);
         drop(inner);
 
-        use std::os::unix::fs::FileExt;
+
         if let Some(ref f) = self.file {
             let mut buf = vec![0u8; line_len];
             match f.read_at(&mut buf, start_offset as u64) {
@@ -371,10 +354,6 @@ impl StreamingFilePreview {
         }
     }
 
-    pub fn get_raw_line(&self, line_index: usize) -> String {
-        self.get_line(line_index)
-    }
-
     /// Get all content written so far.
     pub fn get_all_content(&self) -> Vec<u8> {
         let inner = self.inner.lock().unwrap();
@@ -385,7 +364,7 @@ impl StreamingFilePreview {
             return vec![];
         }
 
-        use std::os::unix::fs::FileExt;
+
         if let Some(ref f) = self.file {
             let mut buf = vec![0u8; bytes_written];
             match f.read_at(&mut buf, 0) {
@@ -426,7 +405,8 @@ impl StreamingFilePreview {
 
 impl Drop for StreamingFilePreview {
     fn drop(&mut self) {
-        self.file.take();
+        // Drop the file handle before removing
+        drop(self.file.take());
         if !self.temp_file_path.is_empty() {
             let _ = fs::remove_file(&self.temp_file_path);
         }

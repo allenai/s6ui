@@ -109,10 +109,6 @@ fn uri_encode(value: &str, encode_slash: bool) -> String {
     encoded
 }
 
-fn url_encode(value: &str) -> String {
-    uri_encode(value, true)
-}
-
 fn sort_query_string(query: &str) -> String {
     if query.is_empty() {
         return String::new();
@@ -148,6 +144,7 @@ fn sort_query_string(query: &str) -> String {
 }
 
 /// Sign an AWS request using Signature Version 4.
+#[must_use]
 pub fn aws_sign_request(
     method: &str,
     host: &str,
@@ -236,6 +233,7 @@ pub fn aws_sign_request(
 }
 
 /// Generate a presigned URL for S3 object download.
+#[must_use]
 pub fn aws_generate_presigned_url(
     bucket: &str,
     key: &str,
@@ -256,11 +254,11 @@ pub fn aws_generate_presigned_url(
     let credential = format!("{}/{}", access_key, credential_scope);
 
     let mut query = format!("X-Amz-Algorithm=AWS4-HMAC-SHA256");
-    write!(query, "&X-Amz-Credential={}", url_encode(&credential)).unwrap();
+    write!(query, "&X-Amz-Credential={}", uri_encode(&credential, true)).unwrap();
     write!(query, "&X-Amz-Date={}", timestamp).unwrap();
     write!(query, "&X-Amz-Expires={}", expires_seconds).unwrap();
     if !session_token.is_empty() {
-        write!(query, "&X-Amz-Security-Token={}", url_encode(session_token)).unwrap();
+        write!(query, "&X-Amz-Security-Token={}", uri_encode(session_token, true)).unwrap();
     }
     write!(query, "&X-Amz-SignedHeaders=host").unwrap();
 

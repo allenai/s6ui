@@ -41,12 +41,10 @@ impl PreviewRenderer for TextPreviewRenderer {
             // Show text content line by line
             let line_count = sp.line_count();
             let clipper = dear_imgui_rs::ListClipper::new(line_count as i32);
-            let mut clipper_token = clipper.begin(ui);
-            while clipper_token.step() {
-                for i in clipper_token.display_start()..clipper_token.display_end() {
-                    let line = sp.get_line(i as usize);
-                    ui.text(&line);
-                }
+            let clipper_token = clipper.begin(ui);
+            for i in clipper_token.iter() {
+                let line = sp.get_line(i as usize);
+                ui.text(&line);
             }
         } else {
             // Simple text display from preview content

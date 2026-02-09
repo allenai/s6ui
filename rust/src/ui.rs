@@ -1,10 +1,10 @@
-use crate::aws::signer::aws_generate_presigned_url;
 use crate::model::BrowserModel;
 use crate::preview::image_preview::ImagePreviewRenderer;
 use crate::preview::jsonl_preview::JsonlPreviewRenderer;
 use crate::preview::renderer::{PreviewContext, PreviewRenderer};
 use crate::preview::text_preview::TextPreviewRenderer;
 use dear_imgui_rs::*;
+use std::fmt::Write as FmtWrite;
 
 pub struct BrowserUI {
     path_input: String,
@@ -56,20 +56,19 @@ impl BrowserUI {
         ui.text("Profile:");
         ui.same_line();
 
-        let profile_names: Vec<String> = model.profiles().iter().map(|p| p.name.clone()).collect();
-        if !profile_names.is_empty() {
-            let name_refs: Vec<&str> = profile_names.iter().map(|s| s.as_str()).collect();
+        let profiles = model.profiles();
+        if !profiles.is_empty() {
+            let name_refs: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
 
-            let mut selected: usize = model.selected_profile_index() as usize;
+            let mut selected = model.selected_profile_index();
             ui.set_next_item_width(150.0);
             if ui.combo("##profile", &mut selected, &name_refs, |name| (*name).into()) {
-                model.select_profile(selected as i32);
+                model.select_profile(selected);
                 self.path_input = "s3://".to_string();
             }
 
             ui.same_line();
-            let region = model.profiles()[selected].region.clone();
-            ui.text_colored([0.5, 0.5, 0.5, 1.0], format!("({})", region));
+            ui.text_colored([0.5, 0.5, 0.5, 1.0], format!("({})", &model.profiles()[selected].region));
         } else {
             ui.text_colored(
                 [1.0, 0.3, 0.3, 1.0],
@@ -206,8 +205,7 @@ impl BrowserUI {
             // Right-click context menu
             if let Some(_popup) = ui.begin_popup_context_item() {
                 if ui.menu_item("Copy path") {
-                    let _path = format!("s3://{}/", bucket_name);
-                    // Clipboard not directly available on Ui; would need platform integration
+                    // TODO: clipboard integration (platform-level)
                 }
             }
         }
@@ -287,8 +285,7 @@ impl BrowserUI {
                 }
                 if let Some(_popup) = ui.begin_popup_context_item() {
                     if ui.menu_item("Copy path") {
-                        let _path = format!("s3://{}/{}", bucket, key);
-                        // Clipboard not directly available on Ui
+                        // TODO: clipboard integration (platform-level)
                     }
                 }
                 if ui.is_item_hovered() {
@@ -302,25 +299,11 @@ impl BrowserUI {
                 }
                 if let Some(_popup) = ui.begin_popup_context_item() {
                     if ui.menu_item("Copy path") {
-                        let _path = format!("s3://{}/{}", bucket, key);
-                        // Clipboard not directly available on Ui
+                        // TODO: clipboard integration (platform-level)
                     }
                     if ui.menu_item("Copy pre-signed URL (7 days)") {
-                        let profiles = model.profiles();
-                        let idx = model.selected_profile_index() as usize;
-                        if idx < profiles.len() {
-                            let profile = &profiles[idx];
-                            let _url = aws_generate_presigned_url(
-                                &bucket,
-                                key,
-                                &profile.region,
-                                &profile.access_key_id,
-                                &profile.secret_access_key,
-                                &profile.session_token,
-                                604800,
-                            );
-                            // Clipboard not directly available on Ui
-                        }
+                        // TODO: clipboard integration (platform-level)
+                        // Would call aws_generate_presigned_url and copy to clipboard
                     }
                 }
                 if ui.is_item_hovered() {
@@ -392,25 +375,27 @@ impl BrowserUI {
 
                     let mut status = String::new();
                     if folder_count > 0 {
-                        status.push_str(&format!(
+                        let _ = write!(
+                            status,
                             "{} folder{}",
                             format_number(folder_count as i64),
                             if folder_count == 1 { "" } else { "s" }
-                        ));
+                        );
                     }
                     if file_count > 0 {
                         if !status.is_empty() {
                             status.push_str(", ");
                         }
-                        status.push_str(&format!(
+                        let _ = write!(
+                            status,
                             "{} file{} ({})",
                             format_number(file_count as i64),
                             if file_count == 1 { "" } else { "s" },
                             format_size(total_size)
-                        ));
+                        );
                     }
                     if status.is_empty() {
-                        status = "Empty folder".to_string();
+                        status.push_str("Empty folder");
                     }
 
                     if node.loading {

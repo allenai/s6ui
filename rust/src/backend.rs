@@ -26,14 +26,14 @@ pub trait Backend: Send {
     );
 
     /// Request object content (for preview).
-    /// `max_bytes` limits download size (0 = no limit).
+    /// `max_bytes` limits download size (`None` = no limit).
     /// `low_priority` = true for background prefetch.
     /// `cancellable` = true means this request can be cancelled by newer hover prefetches.
     fn get_object(
         &self,
         bucket: &str,
         key: &str,
-        max_bytes: usize,
+        max_bytes: Option<usize>,
         low_priority: bool,
         cancellable: bool,
     );

@@ -78,7 +78,7 @@ pub struct BrowserModel {
 
     // Profiles
     profiles: Vec<AWSProfile>,
-    selected_profile_idx: i32,
+    selected_profile_idx: usize,
 
     // Buckets
     buckets: Vec<S3Bucket>,
@@ -157,29 +157,14 @@ impl BrowserModel {
         self.selected_profile_idx = 0;
 
         // Check AWS_PROFILE env
-        if let Ok(env_profile) = std::env::var("AWS_PROFILE") {
-            for (i, p) in self.profiles.iter().enumerate() {
-                if p.name == env_profile {
-                    self.selected_profile_idx = i as i32;
-                    break;
-                }
-            }
-        } else {
-            // Look for "default" profile
-            for (i, p) in self.profiles.iter().enumerate() {
-                if p.name == "default" {
-                    self.selected_profile_idx = i as i32;
-                    break;
-                }
-            }
+        let target = std::env::var("AWS_PROFILE").unwrap_or_else(|_| "default".to_string());
+        if let Some(idx) = self.profiles.iter().position(|p| p.name == target) {
+            self.selected_profile_idx = idx;
         }
     }
 
-    pub fn select_profile(&mut self, index: i32) {
-        if index < 0 || index >= self.profiles.len() as i32 {
-            return;
-        }
-        if index == self.selected_profile_idx {
+    pub fn select_profile(&mut self, index: usize) {
+        if index >= self.profiles.len() || index == self.selected_profile_idx {
             return;
         }
 
@@ -194,7 +179,7 @@ impl BrowserModel {
         self.refresh();
     }
 
-    pub fn selected_profile_index(&self) -> i32 {
+    pub fn selected_profile_index(&self) -> usize {
         self.selected_profile_idx
     }
 
@@ -215,14 +200,9 @@ impl BrowserModel {
             return;
         }
 
-        let profile_name = if self.selected_profile_idx >= 0
-            && (self.selected_profile_idx as usize) < self.profiles.len()
-        {
-            self.profiles[self.selected_profile_idx as usize]
-                .name
-                .clone()
-        } else {
-            return;
+        let profile_name = match self.profiles.get(self.selected_profile_idx) {
+            Some(p) => p.name.clone(),
+            None => return,
         };
 
         if profile_name.is_empty() {
@@ -258,12 +238,9 @@ impl BrowserModel {
     }
 
     pub fn top_frecent_paths(&self, count: usize) -> Vec<String> {
-        let profile_name = if self.selected_profile_idx >= 0
-            && (self.selected_profile_idx as usize) < self.profiles.len()
-        {
-            &self.profiles[self.selected_profile_idx as usize].name
-        } else {
-            return vec![];
+        let profile_name = match self.profiles.get(self.selected_profile_idx) {
+            Some(p) => &p.name,
+            None => return vec![],
         };
 
         let entries = match self.settings.frecent_paths.get(profile_name) {
@@ -393,18 +370,18 @@ impl BrowserModel {
             return;
         }
 
-        let mut new_prefix = self.current_prefix.clone();
-        if new_prefix.ends_with('/') {
-            new_prefix.pop();
+        let mut prefix = self.current_prefix.clone();
+        if prefix.ends_with('/') {
+            prefix.pop();
         }
-
-        new_prefix = match new_prefix.rfind('/') {
+        prefix = match prefix.rfind('/') {
             None => String::new(),
-            Some(pos) => new_prefix[..pos + 1].to_string(),
+            Some(pos) => prefix[..pos + 1].to_string(),
         };
 
+        // Clone bucket to avoid borrow conflict with self.navigate_into
         let bucket = self.current_bucket.clone();
-        self.navigate_into(&bucket, &new_prefix);
+        self.navigate_into(&bucket, &prefix);
     }
 
     pub fn navigate_into(&mut self, bucket: &str, prefix: &str) {
@@ -419,18 +396,18 @@ impl BrowserModel {
 
         // Check if folder already loaded for prefetch/pagination resume
         let key = make_node_key(bucket, prefix);
-        if let Some(node) = self.nodes.get(&key) {
-            if node.loaded {
-                let objects: Vec<S3Object> = node.objects.clone();
-                let is_truncated = node.is_truncated;
-                let loading = node.loading;
+        let (should_prefetch, should_load_more) = match self.nodes.get(&key) {
+            Some(node) if node.loaded => (true, node.is_truncated && !node.loading),
+            _ => (false, false),
+        };
 
-                self.trigger_prefetch(bucket, &objects);
-
-                if is_truncated && !loading {
-                    self.load_more(bucket, prefix);
-                }
-            }
+        if should_prefetch {
+            // Clone the objects for prefetch to avoid borrow conflict
+            let objects: Vec<S3Object> = self.nodes[&key].objects.clone();
+            self.trigger_prefetch(bucket, &objects);
+        }
+        if should_load_more {
+            self.load_more(bucket, prefix);
         }
     }
 
@@ -492,7 +469,7 @@ impl BrowserModel {
             self.preview_loading = true;
             self.pending_object_requests.insert(cache_key);
             if let Some(ref backend) = self.backend {
-                backend.get_object(bucket, key, PREVIEW_MAX_BYTES, false, false);
+                backend.get_object(bucket, key, Some(PREVIEW_MAX_BYTES), false, false);
             }
         } else {
             self.preview_loading = false;
@@ -520,7 +497,7 @@ impl BrowserModel {
 
         self.last_hovered_file = cache_key;
         if let Some(ref backend) = self.backend {
-            backend.get_object(bucket, key, PREVIEW_MAX_BYTES, true, true);
+            backend.get_object(bucket, key, Some(PREVIEW_MAX_BYTES), true, true);
         }
     }
 
@@ -750,13 +727,17 @@ impl BrowserModel {
                     content,
                 } => {
                     let cache_key = make_preview_cache_key(&bucket, &key);
-                    self.preview_cache.insert(cache_key.clone(), content.clone());
                     self.pending_object_requests.remove(&cache_key);
 
-                    if bucket == self.selected_bucket && key == self.selected_key {
-                        self.preview_content = content;
+                    let is_selected = bucket == self.selected_bucket && key == self.selected_key;
+                    if is_selected {
+                        self.preview_content = content.clone();
                         self.preview_loading = false;
                         self.preview_error.clear();
+                    }
+                    self.preview_cache.insert(cache_key, content);
+
+                    if is_selected {
 
                         let should_start = self.streaming_preview.is_none()
                             || self

@@ -11,7 +11,6 @@ use winit::{
     window::{Window, WindowId},
 };
 
-use s6ui::aws::credentials::load_aws_profiles;
 use s6ui::aws::s3_backend::S3Backend;
 use s6ui::model::BrowserModel;
 use s6ui::settings::{load_settings, save_settings};
@@ -127,9 +126,9 @@ impl AppWindow {
         model.set_settings(settings);
 
         // Create backend with selected profile
-        let profiles = load_aws_profiles();
+        let profiles = model.profiles();
         if !profiles.is_empty() {
-            let idx = model.selected_profile_index() as usize;
+            let idx = model.selected_profile_index();
             let profile = if idx < profiles.len() {
                 profiles[idx].clone()
             } else {
