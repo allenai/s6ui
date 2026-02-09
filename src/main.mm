@@ -15,6 +15,7 @@
 
 #include "browser_model.h"
 #include "browser_ui.h"
+#include "browser_tui.h"
 #include "aws/s3_backend.h"
 #include "settings.h"
 #include "loguru.hpp"
@@ -25,6 +26,7 @@
 #include <memory>
 #include <vector>
 #include <climits>
+#include <unistd.h>
 
 static void glfw_error_callback(int error, const char* description)
 {
@@ -41,9 +43,10 @@ int main(int argc, char* argv[])
         }
     }
 
-    // Check for verbose flag, debug flag, endpoint URL, lag, and S3 path, filter before passing to loguru
+    // Check for verbose flag, debug flag, TUI mode, endpoint URL, lag, and S3 path, filter before passing to loguru
     bool verbose = false;
     bool showDebugWindow = false;
+    bool tuiMode = false;
     std::string initialPath;
     std::string endpointUrl;
     float requestLag = 0.0f;
@@ -54,6 +57,8 @@ int main(int argc, char* argv[])
             verbose = true;
         } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--debug") == 0) {
             showDebugWindow = true;
+        } else if (strcmp(argv[i], "--tui") == 0) {
+            tuiMode = true;
         } else if (strcmp(argv[i], "--endpoint-url") == 0 && i + 1 < argc) {
             endpointUrl = argv[++i];
         } else if (strcmp(argv[i], "--lag") == 0 && i + 1 < argc) {
@@ -125,7 +130,34 @@ int main(int argc, char* argv[])
         }
     }
 
-    // Create UI
+    // Launch TUI mode if requested
+    if (tuiMode) {
+        LOG_F(INFO, "Starting TUI mode");
+        BrowserTUI tui(model);
+
+        // TUI render loop
+        while (!tui.shouldQuit()) {
+            // Process any pending events from backend
+            model.processEvents();
+
+            // Handle input (non-blocking)
+            int ch = getch();
+            if (ch != ERR) {
+                tui.handleInput(ch);
+            }
+
+            // Render
+            tui.render();
+
+            // Small delay for CPU efficiency (~60fps)
+            usleep(16000);
+        }
+
+        LOG_F(INFO, "TUI mode exiting");
+        return 0;
+    }
+
+    // Create GUI
     BrowserUI ui(model);
 
     // Setup GLFW

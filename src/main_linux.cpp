@@ -9,6 +9,7 @@
 
 #include "browser_model.h"
 #include "browser_ui.h"
+#include "browser_tui.h"
 #include "aws/s3_backend.h"
 #include "settings.h"
 #include "loguru.hpp"
@@ -35,7 +36,25 @@ static void glfw_error_callback(int error, const char* description)
 
 int main(int argc, char* argv[])
 {
-    // Check for --version flag first
+    // Check for --help flag first
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("s6ui %s - Fast AWS S3 Browser\n\n", VERSION_STRING);
+            printf("Usage: %s [options] [s3://bucket/path]\n\n", argv[0]);
+            printf("Options:\n");
+            printf("  -h, --help            Show this help message and exit\n");
+            printf("  --version             Show version information and exit\n");
+            printf("  -v, --verbose         Enable verbose logging\n");
+            printf("  -d, --debug           Show ImGui debug/metrics window\n");
+            printf("  --tui                 Run in terminal UI mode\n");
+            printf("  --endpoint-url <url>  Use custom S3 endpoint URL\n");
+            printf("  s3://bucket/path      Initial S3 path to navigate to\n");
+            printf("\n");
+            return 0;
+        }
+    }
+
+    // Check for --version flag
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--version") == 0) {
             printf("s6ui %s\n", VERSION_STRING);
@@ -43,9 +62,10 @@ int main(int argc, char* argv[])
         }
     }
 
-    // Check for verbose flag, debug flag, endpoint URL, and S3 path, filter before passing to loguru
+    // Check for verbose flag, debug flag, TUI mode, endpoint URL, and S3 path, filter before passing to loguru
     bool verbose = false;
     bool showDebugWindow = false;
+    bool tuiMode = false;
     std::string initialPath;
     std::string endpointUrl;
     std::vector<char*> filtered_argv;
@@ -55,6 +75,8 @@ int main(int argc, char* argv[])
             verbose = true;
         } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--debug") == 0) {
             showDebugWindow = true;
+        } else if (strcmp(argv[i], "--tui") == 0) {
+            tuiMode = true;
         } else if (strcmp(argv[i], "--endpoint-url") == 0 && i + 1 < argc) {
             endpointUrl = argv[++i];
         } else if (strncmp(argv[i], "s3://", 5) == 0 || strncmp(argv[i], "s3:", 3) == 0) {
@@ -119,7 +141,34 @@ int main(int argc, char* argv[])
         }
     }
 
-    // Create UI
+    // Launch TUI mode if requested
+    if (tuiMode) {
+        LOG_F(INFO, "Starting TUI mode");
+        BrowserTUI tui(model);
+
+        // TUI render loop
+        while (!tui.shouldQuit()) {
+            // Process any pending events from backend
+            model.processEvents();
+
+            // Handle input (non-blocking)
+            int ch = getch();
+            if (ch != ERR) {
+                tui.handleInput(ch);
+            }
+
+            // Render
+            tui.render();
+
+            // Small delay for CPU efficiency (~60fps)
+            usleep(16000);
+        }
+
+        LOG_F(INFO, "TUI mode exiting");
+        return 0;
+    }
+
+    // Create GUI
     BrowserUI ui(model);
 
     // Setup GLFW

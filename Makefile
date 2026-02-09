@@ -79,10 +79,12 @@ ifeq ($(UNAME_S), Darwin)
 	LDFLAGS += -framework CoreVideo
 	LDFLAGS += -framework QuartzCore
 	LDFLAGS += -framework Security
+	LDFLAGS += -lncurses
 else
 	LDFLAGS += -lGL
 	LDFLAGS += -ldl
 	LDFLAGS += -lpthread
+	LDFLAGS += -lncursesw
 endif
 
 # Source files
@@ -129,9 +131,14 @@ else
 	IMAGE_TEXTURE_SOURCES = $(PREVIEW_DIR)/image_texture_opengl.cpp
 endif
 
+TUI_PREVIEW_SOURCES = $(SRC_DIR)/tui_text_preview.cpp \
+                      $(SRC_DIR)/tui_jsonl_preview.cpp
+
 APP_SOURCES = $(SRC_DIR)/browser_model.cpp \
               $(SRC_DIR)/browser_ui.cpp \
+              $(SRC_DIR)/browser_tui.cpp \
               $(SRC_DIR)/streaming_preview.cpp \
+              $(TUI_PREVIEW_SOURCES) \
               $(SRC_DIR)/settings.cpp \
               $(PREVIEW_SOURCES)
 
