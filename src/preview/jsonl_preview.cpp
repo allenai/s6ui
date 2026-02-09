@@ -48,17 +48,19 @@ void JsonlPreviewRenderer::render(const PreviewContext& ctx) {
         m_currentKey = fullKey;
         m_currentLine = 0;
         m_formattedLineIndex = SIZE_MAX;
-        m_formattedCache.clear();
-        m_textFieldCache.clear();
-        m_textFieldName.clear();
-        m_validatedFirstLine = false;
-        // Close all viewers
+        // Close all viewers BEFORE clearing strings they may reference
         m_rawViewer.close();
         m_jsonViewer.close();
         m_textViewer.close();
         m_jsonSP.reset();
         m_textSP.reset();
         m_incompleteSP.reset();
+        // Now safe to clear strings
+        m_formattedCache.clear();
+        m_textFieldCache.clear();
+        m_textFieldName.clear();
+        m_validatedFirstLine = false;
+        m_fallbackKey.clear();
         m_rawViewerKey.clear();
         m_jsonViewerLine = SIZE_MAX;
         m_textViewerLine = SIZE_MAX;
@@ -158,6 +160,9 @@ void JsonlPreviewRenderer::render(const PreviewContext& ctx) {
                 incompleteViewer.render(availSize.x, availSize.y);
             }
         } else if (m_rawMode) {
+            // Clean up incomplete state if we transitioned to complete
+            m_incompleteSP.reset();
+
             // Raw mode - open the main streaming temp file and scroll to current line
             if (m_rawViewerKey != fullKey) {
                 m_rawViewer.close();
@@ -179,6 +184,9 @@ void JsonlPreviewRenderer::render(const PreviewContext& ctx) {
                 m_rawViewer.render(availSize.x, availSize.y);
             }
         } else {
+            // Clean up incomplete state if we transitioned to complete
+            m_incompleteSP.reset();
+
             // Formatted mode - show pretty-printed JSON (and extract text field)
             if (m_formattedLineIndex != m_currentLine) {
                 updateCache(lineContent);
@@ -312,6 +320,14 @@ void JsonlPreviewRenderer::updateCache(const std::string& rawJson) {
         m_textFieldCache = extractTextField(rawJson, m_textFieldName);
     } catch (const nlohmann::json::parse_error& e) {
         m_formattedCache = std::string("(Invalid JSON: ") + e.what() + ")\n\n" + rawJson;
+        m_textFieldCache.clear();
+        m_textFieldName.clear();
+    } catch (const std::exception& e) {
+        m_formattedCache = std::string("(Error: ") + e.what() + ")";
+        m_textFieldCache.clear();
+        m_textFieldName.clear();
+    } catch (...) {
+        m_formattedCache = "(Error formatting JSON)";
         m_textFieldCache.clear();
         m_textFieldName.clear();
     }

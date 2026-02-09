@@ -701,8 +701,16 @@ bool BrowserModel::processEvents() {
                     m_previewLoading = false;
                     m_previewError.clear();
 
-                    // Always create StreamingFilePreview for unified data access
-                    startStreamingDownload(static_cast<size_t>(m_selectedFileSize));
+                    // Only start streaming if not already streaming this file.
+                    // Duplicate ObjectContentLoaded events can arrive when a prefetch
+                    // was already in-flight and a new high-priority request was also sent.
+                    // Restarting the stream would cancel the in-progress download and
+                    // cause data loss from already-queued chunk events.
+                    if (!m_streamingPreview ||
+                        m_streamingPreview->bucket() != payload.bucket ||
+                        m_streamingPreview->key() != payload.key) {
+                        startStreamingDownload(static_cast<size_t>(m_selectedFileSize));
+                    }
                 }
                 break;
             }

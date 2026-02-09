@@ -328,18 +328,26 @@ void StreamingFilePreview::writeToTempFile(const char* data, size_t len) {
 
     if (m_fd < 0 || len == 0) return;
 
-    // Write data
-    ssize_t written = write(m_fd, data, len);
-    if (written < 0) {
-        LOG_F(ERROR, "StreamingFilePreview: write failed: %s", strerror(errno));
-        return;
+    // Write all data, handling partial writes
+    size_t totalWritten = 0;
+    while (totalWritten < len) {
+        ssize_t written = write(m_fd, data + totalWritten, len - totalWritten);
+        if (written < 0) {
+            if (errno == EINTR) continue;
+            LOG_F(ERROR, "StreamingFilePreview: write failed: %s", strerror(errno));
+            break;
+        }
+        if (written == 0) break;
+        totalWritten += static_cast<size_t>(written);
     }
 
-    // Index newlines in the data we just wrote
-    size_t baseOffset = m_bytesWritten;
-    indexNewlines(data, len, baseOffset);
+    if (totalWritten == 0) return;
 
-    m_bytesWritten += static_cast<size_t>(written);
+    // Index newlines only in the data we actually wrote
+    size_t baseOffset = m_bytesWritten;
+    indexNewlines(data, totalWritten, baseOffset);
+
+    m_bytesWritten += totalWritten;
 }
 
 void StreamingFilePreview::indexNewlines(const char* data, size_t len, size_t baseOffset) {
@@ -402,6 +410,11 @@ std::string StreamingFilePreview::getLine(size_t lineIndex) const {
         endOffset = m_lineOffsets[lineIndex + 1] - 1;
     } else {
         // Last line - end at current write position
+        endOffset = m_bytesWritten;
+    }
+
+    // Clamp endOffset to what's actually written
+    if (endOffset > m_bytesWritten) {
         endOffset = m_bytesWritten;
     }
 
