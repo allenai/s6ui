@@ -1,13 +1,23 @@
+mod aws;
+mod backend;
+mod events;
+mod model;
+mod ui;
+
+use aws::credentials;
+use aws::s3_backend::S3Backend;
 use dear_imgui_rs::*;
 use dear_imgui_wgpu::WgpuRenderer;
 use dear_imgui_winit::WinitPlatform;
+use model::BrowserModel;
 use pollster::block_on;
 use std::{sync::Arc, time::Instant};
+use ui::BrowserUI;
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
     event::WindowEvent,
-    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     window::{Window, WindowId},
 };
 
@@ -28,9 +38,62 @@ struct AppWindow {
     imgui: ImguiState,
 }
 
-#[derive(Default)]
 struct App {
     window: Option<AppWindow>,
+    model: BrowserModel,
+    browser_ui: BrowserUI,
+    runtime: tokio::runtime::Runtime,
+    event_proxy: Option<EventLoopProxy<()>>,
+    backend_initialized: bool,
+}
+
+impl App {
+    fn new(event_proxy: EventLoopProxy<()>) -> Self {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime");
+
+        let mut model = BrowserModel::new();
+        model.profiles = credentials::load_aws_profiles();
+        model.selected_profile_idx = credentials::default_profile_index(&model.profiles);
+
+        Self {
+            window: None,
+            model,
+            browser_ui: BrowserUI::new(),
+            runtime,
+            event_proxy: Some(event_proxy),
+            backend_initialized: false,
+        }
+    }
+
+    fn init_backend(&mut self) {
+        if self.backend_initialized || self.model.profiles.is_empty() {
+            return;
+        }
+
+        let profile = self.model.profiles[self.model.selected_profile_idx].clone();
+        if let Some(proxy) = self.event_proxy.clone() {
+            let backend = S3Backend::new(profile, self.runtime.handle().clone(), proxy);
+            self.model.set_backend(Box::new(backend));
+            self.model.refresh();
+            self.backend_initialized = true;
+        }
+    }
+
+    fn recreate_backend(&mut self) {
+        if self.model.profiles.is_empty() {
+            return;
+        }
+        let profile = self.model.profiles[self.model.selected_profile_idx].clone();
+        if let Some(proxy) = self.event_proxy.clone() {
+            let backend = S3Backend::new(profile, self.runtime.handle().clone(), proxy);
+            self.model.set_backend(Box::new(backend));
+            self.model.refresh();
+        }
+    }
 }
 
 impl AppWindow {
@@ -93,8 +156,8 @@ impl AppWindow {
 
         let init_info =
             dear_imgui_wgpu::WgpuInitInfo::new(device.clone(), queue.clone(), surface_desc.format);
-        let mut renderer =
-            WgpuRenderer::new(init_info, &mut context).expect("Failed to initialize WGPU renderer");
+        let mut renderer = WgpuRenderer::new(init_info, &mut context)
+            .expect("Failed to initialize WGPU renderer");
         renderer.set_gamma_mode(dear_imgui_wgpu::GammaMode::Auto);
 
         let imgui = ImguiState {
@@ -128,10 +191,17 @@ impl AppWindow {
         }
     }
 
-    fn render(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    fn render(
+        &mut self,
+        model: &mut BrowserModel,
+        browser_ui: &mut BrowserUI,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let now = Instant::now();
         let delta_time = now - self.imgui.last_frame;
-        self.imgui.context.io_mut().set_delta_time(delta_time.as_secs_f32());
+        self.imgui
+            .context
+            .io_mut()
+            .set_delta_time(delta_time.as_secs_f32());
         self.imgui.last_frame = now;
 
         let frame = match self.surface.get_current_texture() {
@@ -149,18 +219,19 @@ impl AppWindow {
             .prepare_frame(&self.window, &mut self.imgui.context);
         let ui = self.imgui.context.frame();
 
-        // Main window
-        ui.window("s6ui")
-            .size([400.0, 200.0], Condition::FirstUseEver)
-            .build(|| {
-                ui.text("S3 Browser - Rust Port");
-                ui.separator();
-                ui.text(format!(
-                    "{:.1} FPS ({:.3} ms/frame)",
-                    ui.io().framerate(),
-                    1000.0 / ui.io().framerate(),
-                ));
-            });
+        // Process backend events
+        model.process_events();
+
+        // Get window size for UI
+        let size = self.window.inner_size();
+        let scale = self.imgui.platform.hidpi_factor();
+        let window_size = [
+            size.width as f32 / scale as f32,
+            size.height as f32 / scale as f32,
+        ];
+
+        // Render browser UI
+        browser_ui.render(ui, model, window_size);
 
         let view = frame
             .texture
@@ -207,16 +278,26 @@ impl AppWindow {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<()> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
             match AppWindow::new(event_loop) {
-                Ok(window) => self.window = Some(window),
+                Ok(window) => {
+                    self.window = Some(window);
+                    self.init_backend();
+                }
                 Err(e) => {
                     eprintln!("Failed to create window: {e}");
                     event_loop.exit();
                 }
             }
+        }
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
+        // Backend pushed events - request redraw
+        if let Some(window) = &self.window {
+            window.window.request_redraw();
         }
     }
 
@@ -226,33 +307,48 @@ impl ApplicationHandler for App {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
-        let window = match self.window.as_mut() {
-            Some(w) => w,
-            None => return,
-        };
+        if self.window.is_none() {
+            return;
+        }
 
-        window.imgui.platform.handle_window_event(
-            &mut window.imgui.context,
-            &window.window,
-            &event,
-        );
+        // Handle platform events
+        {
+            let window = self.window.as_mut().unwrap();
+            window.imgui.platform.handle_window_event(
+                &mut window.imgui.context,
+                &window.window,
+                &event,
+            );
+        }
 
         match event {
             WindowEvent::Resized(size) => {
+                let window = self.window.as_mut().unwrap();
                 window.resize(size);
                 window.window.request_redraw();
             }
             WindowEvent::ScaleFactorChanged { .. } => {
+                let window = self.window.as_mut().unwrap();
                 let new_size = window.window.inner_size();
                 window.resize(new_size);
                 window.window.request_redraw();
             }
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => {
-                if let Err(e) = window.render() {
-                    eprintln!("Render error: {e}");
+                let prev_profile = self.model.selected_profile_idx;
+
+                {
+                    let window = self.window.as_mut().unwrap();
+                    if let Err(e) = window.render(&mut self.model, &mut self.browser_ui) {
+                        eprintln!("Render error: {e}");
+                    }
                 }
-                window.window.request_redraw();
+
+                if self.model.selected_profile_idx != prev_profile {
+                    self.recreate_backend();
+                }
+
+                self.window.as_ref().unwrap().window.request_redraw();
             }
             _ => {}
         }
@@ -266,8 +362,10 @@ impl ApplicationHandler for App {
 }
 
 fn main() {
-    let event_loop = EventLoop::new().unwrap();
+    let event_loop = EventLoop::<()>::with_user_event().build().unwrap();
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::default();
+
+    let proxy = event_loop.create_proxy();
+    let mut app = App::new(proxy);
     event_loop.run_app(&mut app).unwrap();
 }
