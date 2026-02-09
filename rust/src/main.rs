@@ -38,6 +38,52 @@ struct AppWindow {
     imgui: ImguiState,
 }
 
+/// Parsed command-line options
+struct CliOptions {
+    verbose: bool,
+    debug: bool,
+    initial_path: Option<String>,
+}
+
+fn parse_args() -> CliOptions {
+    let args: Vec<String> = std::env::args().collect();
+
+    // First pass: check for --version
+    for arg in &args[1..] {
+        if arg == "--version" {
+            let version = env!("CARGO_PKG_VERSION");
+            println!("s6ui {version}");
+            std::process::exit(0);
+        }
+    }
+
+    let mut opts = CliOptions {
+        verbose: false,
+        debug: false,
+        initial_path: None,
+    };
+
+    for arg in &args[1..] {
+        match arg.as_str() {
+            "-v" | "--verbose" => opts.verbose = true,
+            "-d" | "--debug" => opts.debug = true,
+            a if a.starts_with("s3://") || a.starts_with("s3:") => {
+                opts.initial_path = Some(a.to_string());
+            }
+            other => {
+                eprintln!("Unknown argument: {other}");
+                eprintln!("Usage: s6ui [OPTIONS] [s3://bucket/prefix]");
+                eprintln!("  --version       Show version and exit");
+                eprintln!("  -v, --verbose   Enable verbose logging to stderr");
+                eprintln!("  -d, --debug     Show ImGui debug/metrics window");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    opts
+}
+
 struct App {
     window: Option<AppWindow>,
     model: BrowserModel,
@@ -45,10 +91,12 @@ struct App {
     runtime: tokio::runtime::Runtime,
     event_proxy: Option<EventLoopProxy<()>>,
     backend_initialized: bool,
+    show_debug_window: bool,
+    initial_path: Option<String>,
 }
 
 impl App {
-    fn new(event_proxy: EventLoopProxy<()>) -> Self {
+    fn new(event_proxy: EventLoopProxy<()>, opts: CliOptions) -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .enable_all()
@@ -66,6 +114,8 @@ impl App {
             runtime,
             event_proxy: Some(event_proxy),
             backend_initialized: false,
+            show_debug_window: opts.debug,
+            initial_path: opts.initial_path,
         }
     }
 
@@ -78,7 +128,12 @@ impl App {
         if let Some(proxy) = self.event_proxy.clone() {
             let backend = S3Backend::new(profile, self.runtime.handle().clone(), proxy);
             self.model.set_backend(Box::new(backend));
-            self.model.refresh();
+
+            if let Some(path) = self.initial_path.take() {
+                self.model.navigate_to(&path);
+            } else {
+                self.model.refresh();
+            }
             self.backend_initialized = true;
         }
     }
@@ -195,6 +250,7 @@ impl AppWindow {
         &mut self,
         model: &mut BrowserModel,
         browser_ui: &mut BrowserUI,
+        show_debug_window: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let now = Instant::now();
         let delta_time = now - self.imgui.last_frame;
@@ -232,6 +288,11 @@ impl AppWindow {
 
         // Render browser UI
         browser_ui.render(ui, model, window_size);
+
+        if show_debug_window {
+            let mut open = true;
+            ui.show_metrics_window(&mut open);
+        }
 
         let view = frame
             .texture
@@ -339,7 +400,9 @@ impl ApplicationHandler<()> for App {
 
                 {
                     let window = self.window.as_mut().unwrap();
-                    if let Err(e) = window.render(&mut self.model, &mut self.browser_ui) {
+                    if let Err(e) =
+                        window.render(&mut self.model, &mut self.browser_ui, self.show_debug_window)
+                    {
                         eprintln!("Render error: {e}");
                     }
                 }
@@ -362,10 +425,16 @@ impl ApplicationHandler<()> for App {
 }
 
 fn main() {
+    let opts = parse_args();
+
+    if opts.verbose {
+        eprintln!("s6ui {} - verbose mode enabled", env!("CARGO_PKG_VERSION"));
+    }
+
     let event_loop = EventLoop::<()>::with_user_event().build().unwrap();
     event_loop.set_control_flow(ControlFlow::Poll);
 
     let proxy = event_loop.create_proxy();
-    let mut app = App::new(proxy);
+    let mut app = App::new(proxy, opts);
     event_loop.run_app(&mut app).unwrap();
 }
