@@ -1,5 +1,4 @@
 #include "text_preview.h"
-#include "browser_model.h"
 #include "streaming_preview.h"
 #include "imgui/imgui.h"
 

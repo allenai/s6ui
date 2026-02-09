@@ -132,6 +132,7 @@ endif
 APP_SOURCES = $(SRC_DIR)/browser_model.cpp \
               $(SRC_DIR)/browser_ui.cpp \
               $(SRC_DIR)/streaming_preview.cpp \
+              $(SRC_DIR)/preview_manager.cpp \
               $(SRC_DIR)/settings.cpp \
               $(PREVIEW_SOURCES)
 

@@ -1,5 +1,4 @@
 #include "jsonl_preview.h"
-#include "browser_model.h"
 #include "streaming_preview.h"
 #include "imgui/imgui.h"
 #include "nlohmann/json.hpp"

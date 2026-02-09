@@ -1,5 +1,4 @@
 #include "image_preview.h"
-#include "browser_model.h"
 #include "streaming_preview.h"
 #include "imgui/imgui.h"
 #include "stb/stb_image.h"
@@ -64,7 +63,7 @@ void ImagePreviewRenderer::render(const PreviewContext& ctx) {
 
     // Check if we need to load a new image
     std::string fullKey = ctx.bucket + "/" + ctx.key;
-    const std::string& content = ctx.model.previewContent();
+    const std::string& content = ctx.previewContent;
 
     if (content.empty()) {
         ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "(empty file)");
@@ -73,7 +72,7 @@ void ImagePreviewRenderer::render(const PreviewContext& ctx) {
 
     // For images, we need the complete file data before we can decode
     // Check if we're still downloading
-    int64_t totalSize = ctx.model.selectedFileSize();
+    int64_t totalSize = ctx.selectedFileSize;
     bool downloadComplete = true;
 
     if (ctx.streamingPreview) {

@@ -2,17 +2,18 @@
 
 #include <memory>
 #include <string>
+#include <cstdint>
 
-class BrowserModel;
 class StreamingFilePreview;
 
 // Context passed to preview renderers each frame
 struct PreviewContext {
-    BrowserModel& model;
     const std::string& bucket;
     const std::string& key;
     const std::string& filename;
     std::shared_ptr<StreamingFilePreview> streamingPreview;  // May be null
+    const std::string& previewContent;   // raw content for image decoder
+    int64_t selectedFileSize;            // total file size
     float width;
     float height;
 };

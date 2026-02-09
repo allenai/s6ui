@@ -292,7 +292,7 @@ void BrowserUI::renderFolderContents() {
                 // Render file
                 std::string label = "    " + obj.display_name + "  (" + formatSize(obj.size) + ")";
                 // Check if this file is selected
-                bool isSelected = (m_model.selectedBucket() == bucket && m_model.selectedKey() == obj.key);
+                bool isSelected = (m_model.preview().selectedBucket() == bucket && m_model.preview().selectedKey() == obj.key);
                 if (ImGui::Selectable(label.c_str(), isSelected)) {
                     m_model.selectFile(bucket, obj.key);
                 }
@@ -415,7 +415,9 @@ void BrowserUI::renderStatusBar() {
 void BrowserUI::renderPreviewPane(float width, float height) {
     ImGui::BeginChild("PreviewPane", ImVec2(width, height), true);
 
-    if (!m_model.hasSelection()) {
+    auto& preview = m_model.preview();
+
+    if (!preview.hasSelection()) {
         // No file selected - reset active renderer
         if (m_activeRenderer) {
             m_activeRenderer->reset();
@@ -423,11 +425,11 @@ void BrowserUI::renderPreviewPane(float width, float height) {
         }
         ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Select a file to preview");
     } else {
-        const std::string& key = m_model.selectedKey();
+        const std::string& key = preview.selectedKey();
         size_t lastSlash = key.rfind('/');
         std::string filename = (lastSlash != std::string::npos) ? key.substr(lastSlash + 1) : key;
 
-        if (!m_model.previewSupported()) {
+        if (!preview.previewSupported()) {
             if (m_activeRenderer) {
                 m_activeRenderer->reset();
                 m_activeRenderer = nullptr;
@@ -438,11 +440,11 @@ void BrowserUI::renderPreviewPane(float width, float height) {
             ImGui::Spacing();
             ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
                 "Supported: .txt, .md, .html, .htm, .json, .jsonl");
-        } else if (m_model.previewLoading()) {
+        } else if (preview.previewLoading()) {
             ImGui::Text("Preview: %s", filename.c_str());
             ImGui::Separator();
             ImGui::TextColored(ImVec4(0.5f, 0.5f, 1.0f, 1.0f), "Loading preview...");
-        } else if (!m_model.previewError().empty()) {
+        } else if (!preview.previewError().empty()) {
             if (m_activeRenderer) {
                 m_activeRenderer->reset();
                 m_activeRenderer = nullptr;
@@ -450,7 +452,7 @@ void BrowserUI::renderPreviewPane(float width, float height) {
             ImGui::Text("Preview: %s", filename.c_str());
             ImGui::Separator();
             ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
-                "Error: %s", m_model.previewError().c_str());
+                "Error: %s", preview.previewError().c_str());
         } else {
             // Find appropriate renderer
             IPreviewRenderer* renderer = nullptr;
@@ -459,12 +461,12 @@ void BrowserUI::renderPreviewPane(float width, float height) {
                 if (r->canHandle(key)) {
                     // Special case: JSONL renderer needs streaming preview and valid JSONL content
                     if (dynamic_cast<JsonlPreviewRenderer*>(r.get())) {
-                        if (!m_model.hasStreamingPreview()) {
+                        if (!preview.hasStreamingPreview()) {
                             // If no streaming preview, skip JSONL renderer and use text
                             continue;
                         }
                         // Check if this file was determined to not be valid JSONL
-                        if (r->wantsFallback(m_model.selectedBucket(), key)) {
+                        if (r->wantsFallback(preview.selectedBucket(), key)) {
                             continue;
                         }
                     }
@@ -483,12 +485,14 @@ void BrowserUI::renderPreviewPane(float width, float height) {
                 }
 
                 ImVec2 availSize = ImGui::GetContentRegionAvail();
+                std::string content = preview.previewContent();
                 PreviewContext ctx{
-                    m_model,
-                    m_model.selectedBucket(),
+                    preview.selectedBucket(),
                     key,
                     filename,
-                    m_model.streamingPreview(),
+                    preview.streamingPreview(),
+                    content,
+                    preview.selectedFileSize(),
                     availSize.x,
                     availSize.y
                 };
