@@ -1,4 +1,4 @@
-use crate::model::BrowserModel;
+use crate::model::{BrowserModel, PreviewStatus};
 use dear_imgui_rs::*;
 use std::borrow::Cow;
 
@@ -230,8 +230,8 @@ impl BrowserUI {
                     }
                 } else {
                     let label = format!("    {}  ({})", obj.display_name, format_size(obj.size));
-                    let is_selected =
-                        model.selected_bucket == bucket && model.selected_key == obj.key;
+                    let preview_key = format!("{}/{}", bucket, obj.key);
+                    let is_selected = model.selected_preview.as_ref() == Some(&preview_key);
                     if ui.selectable_config(label).selected(is_selected).build() {
                         pending_select = Some(obj.key.clone());
                     }
@@ -341,43 +341,41 @@ impl BrowserUI {
             .size([width, height])
             .border(true)
             .build(ui, || {
-                if !model.has_selection() {
-                    ui.text_colored([0.5, 0.5, 0.5, 1.0], "Select a file to preview");
-                } else {
-                    let key = &model.selected_key;
-                    let filename = match key.rfind('/') {
-                        Some(i) => &key[i + 1..],
-                        None => key.as_str(),
-                    };
+                let preview = model.selected_preview();
+                match preview {
+                    None => {
+                        ui.text_colored([0.5, 0.5, 0.5, 1.0], "Select a file to preview");
+                    }
+                    Some(node) => {
+                        let filename = match node.key.rfind('/') {
+                            Some(i) => &node.key[i + 1..],
+                            None => node.key.as_str(),
+                        };
 
-                    if !model.preview_supported {
-                        ui.text(format!("Preview: {}", filename));
-                        ui.separator();
-                        ui.text_colored(
-                            [0.7, 0.7, 0.7, 1.0],
-                            "Preview not supported for this file type",
-                        );
-                    } else if model.preview_loading {
-                        ui.text(format!("Preview: {}", filename));
-                        ui.separator();
-                        ui.text_colored([0.5, 0.5, 1.0, 1.0], "Loading preview...");
-                    } else if !model.preview_error.is_empty() {
-                        ui.text(format!("Preview: {}", filename));
-                        ui.separator();
-                        ui.text_colored(
-                            [1.0, 0.3, 0.3, 1.0],
-                            format!("Error: {}", model.preview_error),
-                        );
-                    } else {
                         ui.text(format!("Preview: {}", filename));
                         ui.separator();
 
-                        // Show content in scrollable text
-                        ui.child_window("PreviewContent")
-                            .flags(WindowFlags::HORIZONTAL_SCROLLBAR)
-                            .build(ui, || {
-                                ui.text(&model.preview_content);
-                            });
+                        match &node.status {
+                            PreviewStatus::Unsupported => {
+                                ui.text_colored(
+                                    [0.7, 0.7, 0.7, 1.0],
+                                    "Preview not supported for this file type",
+                                );
+                            }
+                            PreviewStatus::Loading => {
+                                ui.text_colored([0.5, 0.5, 1.0, 1.0], "Loading preview...");
+                            }
+                            PreviewStatus::Error(err) => {
+                                ui.text_colored([1.0, 0.3, 0.3, 1.0], format!("Error: {}", err));
+                            }
+                            PreviewStatus::Ready => {
+                                ui.child_window("PreviewContent")
+                                    .flags(WindowFlags::HORIZONTAL_SCROLLBAR)
+                                    .build(ui, || {
+                                        ui.text(&node.content);
+                                    });
+                            }
+                        }
                     }
                 }
             });

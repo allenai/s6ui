@@ -1,6 +1,7 @@
 use crate::backend::Backend;
 use crate::events::{S3Bucket, S3Object, StateEvent};
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 /// Loading state for folder data (orthogonal to `loading: bool` which tracks in-flight requests)
 #[derive(Clone, PartialEq)]
@@ -87,7 +88,57 @@ impl FolderNode {
     }
 }
 
+/// Status of a file preview
+#[derive(Clone, PartialEq)]
+pub enum PreviewStatus {
+    /// Request in flight
+    Loading,
+    /// Content loaded successfully
+    Ready,
+    /// File type not supported for preview
+    Unsupported,
+    /// Error loading content
+    Error(String),
+}
+
+/// A cached file preview
+pub struct PreviewNode {
+    pub bucket: String,
+    pub key: String,
+    pub status: PreviewStatus,
+    pub content: String,
+    last_accessed: Instant,
+}
+
+impl PreviewNode {
+    fn new(bucket: String, key: String, status: PreviewStatus) -> Self {
+        Self {
+            bucket,
+            key,
+            status,
+            content: String::new(),
+            last_accessed: Instant::now(),
+        }
+    }
+
+    pub fn touch(&mut self) {
+        self.last_accessed = Instant::now();
+    }
+
+    pub fn is_loading(&self) -> bool {
+        matches!(self.status, PreviewStatus::Loading)
+    }
+
+    pub fn error(&self) -> Option<&str> {
+        match &self.status {
+            PreviewStatus::Error(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
 const PREVIEW_MAX_BYTES: usize = 64 * 1024;
+const PREVIEW_CACHE_MAX_ENTRIES: usize = 50;
 
 /// The browser model - owns state and processes commands
 pub struct BrowserModel {
@@ -109,17 +160,9 @@ pub struct BrowserModel {
     pub current_bucket: String,
     pub current_prefix: String,
 
-    // File selection and preview
-    pub selected_bucket: String,
-    pub selected_key: String,
-    pub preview_loading: bool,
-    pub preview_supported: bool,
-    pub preview_content: String,
-    pub preview_error: String,
-
-    // Preview cache
-    preview_cache: HashMap<String, String>,
-    pending_object_requests: HashSet<String>,
+    // Preview cache with LRU eviction
+    previews: HashMap<String, PreviewNode>,
+    pub selected_preview: Option<String>, // key into previews hashmap
 }
 
 impl BrowserModel {
@@ -134,14 +177,8 @@ impl BrowserModel {
             nodes: HashMap::new(),
             current_bucket: String::new(),
             current_prefix: String::new(),
-            selected_bucket: String::new(),
-            selected_key: String::new(),
-            preview_loading: false,
-            preview_supported: false,
-            preview_content: String::new(),
-            preview_error: String::new(),
-            preview_cache: HashMap::new(),
-            pending_object_requests: HashSet::new(),
+            previews: HashMap::new(),
+            selected_preview: None,
         }
     }
 
@@ -154,7 +191,22 @@ impl BrowserModel {
     }
 
     pub fn has_selection(&self) -> bool {
-        !self.selected_key.is_empty()
+        self.selected_preview.is_some()
+    }
+
+    /// Get the currently selected preview node
+    pub fn selected_preview(&self) -> Option<&PreviewNode> {
+        self.selected_preview
+            .as_ref()
+            .and_then(|k| self.previews.get(k))
+    }
+
+    /// Get the currently selected preview node mutably
+    pub fn selected_preview_mut(&mut self) -> Option<&mut PreviewNode> {
+        match &self.selected_preview {
+            Some(k) => self.previews.get_mut(k),
+            None => None,
+        }
     }
 
     /// Process pending events from the backend. Returns true if any were processed.
@@ -239,13 +291,10 @@ impl BrowserModel {
                     content,
                 } => {
                     let cache_key = Self::make_preview_cache_key(&bucket, &key);
-                    self.preview_cache.insert(cache_key.clone(), content.clone());
-                    self.pending_object_requests.remove(&cache_key);
-
-                    if bucket == self.selected_bucket && key == self.selected_key {
-                        self.preview_content = content;
-                        self.preview_loading = false;
-                        self.preview_error.clear();
+                    if let Some(node) = self.previews.get_mut(&cache_key) {
+                        node.content = content;
+                        node.status = PreviewStatus::Ready;
+                        node.touch();
                     }
                 }
                 StateEvent::ObjectContentError {
@@ -254,11 +303,9 @@ impl BrowserModel {
                     error,
                 } => {
                     let cache_key = Self::make_preview_cache_key(&bucket, &key);
-                    self.pending_object_requests.remove(&cache_key);
-
-                    if bucket == self.selected_bucket && key == self.selected_key {
-                        self.preview_loading = false;
-                        self.preview_error = error;
+                    if let Some(node) = self.previews.get_mut(&cache_key) {
+                        node.status = PreviewStatus::Error(error);
+                        node.touch();
                     }
                 }
             }
@@ -271,8 +318,8 @@ impl BrowserModel {
         self.buckets_error.clear();
         self.buckets_loading = true;
         self.nodes.clear();
-        self.preview_cache.clear();
-        self.pending_object_requests.clear();
+        self.previews.clear();
+        self.selected_preview = None;
 
         if let Some(b) = &self.backend {
             b.list_buckets();
@@ -392,42 +439,68 @@ impl BrowserModel {
     }
 
     pub fn select_file(&mut self, bucket: &str, key: &str) {
-        if self.selected_bucket == bucket && self.selected_key == key {
+        let cache_key = Self::make_preview_cache_key(bucket, key);
+
+        // Already selected?
+        if self.selected_preview.as_ref() == Some(&cache_key) {
+            // Touch for LRU
+            if let Some(node) = self.previews.get_mut(&cache_key) {
+                node.touch();
+            }
             return;
         }
 
-        self.selected_bucket = bucket.to_string();
-        self.selected_key = key.to_string();
-        self.preview_content.clear();
-        self.preview_error.clear();
-        self.preview_supported = Self::is_preview_supported(key);
+        self.selected_preview = Some(cache_key.clone());
 
-        if self.preview_supported {
-            // Check cache
-            let cache_key = Self::make_preview_cache_key(bucket, key);
-            if let Some(content) = self.preview_cache.get(&cache_key) {
-                self.preview_content = content.clone();
-                self.preview_loading = false;
-                return;
-            }
+        // Check if already in cache
+        if let Some(node) = self.previews.get_mut(&cache_key) {
+            node.touch();
+            return;
+        }
 
-            self.preview_loading = true;
-            self.pending_object_requests.insert(cache_key);
+        // Determine initial status
+        let status = if Self::is_preview_supported(key) {
+            PreviewStatus::Loading
+        } else {
+            PreviewStatus::Unsupported
+        };
+
+        // Create new preview node
+        let node = PreviewNode::new(bucket.to_string(), key.to_string(), status.clone());
+        self.previews.insert(cache_key.clone(), node);
+
+        // Evict old entries if cache is too large
+        self.evict_old_previews();
+
+        // Start loading if supported
+        if status == PreviewStatus::Loading {
             if let Some(b) = &self.backend {
                 b.get_object(bucket, key, PREVIEW_MAX_BYTES);
             }
-        } else {
-            self.preview_loading = false;
         }
     }
 
     pub fn clear_selection(&mut self) {
-        self.selected_bucket.clear();
-        self.selected_key.clear();
-        self.preview_content.clear();
-        self.preview_error.clear();
-        self.preview_loading = false;
-        self.preview_supported = false;
+        self.selected_preview = None;
+    }
+
+    /// Evict oldest preview entries if cache exceeds limit
+    fn evict_old_previews(&mut self) {
+        while self.previews.len() > PREVIEW_CACHE_MAX_ENTRIES {
+            // Find oldest entry (excluding selected)
+            let oldest = self
+                .previews
+                .iter()
+                .filter(|(k, _)| self.selected_preview.as_ref() != Some(*k))
+                .min_by_key(|(_, v)| v.last_accessed)
+                .map(|(k, _)| k.clone());
+
+            if let Some(key) = oldest {
+                self.previews.remove(&key);
+            } else {
+                break;
+            }
+        }
     }
 
     pub fn select_profile(&mut self, index: usize) {
