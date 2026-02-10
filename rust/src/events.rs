@@ -15,6 +15,8 @@ pub struct S3Object {
     pub is_folder: bool,
 }
 
+use crate::preview::StreamingStatus;
+
 /// Events emitted by the backend for the model to process
 pub enum StateEvent {
     BucketsLoaded {
@@ -42,6 +44,21 @@ pub enum StateEvent {
         content: String,
     },
     ObjectContentError {
+        bucket: String,
+        key: String,
+        error: String,
+    },
+    /// Streaming preview progress update
+    PreviewProgress {
+        bucket: String,
+        key: String,
+        decompressed_bytes: u64,
+        source_bytes: u64,
+        line_count: usize,
+        status: StreamingStatus,
+    },
+    /// Streaming preview error
+    PreviewError {
         bucket: String,
         key: String,
         error: String,

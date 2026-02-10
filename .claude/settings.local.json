@@ -16,7 +16,10 @@
       "Bash(ls:*)",
       "WebSearch",
       "WebFetch(domain:docs.rs)",
-      "Bash(cargo build:*)"
+      "Bash(cargo build:*)",
+      "Bash(wc:*)",
+      "Bash(git log:*)",
+      "Bash(cargo test:*)"
     ]
   }
 }

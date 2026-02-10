@@ -24,3 +24,9 @@ ring = "0.17"
 # S3 Backend
 reqwest = { version = "0.12", features = ["stream", "blocking"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+futures-util = "0.3"
+
+# Streaming preview: decompression + memory mapping
+flate2 = "1.0"
+zstd = "0.13"
+memmap2 = "0.9"

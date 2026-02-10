@@ -36,6 +36,7 @@ impl BrowserUI {
 
                 self.render_left_pane(ui, model, pane_width, pane_height);
                 ui.same_line();
+                // render_preview_pane needs mutable model for continue_download
                 self.render_preview_pane(ui, model, pane_width, pane_height);
             });
     }
@@ -336,7 +337,7 @@ impl BrowserUI {
         }
     }
 
-    fn render_preview_pane(&self, ui: &Ui, model: &BrowserModel, width: f32, height: f32) {
+    fn render_preview_pane(&self, ui: &Ui, model: &mut BrowserModel, width: f32, height: f32) {
         ui.child_window("PreviewPane")
             .size([width, height])
             .border(true)
@@ -352,33 +353,120 @@ impl BrowserUI {
                             None => node.key.as_str(),
                         };
 
+                        // Header with filename and status
                         ui.text(format!("Preview: {}", filename));
+
+                        // Show progress info
+                        let status = node.status();
+                        match &status {
+                            PreviewStatus::Loading => {
+                                ui.same_line();
+                                let bytes = node.bytes_written();
+                                let source = node.source_bytes();
+                                if bytes > 0 {
+                                    ui.text_colored(
+                                        [0.5, 0.5, 1.0, 1.0],
+                                        format!(
+                                            " ({} decompressed from {} source)",
+                                            format_size(bytes as i64),
+                                            format_size(source as i64)
+                                        ),
+                                    );
+                                } else {
+                                    ui.text_colored([0.5, 0.5, 1.0, 1.0], " Loading...");
+                                }
+                            }
+                            PreviewStatus::Ready => {
+                                ui.same_line();
+                                let bytes = node.bytes_written();
+                                let lines = node.line_count();
+                                ui.text_colored(
+                                    [0.5, 0.5, 0.5, 1.0],
+                                    format!(
+                                        " ({}, {} lines)",
+                                        format_size(bytes as i64),
+                                        format_number(lines as i64)
+                                    ),
+                                );
+                            }
+                            _ => {}
+                        }
+
                         ui.separator();
 
-                        match &node.status {
+                        // Get data needed for rendering before we drop the borrow
+                        let line_count = node.line_count();
+                        let can_continue = node.can_continue_download();
+                        let is_complete = node.is_complete();
+
+                        match &status {
                             PreviewStatus::Unsupported => {
                                 ui.text_colored(
                                     [0.7, 0.7, 0.7, 1.0],
                                     "Preview not supported for this file type",
                                 );
                             }
-                            PreviewStatus::Loading => {
-                                ui.text_colored([0.5, 0.5, 1.0, 1.0], "Loading preview...");
-                            }
                             PreviewStatus::Error(err) => {
                                 ui.text_colored([1.0, 0.3, 0.3, 1.0], format!("Error: {}", err));
                             }
-                            PreviewStatus::Ready => {
-                                ui.child_window("PreviewContent")
-                                    .flags(WindowFlags::HORIZONTAL_SCROLLBAR)
-                                    .build(ui, || {
-                                        ui.text(&node.content);
-                                    });
+                            PreviewStatus::Loading | PreviewStatus::Ready => {
+                                if line_count == 0 {
+                                    ui.text_colored([0.5, 0.5, 1.0, 1.0], "Loading...");
+                                } else {
+                                    // Calculate available height for content
+                                    let button_height = if can_continue {
+                                        ui.frame_height_with_spacing() + 8.0
+                                    } else {
+                                        0.0
+                                    };
+                                    let content_height = ui.content_region_avail()[1] - button_height;
+
+                                    // Virtual scrolling content area
+                                    ui.child_window("PreviewContent")
+                                        .size([0.0, content_height])
+                                        .flags(WindowFlags::HORIZONTAL_SCROLLBAR)
+                                        .build(ui, || {
+                                            self.render_preview_lines(ui, model, line_count);
+                                        });
+
+                                    // "Load more" button for prefetch-only downloads
+                                    if can_continue {
+                                        ui.spacing();
+                                        if ui.button("Download full file") {
+                                            model.continue_download();
+                                        }
+                                        ui.same_line();
+                                        ui.text_colored(
+                                            [0.7, 0.7, 0.7, 1.0],
+                                            "(Only first 64KB loaded)",
+                                        );
+                                    } else if !is_complete && matches!(status, PreviewStatus::Loading) {
+                                        ui.spacing();
+                                        ui.text_colored([0.5, 0.5, 1.0, 1.0], "Downloading...");
+                                    }
+                                }
                             }
                         }
                     }
                 }
             });
+    }
+
+    fn render_preview_lines(&self, ui: &Ui, model: &BrowserModel, line_count: usize) {
+        // ListClipper requires items to be rendered during iteration
+        if let Some(node) = model.selected_preview() {
+            let clipper = ListClipper::new(line_count as i32).begin(ui);
+
+            for i in clipper.iter() {
+                // Read and render one line at a time during clipper iteration
+                let lines = node.read_lines(i as usize, 1);
+                if let Some(line) = lines.first() {
+                    ui.text(line);
+                } else {
+                    ui.text("");
+                }
+            }
+        }
     }
 }
 

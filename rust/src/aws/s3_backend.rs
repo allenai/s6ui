@@ -3,10 +3,12 @@ use crate::aws::signer;
 use crate::aws::xml;
 use crate::backend::Backend;
 use crate::events::{S3Bucket, S3Object, StateEvent};
+use crate::preview::{create_transform, StreamingFilePreview, StreamingStatus};
 
+use futures_util::StreamExt;
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
 use winit::event_loop::EventLoopProxy;
@@ -23,6 +25,13 @@ enum WorkItem {
         bucket: String,
         key: String,
         max_bytes: usize,
+    },
+    StreamingGetObject {
+        bucket: String,
+        key: String,
+        preview: Arc<StreamingFilePreview>,
+        range_start: u64,
+        max_bytes: Option<u64>,
     },
     Shutdown,
 }
@@ -164,6 +173,26 @@ impl Backend for S3Backend {
         self.inner.high_notify.notify_one();
     }
 
+    fn streaming_get_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        preview: Arc<StreamingFilePreview>,
+        range_start: u64,
+        max_bytes: Option<u64>,
+    ) {
+        let mut q = self.inner.high_queue.lock().unwrap();
+        q.push_back(WorkItem::StreamingGetObject {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            preview,
+            range_start,
+            max_bytes,
+        });
+        drop(q);
+        self.inner.high_notify.notify_one();
+    }
+
     fn cancel_all(&self) {
         self.inner.high_queue.lock().unwrap().clear();
         self.inner.low_queue.lock().unwrap().clear();
@@ -217,6 +246,15 @@ async fn worker_loop(inner: Arc<S3BackendInner>, high_priority: bool) {
                     max_bytes,
                 } => {
                     process_get_object(&inner, &bucket, &key, max_bytes).await;
+                }
+                WorkItem::StreamingGetObject {
+                    bucket,
+                    key,
+                    preview,
+                    range_start,
+                    max_bytes,
+                } => {
+                    process_streaming_get_object(&inner, &bucket, &key, preview, range_start, max_bytes).await;
                 }
             }
         }
@@ -554,6 +592,251 @@ async fn process_get_object(inner: &S3BackendInner, bucket: &str, key: &str, max
             }
         }
         return;
+    }
+}
+
+/// Process streaming GET object request with on-the-fly decompression
+async fn process_streaming_get_object(
+    inner: &S3BackendInner,
+    bucket: &str,
+    key: &str,
+    preview: Arc<StreamingFilePreview>,
+    range_start: u64,
+    max_bytes: Option<u64>,
+) {
+    let mut region = resolve_region(inner, bucket);
+    let profile = &inner.profile;
+    let is_prefetch = max_bytes.is_some();
+
+    // Update status
+    if is_prefetch {
+        preview.set_status(StreamingStatus::Prefetching);
+    } else {
+        preview.set_downloading();
+    }
+
+    for attempt in 0..2 {
+        let (host, path) = build_host_path(profile, bucket, key, &region);
+
+        // Build Range header
+        let range_header = match max_bytes {
+            Some(n) => format!("bytes={}-{}", range_start, range_start + n - 1),
+            None if range_start > 0 => format!("bytes={}-", range_start),
+            None => String::new(),
+        };
+
+        let signed = signer::sign_request(
+            "GET",
+            &host,
+            &path,
+            "",
+            &region,
+            "s3",
+            &profile.access_key_id,
+            &profile.secret_access_key,
+            "",
+            &profile.session_token,
+        );
+
+        let url = if !profile.endpoint_url.is_empty() {
+            let scheme = if profile.endpoint_url.starts_with("http://") {
+                "http"
+            } else {
+                "https"
+            };
+            format!("{}://{}{}", scheme, host, path)
+        } else {
+            signed.url.clone()
+        };
+
+        // Build request
+        let mut req = inner.client.get(&url);
+        for (k, v) in &signed.headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        if !range_header.is_empty() {
+            req = req.header("Range", &range_header);
+        }
+
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+
+                if !status.is_success() && status.as_u16() != 206 {
+                    // Check for redirect or error
+                    let body = resp.text().await.unwrap_or_default();
+
+                    if let Some(error_code) = xml::extract_tag(&body, "Code") {
+                        if error_code == "PermanentRedirect" && attempt == 0 {
+                            if let Some(new_region) = try_extract_redirect_region(&body, bucket) {
+                                if new_region != region {
+                                    region = new_region;
+                                    inner.cache_region(bucket, &region);
+                                    continue;
+                                }
+                            }
+                        }
+
+                        // InvalidRange means empty file
+                        if error_code == "InvalidRange" {
+                            preview.set_complete();
+                            inner.push_event(StateEvent::PreviewProgress {
+                                bucket: bucket.to_string(),
+                                key: key.to_string(),
+                                decompressed_bytes: 0,
+                                source_bytes: 0,
+                                line_count: 1,
+                                status: StreamingStatus::Complete,
+                            });
+                            return;
+                        }
+                    }
+
+                    let error = xml::extract_error(&body)
+                        .unwrap_or_else(|| format!("HTTP {}", status.as_u16()));
+                    preview.set_status(StreamingStatus::Error(error.clone()));
+                    inner.push_event(StateEvent::PreviewError {
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                        error,
+                    });
+                    return;
+                }
+
+                // Get content-length if available
+                if let Some(content_length) = resp.content_length() {
+                    if range_start == 0 {
+                        preview.set_total_source_size(content_length);
+                    }
+                }
+
+                inner.cache_region(bucket, &region);
+
+                // Create decompression transform
+                let compression = preview.compression();
+                let mut transform = match create_transform(compression) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        preview.set_status(StreamingStatus::Error(e.clone()));
+                        inner.push_event(StateEvent::PreviewError {
+                            bucket: bucket.to_string(),
+                            key: key.to_string(),
+                            error: e,
+                        });
+                        return;
+                    }
+                };
+
+                // Stream the response body
+                let mut stream = resp.bytes_stream();
+                let mut decompress_buf = Vec::with_capacity(64 * 1024);
+
+                while let Some(chunk_result) = stream.next().await {
+                    match chunk_result {
+                        Ok(chunk) => {
+                            // Track source bytes
+                            preview.add_source_bytes(chunk.len() as u64);
+
+                            // Decompress
+                            decompress_buf.clear();
+                            if let Err(e) = transform.process(&chunk, &mut decompress_buf) {
+                                preview.set_status(StreamingStatus::Error(e.clone()));
+                                inner.push_event(StateEvent::PreviewError {
+                                    bucket: bucket.to_string(),
+                                    key: key.to_string(),
+                                    error: e,
+                                });
+                                return;
+                            }
+
+                            // Write to temp file + index newlines
+                            if let Err(e) = preview.append_data(&decompress_buf) {
+                                preview.set_status(StreamingStatus::Error(e.clone()));
+                                inner.push_event(StateEvent::PreviewError {
+                                    bucket: bucket.to_string(),
+                                    key: key.to_string(),
+                                    error: e,
+                                });
+                                return;
+                            }
+
+                            // Emit progress event
+                            inner.push_event(StateEvent::PreviewProgress {
+                                bucket: bucket.to_string(),
+                                key: key.to_string(),
+                                decompressed_bytes: preview.bytes_written(),
+                                source_bytes: preview.source_bytes(),
+                                line_count: preview.line_count(),
+                                status: preview.status(),
+                            });
+                        }
+                        Err(e) => {
+                            let error = format!("Stream error: {}", e);
+                            preview.set_status(StreamingStatus::Error(error.clone()));
+                            inner.push_event(StateEvent::PreviewError {
+                                bucket: bucket.to_string(),
+                                key: key.to_string(),
+                                error,
+                            });
+                            return;
+                        }
+                    }
+                }
+
+                // Finalize decompression
+                decompress_buf.clear();
+                if let Err(e) = transform.finish(&mut decompress_buf) {
+                    preview.set_status(StreamingStatus::Error(e.clone()));
+                    inner.push_event(StateEvent::PreviewError {
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                        error: e,
+                    });
+                    return;
+                }
+
+                if !decompress_buf.is_empty() {
+                    if let Err(e) = preview.append_data(&decompress_buf) {
+                        preview.set_status(StreamingStatus::Error(e.clone()));
+                        inner.push_event(StateEvent::PreviewError {
+                            bucket: bucket.to_string(),
+                            key: key.to_string(),
+                            error: e,
+                        });
+                        return;
+                    }
+                }
+
+                // Set final status
+                if is_prefetch {
+                    preview.set_prefetch_ready();
+                } else {
+                    preview.set_complete();
+                }
+
+                // Final progress event
+                inner.push_event(StateEvent::PreviewProgress {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    decompressed_bytes: preview.bytes_written(),
+                    source_bytes: preview.source_bytes(),
+                    line_count: preview.line_count(),
+                    status: preview.status(),
+                });
+
+                return;
+            }
+            Err(e) => {
+                let error = format!("HTTP error: {}", e);
+                preview.set_status(StreamingStatus::Error(error.clone()));
+                inner.push_event(StateEvent::PreviewError {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    error,
+                });
+                return;
+            }
+        }
     }
 }
 

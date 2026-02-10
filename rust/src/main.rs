@@ -2,6 +2,7 @@ mod aws;
 mod backend;
 mod events;
 mod model;
+mod preview;
 mod ui;
 
 use aws::credentials;

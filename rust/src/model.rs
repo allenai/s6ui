@@ -1,6 +1,8 @@
 use crate::backend::Backend;
 use crate::events::{S3Bucket, S3Object, StateEvent};
+use crate::preview::{Compression, StreamingFilePreview, StreamingStatus, PREFETCH_BYTES};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Loading state for folder data (orthogonal to `loading: bool` which tracks in-flight requests)
@@ -88,12 +90,12 @@ impl FolderNode {
     }
 }
 
-/// Status of a file preview
+/// Status of a file preview (compatibility wrapper for UI)
 #[derive(Clone, PartialEq)]
 pub enum PreviewStatus {
-    /// Request in flight
+    /// Request in flight (prefetching or downloading)
     Loading,
-    /// Content loaded successfully
+    /// Content loaded successfully (prefetch or complete)
     Ready,
     /// File type not supported for preview
     Unsupported,
@@ -101,23 +103,49 @@ pub enum PreviewStatus {
     Error(String),
 }
 
-/// A cached file preview
+impl From<&StreamingStatus> for PreviewStatus {
+    fn from(status: &StreamingStatus) -> Self {
+        match status {
+            StreamingStatus::Prefetching | StreamingStatus::Downloading => PreviewStatus::Loading,
+            StreamingStatus::PrefetchReady | StreamingStatus::Complete => PreviewStatus::Ready,
+            StreamingStatus::Error(e) => PreviewStatus::Error(e.clone()),
+        }
+    }
+}
+
+/// A cached file preview using streaming infrastructure
 pub struct PreviewNode {
     pub bucket: String,
     pub key: String,
-    pub status: PreviewStatus,
-    pub content: String,
+    pub preview: Arc<StreamingFilePreview>,
     last_accessed: Instant,
+    /// True if this file type is not supported for preview
+    unsupported: bool,
 }
 
 impl PreviewNode {
-    fn new(bucket: String, key: String, status: PreviewStatus) -> Self {
+    fn new(bucket: String, key: String, preview: Arc<StreamingFilePreview>) -> Self {
         Self {
             bucket,
             key,
-            status,
-            content: String::new(),
+            preview,
             last_accessed: Instant::now(),
+            unsupported: false,
+        }
+    }
+
+    fn new_unsupported(bucket: String, key: String) -> Self {
+        // Create a dummy preview for unsupported files
+        let preview = Arc::new(
+            StreamingFilePreview::new(Compression::None)
+                .expect("Failed to create dummy preview"),
+        );
+        Self {
+            bucket,
+            key,
+            preview,
+            last_accessed: Instant::now(),
+            unsupported: true,
         }
     }
 
@@ -125,19 +153,62 @@ impl PreviewNode {
         self.last_accessed = Instant::now();
     }
 
-    pub fn is_loading(&self) -> bool {
-        matches!(self.status, PreviewStatus::Loading)
+    /// Get the preview status for UI display
+    pub fn status(&self) -> PreviewStatus {
+        if self.unsupported {
+            PreviewStatus::Unsupported
+        } else {
+            PreviewStatus::from(&self.preview.status())
+        }
     }
 
-    pub fn error(&self) -> Option<&str> {
-        match &self.status {
-            PreviewStatus::Error(e) => Some(e),
+    /// Get the streaming status
+    pub fn streaming_status(&self) -> StreamingStatus {
+        self.preview.status()
+    }
+
+    pub fn is_loading(&self) -> bool {
+        matches!(self.status(), PreviewStatus::Loading)
+    }
+
+    pub fn error(&self) -> Option<String> {
+        match self.preview.status() {
+            StreamingStatus::Error(e) => Some(e),
             _ => None,
         }
     }
+
+    /// Get line count
+    pub fn line_count(&self) -> usize {
+        self.preview.line_count()
+    }
+
+    /// Get decompressed bytes written
+    pub fn bytes_written(&self) -> u64 {
+        self.preview.bytes_written()
+    }
+
+    /// Get source bytes downloaded
+    pub fn source_bytes(&self) -> u64 {
+        self.preview.source_bytes()
+    }
+
+    /// Read lines for display
+    pub fn read_lines(&self, start_line: usize, count: usize) -> Vec<String> {
+        self.preview.read_lines(start_line, count)
+    }
+
+    /// Check if more data can be downloaded
+    pub fn can_continue_download(&self) -> bool {
+        matches!(self.preview.status(), StreamingStatus::PrefetchReady)
+    }
+
+    /// Check if download is complete
+    pub fn is_complete(&self) -> bool {
+        matches!(self.preview.status(), StreamingStatus::Complete)
+    }
 }
 
-const PREVIEW_MAX_BYTES: usize = 64 * 1024;
 const PREVIEW_CACHE_MAX_ENTRIES: usize = 50;
 
 /// The browser model - owns state and processes commands
@@ -290,21 +361,41 @@ impl BrowserModel {
                     key,
                     content,
                 } => {
-                    let cache_key = Self::make_preview_cache_key(&bucket, &key);
-                    if let Some(node) = self.previews.get_mut(&cache_key) {
-                        node.content = content;
-                        node.status = PreviewStatus::Ready;
-                        node.touch();
-                    }
+                    // Legacy event - no longer used for streaming previews
+                    // but kept for compatibility
+                    let _ = (bucket, key, content);
                 }
                 StateEvent::ObjectContentError {
                     bucket,
                     key,
                     error,
                 } => {
+                    // Legacy event - no longer used for streaming previews
+                    let _ = (bucket, key, error);
+                }
+                StateEvent::PreviewProgress {
+                    bucket,
+                    key,
+                    decompressed_bytes: _,
+                    source_bytes: _,
+                    line_count: _,
+                    status: _,
+                } => {
+                    // Preview progress is stored in the Arc<StreamingFilePreview>
+                    // Just touch the node for LRU tracking
                     let cache_key = Self::make_preview_cache_key(&bucket, &key);
                     if let Some(node) = self.previews.get_mut(&cache_key) {
-                        node.status = PreviewStatus::Error(error);
+                        node.touch();
+                    }
+                }
+                StateEvent::PreviewError {
+                    bucket,
+                    key,
+                    error: _,
+                } => {
+                    // Error is stored in the Arc<StreamingFilePreview>
+                    let cache_key = Self::make_preview_cache_key(&bucket, &key);
+                    if let Some(node) = self.previews.get_mut(&cache_key) {
                         node.touch();
                     }
                 }
@@ -458,25 +549,70 @@ impl BrowserModel {
             return;
         }
 
-        // Determine initial status
-        let status = if Self::is_preview_supported(key) {
-            PreviewStatus::Loading
-        } else {
-            PreviewStatus::Unsupported
+        // Check if file type is supported
+        if !Self::is_preview_supported(key) {
+            let node = PreviewNode::new_unsupported(bucket.to_string(), key.to_string());
+            self.previews.insert(cache_key.clone(), node);
+            self.evict_old_previews();
+            return;
+        }
+
+        // Detect compression from filename
+        let compression = Compression::from_filename(key);
+
+        // Create streaming preview with temp file
+        let preview = match StreamingFilePreview::new(compression) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                // Create a failed preview node
+                let preview = Arc::new(
+                    StreamingFilePreview::new(Compression::None)
+                        .expect("Failed to create fallback preview"),
+                );
+                preview.set_status(StreamingStatus::Error(e));
+                let node = PreviewNode::new(bucket.to_string(), key.to_string(), preview);
+                self.previews.insert(cache_key.clone(), node);
+                self.evict_old_previews();
+                return;
+            }
         };
 
-        // Create new preview node
-        let node = PreviewNode::new(bucket.to_string(), key.to_string(), status.clone());
+        // Create node
+        let node = PreviewNode::new(bucket.to_string(), key.to_string(), Arc::clone(&preview));
         self.previews.insert(cache_key.clone(), node);
 
         // Evict old entries if cache is too large
         self.evict_old_previews();
 
-        // Start loading if supported
-        if status == PreviewStatus::Loading {
-            if let Some(b) = &self.backend {
-                b.get_object(bucket, key, PREVIEW_MAX_BYTES);
+        // Request prefetch (64KB)
+        if let Some(b) = &self.backend {
+            b.streaming_get_object(bucket, key, preview, 0, Some(PREFETCH_BYTES));
+        }
+    }
+
+    /// Continue downloading the currently selected preview (full file)
+    pub fn continue_download(&mut self) {
+        let (bucket, key, preview) = {
+            let node = match self.selected_preview() {
+                Some(n) => n,
+                None => return,
+            };
+
+            if !node.can_continue_download() {
+                return;
             }
+
+            (
+                node.bucket.clone(),
+                node.key.clone(),
+                Arc::clone(&node.preview),
+            )
+        };
+
+        let source_bytes = preview.source_bytes();
+
+        if let Some(b) = &self.backend {
+            b.streaming_get_object(&bucket, &key, preview, source_bytes, None);
         }
     }
 
