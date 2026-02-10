@@ -185,8 +185,8 @@ impl BrowserUI {
                 ui.text_colored([0.5, 0.5, 1.0, 1.0], "Loading...");
                 return;
             }
-            if !node.error.is_empty() {
-                ui.text_colored([1.0, 0.3, 0.3, 1.0], format!("Error: {}", node.error));
+            if let Some(err) = node.error() {
+                ui.text_colored([1.0, 0.3, 0.3, 1.0], format!("Error: {}", err));
                 return;
             }
         }
@@ -213,7 +213,7 @@ impl BrowserUI {
                     )
                 })
                 .collect();
-            (view, fc, data, node.loading, node.is_truncated)
+            (view, fc, data, node.loading, node.is_truncated())
         };
 
         let item_count = sorted_view.len();
@@ -281,7 +281,7 @@ impl BrowserUI {
                 Some(node) if node.loading && node.objects.is_empty() => {
                     ui.text("Loading...");
                 }
-                Some(node) if !node.error.is_empty() => {
+                Some(node) if node.error().is_some() => {
                     ui.text_colored([1.0, 0.3, 0.3, 1.0], "Error");
                 }
                 Some(node) => {
@@ -322,7 +322,7 @@ impl BrowserUI {
 
                     if node.loading {
                         status += "  Loading...";
-                    } else if node.is_truncated {
+                    } else if node.is_truncated() {
                         status += "  [more available]";
                     }
 

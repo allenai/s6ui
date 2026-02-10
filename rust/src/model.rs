@@ -2,16 +2,27 @@ use crate::backend::Backend;
 use crate::events::{S3Bucket, S3Object, StateEvent};
 use std::collections::{HashMap, HashSet};
 
+/// Loading state for folder data (orthogonal to `loading: bool` which tracks in-flight requests)
+#[derive(Clone, PartialEq)]
+pub enum DataStatus {
+    /// Never loaded
+    Empty,
+    /// Has data, more available
+    Partial,
+    /// Has data, fully loaded
+    Complete,
+    /// Failed to load (no data)
+    Error(String),
+}
+
 /// A cached folder's contents
 pub struct FolderNode {
     pub bucket: String,
     pub prefix: String,
     pub objects: Vec<S3Object>,
     pub next_continuation_token: String,
-    pub is_truncated: bool,
     pub loading: bool,
-    pub loaded: bool,
-    pub error: String,
+    pub status: DataStatus,
 
     // Cached sorted view: indices into objects[] (folders first, then files)
     pub sorted_view: Vec<usize>,
@@ -26,13 +37,26 @@ impl FolderNode {
             prefix,
             objects: Vec::new(),
             next_continuation_token: String::new(),
-            is_truncated: false,
             loading: false,
-            loaded: false,
-            error: String::new(),
+            status: DataStatus::Empty,
             sorted_view: Vec::new(),
             folder_count: 0,
             cached_objects_size: 0,
+        }
+    }
+
+    pub fn is_loaded(&self) -> bool {
+        matches!(self.status, DataStatus::Partial | DataStatus::Complete)
+    }
+
+    pub fn is_truncated(&self) -> bool {
+        matches!(self.status, DataStatus::Partial)
+    }
+
+    pub fn error(&self) -> Option<&str> {
+        match &self.status {
+            DataStatus::Error(e) => Some(e),
+            _ => None,
         }
     }
 
@@ -179,16 +203,18 @@ impl BrowserModel {
                     }
 
                     node.next_continuation_token = next_continuation_token;
-                    node.is_truncated = is_truncated;
                     node.loading = false;
-                    node.loaded = true;
-                    node.error.clear();
+                    node.status = if is_truncated {
+                        DataStatus::Partial
+                    } else {
+                        DataStatus::Complete
+                    };
 
                     // Auto-continue pagination for current folder
                     if bucket == self.current_bucket && prefix == self.current_prefix {
                         let should_load_more = {
                             let node = self.nodes.get(&Self::make_node_key(&bucket, &prefix));
-                            node.map(|n| n.is_truncated).unwrap_or(false)
+                            node.map(|n| n.is_truncated()).unwrap_or(false)
                         };
                         if should_load_more {
                             self.load_more(&bucket, &prefix);
@@ -202,7 +228,10 @@ impl BrowserModel {
                 } => {
                     let node = self.get_or_create_node(&bucket, &prefix);
                     node.loading = false;
-                    node.error = error;
+                    // Only set error status if we don't already have data
+                    if !node.is_loaded() {
+                        node.status = DataStatus::Error(error);
+                    }
                 }
                 StateEvent::ObjectContentLoaded {
                     bucket,
@@ -253,14 +282,14 @@ impl BrowserModel {
     pub fn load_folder(&mut self, bucket: &str, prefix: &str) {
         let key = Self::make_node_key(bucket, prefix);
         if let Some(node) = self.nodes.get(&key) {
-            if node.loaded {
+            if node.is_loaded() {
                 return;
             }
         }
 
         let node = self.get_or_create_node(bucket, prefix);
         node.objects.clear();
-        node.error.clear();
+        node.status = DataStatus::Empty;
         node.loading = true;
 
         if let Some(b) = &self.backend {
@@ -275,7 +304,7 @@ impl BrowserModel {
                 Some(n) => n,
                 None => return,
             };
-            if !node.is_truncated || node.loading {
+            if !node.is_truncated() || node.loading {
                 return;
             }
             node.next_continuation_token.clone()
@@ -345,7 +374,7 @@ impl BrowserModel {
         let should_load_more = self
             .nodes
             .get(&key)
-            .map(|n| n.loaded && n.is_truncated && !n.loading)
+            .map(|n| n.is_loaded() && n.is_truncated() && !n.loading)
             .unwrap_or(false);
         if should_load_more {
             self.load_more(bucket, prefix);
