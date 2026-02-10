@@ -3,7 +3,7 @@ use crate::aws::signer;
 use crate::aws::xml;
 use crate::backend::Backend;
 use crate::events::{S3Bucket, S3Object, StateEvent};
-use crate::preview::{create_transform, StreamingFilePreview, StreamingStatus};
+use crate::preview::{StreamingFilePreview, StreamingStatus};
 
 use futures_util::StreamExt;
 use std::collections::{HashMap, VecDeque};
@@ -712,45 +712,14 @@ async fn process_streaming_get_object(
 
                 inner.cache_region(bucket, &region);
 
-                // Create decompression transform
-                let compression = preview.compression();
-                let mut transform = match create_transform(compression) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        preview.set_status(StreamingStatus::Error(e.clone()));
-                        inner.push_event(StateEvent::PreviewError {
-                            bucket: bucket.to_string(),
-                            key: key.to_string(),
-                            error: e,
-                        });
-                        return;
-                    }
-                };
-
-                // Stream the response body
+                // Stream the response body - preview handles decompression internally
                 let mut stream = resp.bytes_stream();
-                let mut decompress_buf = Vec::with_capacity(64 * 1024);
 
                 while let Some(chunk_result) = stream.next().await {
                     match chunk_result {
                         Ok(chunk) => {
-                            // Track source bytes
-                            preview.add_source_bytes(chunk.len() as u64);
-
-                            // Decompress
-                            decompress_buf.clear();
-                            if let Err(e) = transform.process(&chunk, &mut decompress_buf) {
-                                preview.set_status(StreamingStatus::Error(e.clone()));
-                                inner.push_event(StateEvent::PreviewError {
-                                    bucket: bucket.to_string(),
-                                    key: key.to_string(),
-                                    error: e,
-                                });
-                                return;
-                            }
-
-                            // Write to temp file + index newlines
-                            if let Err(e) = preview.append_data(&decompress_buf) {
+                            // Append raw chunk - preview handles decompression
+                            if let Err(e) = preview.append_chunk(&chunk) {
                                 preview.set_status(StreamingStatus::Error(e.clone()));
                                 inner.push_event(StateEvent::PreviewError {
                                     bucket: bucket.to_string(),
@@ -783,9 +752,8 @@ async fn process_streaming_get_object(
                     }
                 }
 
-                // Finalize decompression
-                decompress_buf.clear();
-                if let Err(e) = transform.finish(&mut decompress_buf) {
+                // Finalize stream (flush any remaining decompression state)
+                if let Err(e) = preview.finish_stream() {
                     preview.set_status(StreamingStatus::Error(e.clone()));
                     inner.push_event(StateEvent::PreviewError {
                         bucket: bucket.to_string(),
@@ -793,18 +761,6 @@ async fn process_streaming_get_object(
                         error: e,
                     });
                     return;
-                }
-
-                if !decompress_buf.is_empty() {
-                    if let Err(e) = preview.append_data(&decompress_buf) {
-                        preview.set_status(StreamingStatus::Error(e.clone()));
-                        inner.push_event(StateEvent::PreviewError {
-                            bucket: bucket.to_string(),
-                            key: key.to_string(),
-                            error: e,
-                        });
-                        return;
-                    }
                 }
 
                 // Set final status

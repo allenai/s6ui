@@ -228,6 +228,10 @@ struct StreamingState {
     status: StreamingStatus,
     /// Partial line buffer (bytes after last newline)
     partial_line: Vec<u8>,
+    /// Decompression transform (owned, processes incoming chunks)
+    transform: Box<dyn Transform>,
+    /// Reusable buffer for decompression output
+    decompress_buf: Vec<u8>,
 }
 
 /// Streaming file preview with on-the-fly decompression
@@ -258,6 +262,8 @@ impl StreamingFilePreview {
             .open(&temp_path)
             .map_err(|e| format!("Failed to create temp file: {}", e))?;
 
+        let transform = create_transform(compression)?;
+
         Ok(Self {
             temp_file,
             temp_path,
@@ -269,6 +275,8 @@ impl StreamingFilePreview {
                 line_offsets: vec![0], // Line 0 starts at byte 0
                 status: StreamingStatus::Prefetching,
                 partial_line: Vec::new(),
+                transform,
+                decompress_buf: Vec::with_capacity(64 * 1024),
             }),
         })
     }
@@ -318,18 +326,69 @@ impl StreamingFilePreview {
         self.state.lock().unwrap().status = status;
     }
 
-    /// Add source bytes downloaded (for progress tracking)
-    pub fn add_source_bytes(&self, bytes: u64) {
-        self.state.lock().unwrap().source_bytes += bytes;
-    }
-
-    /// Append decompressed data to temp file and update line index
-    pub fn append_data(&self, data: &[u8]) -> Result<(), String> {
-        if data.is_empty() {
+    /// Append a raw chunk from the network (possibly compressed).
+    /// Handles decompression internally and writes to temp file.
+    pub fn append_chunk(&self, raw_data: &[u8]) -> Result<(), String> {
+        if raw_data.is_empty() {
             return Ok(());
         }
 
         let mut state = self.state.lock().unwrap();
+
+        // Track source bytes
+        state.source_bytes += raw_data.len() as u64;
+
+        // Take the buffer out to avoid borrow conflict
+        let mut buf = std::mem::take(&mut state.decompress_buf);
+        buf.clear();
+
+        // Decompress
+        let result = state.transform.process(raw_data, &mut buf);
+
+        // Put the buffer back
+        state.decompress_buf = buf;
+
+        result?;
+
+        // Write decompressed data to temp file
+        if !state.decompress_buf.is_empty() {
+            self.write_decompressed(&mut state)?;
+        }
+
+        Ok(())
+    }
+
+    /// Finalize the stream (flush any remaining decompression state)
+    pub fn finish_stream(&self) -> Result<(), String> {
+        let mut state = self.state.lock().unwrap();
+
+        // Take the buffer out to avoid borrow conflict
+        let mut buf = std::mem::take(&mut state.decompress_buf);
+        buf.clear();
+
+        // Flush remaining decompression data
+        let result = state.transform.finish(&mut buf);
+
+        // Put the buffer back
+        state.decompress_buf = buf;
+
+        result?;
+
+        // Write any remaining decompressed data
+        if !state.decompress_buf.is_empty() {
+            self.write_decompressed(&mut state)?;
+        }
+
+        Ok(())
+    }
+
+    /// Internal: write decompressed data from buffer to temp file and index newlines
+    fn write_decompressed(&self, state: &mut StreamingState) -> Result<(), String> {
+        let data = &state.decompress_buf;
+        if data.is_empty() {
+            return Ok(());
+        }
+
         let write_offset = state.bytes_written;
 
         // Write to temp file using pwrite (positional write)
@@ -338,7 +397,6 @@ impl StreamingFilePreview {
             .map_err(|e| format!("Failed to write to temp file: {}", e))?;
 
         // Update line index
-        // Combine partial line from previous chunk with new data
         let search_start = if state.partial_line.is_empty() {
             0
         } else {
@@ -355,7 +413,6 @@ impl StreamingFilePreview {
         for (i, &byte) in state.partial_line[search_start..].iter().enumerate() {
             if byte == b'\n' {
                 let abs_pos = search_start + i;
-                // The next line starts at write_offset - partial_line.len() + abs_pos + 1
                 let line_start = write_offset as i64
                     - (partial_len as i64 - data.len() as i64)
                     + abs_pos as i64 + 1;
@@ -481,7 +538,7 @@ mod tests {
     fn test_streaming_preview_basic() {
         let preview = StreamingFilePreview::new(Compression::None).unwrap();
 
-        preview.append_data(b"line1\nline2\nline3\n").unwrap();
+        preview.append_chunk(b"line1\nline2\nline3\n").unwrap();
 
         assert_eq!(preview.line_count(), 4); // 3 newlines = 4 line starts
         assert_eq!(preview.bytes_written(), 18);
@@ -495,9 +552,9 @@ mod tests {
         let preview = StreamingFilePreview::new(Compression::None).unwrap();
 
         // Simulate chunked arrival
-        preview.append_data(b"hel").unwrap();
-        preview.append_data(b"lo\nwor").unwrap();
-        preview.append_data(b"ld\n").unwrap();
+        preview.append_chunk(b"hel").unwrap();
+        preview.append_chunk(b"lo\nwor").unwrap();
+        preview.append_chunk(b"ld\n").unwrap();
 
         assert_eq!(preview.line_count(), 3);
 
