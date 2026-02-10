@@ -196,50 +196,54 @@ impl BrowserUI {
             node.rebuild_sorted_view_if_needed();
         }
 
-        // Collect data for rendering to avoid borrow conflicts
-        let (sorted_view, folder_count, objects_data, is_loading, is_truncated) = {
+        // Get metadata without cloning large data structures
+        let (item_count, folder_count, is_loading, is_truncated) = {
             let node = model.get_node(&bucket, &prefix).unwrap();
-            let view = node.sorted_view.clone();
-            let fc = node.folder_count;
-            let data: Vec<(String, String, i64, bool)> = node
-                .objects
-                .iter()
-                .map(|o| {
-                    (
-                        o.key.clone(),
-                        o.display_name.clone(),
-                        o.size,
-                        o.is_folder,
-                    )
-                })
-                .collect();
-            (view, fc, data, node.loading, node.is_truncated())
+            (
+                node.sorted_view.len(),
+                node.folder_count,
+                node.loading,
+                node.is_truncated(),
+            )
         };
 
-        let item_count = sorted_view.len();
+        // Track pending action (can't mutate model while borrowing node)
+        let mut pending_navigate: Option<String> = None;
+        let mut pending_select: Option<String> = None;
 
-        // Use ListClipper for virtual scrolling
-        let clipper = ListClipper::new(item_count as i32).begin(ui);
-        for i in clipper.iter() {
-            let idx = sorted_view[i as usize];
-            let (ref key, ref display_name, size, _is_folder) = objects_data[idx];
-            let is_folder_row = (i as usize) < folder_count;
+        // Use ListClipper for virtual scrolling - only access visible items
+        {
+            let node = model.get_node(&bucket, &prefix).unwrap();
+            let clipper = ListClipper::new(item_count as i32).begin(ui);
 
-            let _id = ui.push_id(idx as i32);
+            for i in clipper.iter() {
+                let idx = node.sorted_view[i as usize];
+                let obj = &node.objects[idx];
+                let is_folder_row = (i as usize) < folder_count;
 
-            if is_folder_row {
-                let label = format!("[D] {}", display_name);
-                if ui.selectable(label) {
-                    model.navigate_into(&bucket, key);
-                }
-            } else {
-                let label = format!("    {}  ({})", display_name, format_size(size));
-                let is_selected =
-                    model.selected_bucket == bucket && model.selected_key == *key;
-                if ui.selectable_config(label).selected(is_selected).build() {
-                    model.select_file(&bucket, key);
+                let _id = ui.push_id(idx as i32);
+
+                if is_folder_row {
+                    let label = format!("[D] {}", obj.display_name);
+                    if ui.selectable(label) {
+                        pending_navigate = Some(obj.key.clone());
+                    }
+                } else {
+                    let label = format!("    {}  ({})", obj.display_name, format_size(obj.size));
+                    let is_selected =
+                        model.selected_bucket == bucket && model.selected_key == obj.key;
+                    if ui.selectable_config(label).selected(is_selected).build() {
+                        pending_select = Some(obj.key.clone());
+                    }
                 }
             }
+        }
+
+        // Apply pending actions after borrow ends
+        if let Some(key) = pending_navigate {
+            model.navigate_into(&bucket, &key);
+        } else if let Some(key) = pending_select {
+            model.select_file(&bucket, &key);
         }
 
         // Loading indicator at bottom
