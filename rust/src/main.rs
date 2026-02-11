@@ -3,6 +3,7 @@ mod backend;
 mod events;
 mod model;
 mod preview;
+mod text_viewer;
 mod ui;
 
 use aws::credentials;

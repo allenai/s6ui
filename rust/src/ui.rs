@@ -1,15 +1,22 @@
 use crate::model::{BrowserModel, PreviewStatus};
+use crate::text_viewer::MmapTextViewer;
 use dear_imgui_rs::*;
 use std::borrow::Cow;
 
 pub struct BrowserUI {
     path_input: String,
+    /// Text viewer for file preview
+    text_viewer: MmapTextViewer,
+    /// Currently loaded preview key (bucket/key)
+    viewer_preview_key: Option<String>,
 }
 
 impl BrowserUI {
     pub fn new() -> Self {
         Self {
             path_input: "s3://".to_string(),
+            text_viewer: MmapTextViewer::new(),
+            viewer_preview_key: None,
         }
     }
 
@@ -337,11 +344,27 @@ impl BrowserUI {
         }
     }
 
-    fn render_preview_pane(&self, ui: &Ui, model: &mut BrowserModel, width: f32, height: f32) {
+    fn render_preview_pane(&mut self, ui: &Ui, model: &mut BrowserModel, width: f32, height: f32) {
         ui.child_window("PreviewPane")
             .size([width, height])
             .border(true)
             .build(ui, || {
+                // Check if we need to update the viewer's source
+                let current_preview_key = model.selected_preview.clone();
+
+                // Update viewer if preview changed
+                if current_preview_key != self.viewer_preview_key {
+                    self.viewer_preview_key = current_preview_key.clone();
+                    if let Some(node) = model.selected_preview() {
+                        self.text_viewer.open(node.preview.clone());
+                    } else {
+                        self.text_viewer.close();
+                    }
+                }
+
+                // Refresh viewer to pick up new streaming data
+                self.text_viewer.refresh();
+
                 let preview = model.selected_preview();
                 match preview {
                     None => {
@@ -379,7 +402,7 @@ impl BrowserUI {
                             PreviewStatus::Ready => {
                                 ui.same_line();
                                 let bytes = node.bytes_written();
-                                let lines = node.line_count();
+                                let lines = self.text_viewer.line_count();
                                 ui.text_colored(
                                     [0.5, 0.5, 0.5, 1.0],
                                     format!(
@@ -395,7 +418,6 @@ impl BrowserUI {
                         ui.separator();
 
                         // Get data needed for rendering before we drop the borrow
-                        let line_count = node.line_count();
                         let can_continue = node.can_continue_download();
                         let is_complete = node.is_complete();
 
@@ -410,7 +432,14 @@ impl BrowserUI {
                                 ui.text_colored([1.0, 0.3, 0.3, 1.0], format!("Error: {}", err));
                             }
                             PreviewStatus::Loading | PreviewStatus::Ready => {
-                                if line_count == 0 {
+                                // Show loading if no data yet
+                                if self.text_viewer.file_size() == 0 {
+                                    ui.text_colored([0.5, 0.5, 1.0, 1.0], "Loading...");
+                                } else if !self.text_viewer.is_open() {
+                                    // File has data but mmap failed - try to re-open
+                                    if let Some(n) = model.selected_preview() {
+                                        self.text_viewer.open(n.preview.clone());
+                                    }
                                     ui.text_colored([0.5, 0.5, 1.0, 1.0], "Loading...");
                                 } else {
                                     // Calculate available height for content
@@ -420,14 +449,10 @@ impl BrowserUI {
                                         0.0
                                     };
                                     let content_height = ui.content_region_avail()[1] - button_height;
+                                    let content_width = ui.content_region_avail()[0];
 
-                                    // Virtual scrolling content area
-                                    ui.child_window("PreviewContent")
-                                        .size([0.0, content_height])
-                                        .flags(WindowFlags::HORIZONTAL_SCROLLBAR)
-                                        .build(ui, || {
-                                            self.render_preview_lines(ui, model, line_count);
-                                        });
+                                    // Render using MmapTextViewer
+                                    self.text_viewer.render(ui, content_width, content_height);
 
                                     // "Load more" button for prefetch-only downloads
                                     if can_continue {
@@ -450,23 +475,6 @@ impl BrowserUI {
                     }
                 }
             });
-    }
-
-    fn render_preview_lines(&self, ui: &Ui, model: &BrowserModel, line_count: usize) {
-        // ListClipper requires items to be rendered during iteration
-        if let Some(node) = model.selected_preview() {
-            let clipper = ListClipper::new(line_count as i32).begin(ui);
-
-            for i in clipper.iter() {
-                // Read and render one line at a time during clipper iteration
-                let lines = node.read_lines(i as usize, 1);
-                if let Some(line) = lines.first() {
-                    ui.text(line);
-                } else {
-                    ui.text("");
-                }
-            }
-        }
     }
 }
 
