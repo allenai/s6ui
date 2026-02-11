@@ -376,8 +376,13 @@ impl BrowserUI {
                             None => node.key.as_str(),
                         };
 
-                        // Header with filename and status
+                        // Header with filename and wrap toggle
                         ui.text(format!("Preview: {}", filename));
+                        ui.same_line();
+                        let mut wrap = self.text_viewer.word_wrap();
+                        if ui.checkbox("Wrap", &mut wrap) {
+                            self.text_viewer.set_word_wrap(wrap);
+                        }
 
                         // Show progress info
                         let status = node.status();

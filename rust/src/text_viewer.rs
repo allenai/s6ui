@@ -101,13 +101,16 @@ pub struct MmapTextViewer {
     /// Average visual rows per line (for scrollbar estimation)
     avg_visual_rows: f32,
     avg_visual_rows_sample_line: u64,
+
+    /// Cached monospace character width (all chars same width in fixed-width font)
+    char_width: f32,
 }
 
 // Constants
-const MAX_DISPLAY_LINE_BYTES: u64 = 65536;
 const LINE_NUMBER_GUTTER_WIDTH: f32 = 60.0;
 const SCROLLBAR_WIDTH: f32 = 14.0;
 const WRAP_CACHE_MAX_SIZE: usize = 4096;
+const TEXT_LEFT_PADDING: f32 = 4.0;
 
 impl MmapTextViewer {
     pub fn new() -> Self {
@@ -129,6 +132,7 @@ impl MmapTextViewer {
             scrollbar_drag_start_y: 0.0,
             avg_visual_rows: 1.0,
             avg_visual_rows_sample_line: 0,
+            char_width: 0.0,
         }
     }
 
@@ -241,6 +245,57 @@ impl MmapTextViewer {
         self.anchor_sub_row = 0;
     }
 
+    /// Scroll to a fraction of the document [0.0, 1.0].
+    /// In word wrap mode, resolves to the correct (anchor_line, anchor_sub_row).
+    fn scroll_to_fraction(&mut self, fraction: f32) {
+        let lc = self.line_count();
+        if lc == 0 {
+            return;
+        }
+
+        let fraction = fraction.clamp(0.0, 1.0);
+
+        if !self.word_wrap {
+            self.anchor_line = (fraction * (lc - 1) as f32) as u64;
+            self.anchor_sub_row = 0;
+            return;
+        }
+
+        // Map fraction to a logical line with fractional sub-row position
+        let exact_line = fraction * (lc - 1) as f32;
+        let target_line = (exact_line as u64).min(lc - 1);
+        let line_frac = exact_line - target_line as f32;
+
+        // Compute wrap info for the target line to resolve sub_row
+        let wi = self.compute_wrap_info(target_line, self.last_wrap_width);
+        let sub_row = (line_frac * wi.visual_row_count as f32) as u32;
+
+        self.anchor_line = target_line;
+        self.anchor_sub_row = sub_row.min(wi.visual_row_count.saturating_sub(1));
+    }
+
+    /// Get the current scroll position as a fraction [0.0, 1.0] of the document.
+    fn scroll_fraction(&self) -> f32 {
+        let lc = self.line_count();
+        if lc <= 1 {
+            return 0.0;
+        }
+
+        if !self.word_wrap || self.last_wrap_width <= 0.0 {
+            return self.anchor_line as f32 / (lc - 1) as f32;
+        }
+
+        // Inverse of scroll_to_fraction: line + sub_row/visual_row_count → fraction
+        let wi = self.compute_wrap_info(self.anchor_line, self.last_wrap_width);
+        let line_frac = if wi.visual_row_count > 1 {
+            self.anchor_sub_row as f32 / wi.visual_row_count as f32
+        } else {
+            0.0
+        };
+        let exact_line = self.anchor_line as f32 + line_frac;
+        (exact_line / (lc - 1) as f32).clamp(0.0, 1.0)
+    }
+
     /// Get line data (pointer into mmap and length)
     fn get_line_data(&self, line_index: u64) -> Option<&[u8]> {
         let mmap = self.mmap.as_ref()?;
@@ -274,15 +329,15 @@ impl MmapTextViewer {
         Some(&mmap[start..slice_end])
     }
 
-    /// Calculate text size using current font
-    fn calc_text_size(&self, ui: &Ui, text: &str) -> [f32; 2] {
+    /// Measure the monospace character width from the current font
+    fn update_char_width(&mut self, ui: &Ui) {
         let font = ui.current_font();
         let size = ui.current_font_size();
-        font.calc_text_size(size, f32::MAX, -1.0, text)
+        self.char_width = font.calc_text_size(size, f32::MAX, -1.0, "M")[0];
     }
 
-    /// Compute wrap info for a line
-    fn compute_wrap_info(&self, ui: &Ui, line_index: u64, wrap_width: f32) -> WrapInfo {
+    /// Compute wrap info for a line using the cached char width table
+    fn compute_wrap_info(&self, line_index: u64, wrap_width: f32) -> WrapInfo {
         let mut info = WrapInfo::default();
 
         let line_data = match self.get_line_data(line_index) {
@@ -290,7 +345,7 @@ impl MmapTextViewer {
             _ => return info,
         };
 
-        let line_len = std::cmp::min(line_data.len(), MAX_DISPLAY_LINE_BYTES as usize) as u32;
+        let line_len = line_data.len() as u32;
         let mut x = 0.0f32;
         let mut last_break_offset = 0u32;
         let mut i = 0u32;
@@ -298,11 +353,7 @@ impl MmapTextViewer {
         while i < line_len {
             let ch = line_data[i as usize];
 
-            // Simple ASCII char width estimation
-            let char_str = std::str::from_utf8(&line_data[i as usize..i as usize + 1]).unwrap_or(" ");
-            let char_width = self.calc_text_size(ui, char_str)[0];
-
-            if x + char_width > wrap_width && x > 0.0 {
+            if x + self.char_width > wrap_width && x > 0.0 {
                 let break_at = if last_break_offset > *info.row_start_offsets.last().unwrap_or(&0) {
                     last_break_offset
                 } else {
@@ -324,7 +375,7 @@ impl MmapTextViewer {
                 last_break_offset = i + 1;
             }
 
-            x += char_width;
+            x += self.char_width;
             i += 1;
         }
 
@@ -332,7 +383,7 @@ impl MmapTextViewer {
     }
 
     /// Scroll by visual rows (positive = down, negative = up)
-    fn scroll_by_visual_rows(&mut self, ui: &Ui, rows: i64) {
+    fn scroll_by_visual_rows(&mut self, rows: i64) {
         let lc = self.line_count();
         if lc == 0 {
             return;
@@ -346,7 +397,7 @@ impl MmapTextViewer {
                         width_px: self.last_wrap_width as i32,
                     };
                     let wi = self.wrap_cache.get(&key).cloned()
-                        .unwrap_or_else(|| self.compute_wrap_info(ui, self.anchor_line, self.last_wrap_width));
+                        .unwrap_or_else(|| self.compute_wrap_info(self.anchor_line, self.last_wrap_width));
 
                     if self.anchor_sub_row + 1 < wi.visual_row_count {
                         self.anchor_sub_row += 1;
@@ -371,7 +422,7 @@ impl MmapTextViewer {
                             width_px: self.last_wrap_width as i32,
                         };
                         let wi = self.wrap_cache.get(&key).cloned()
-                            .unwrap_or_else(|| self.compute_wrap_info(ui, self.anchor_line, self.last_wrap_width));
+                            .unwrap_or_else(|| self.compute_wrap_info(self.anchor_line, self.last_wrap_width));
                         self.anchor_sub_row = wi.visual_row_count - 1;
                     }
                 } else if self.anchor_line > 0 {
@@ -382,7 +433,7 @@ impl MmapTextViewer {
     }
 
     /// Estimate average visual rows per line (for scrollbar)
-    fn estimate_avg_visual_rows(&mut self, ui: &Ui) -> f32 {
+    fn estimate_avg_visual_rows(&mut self) -> f32 {
         if !self.word_wrap {
             return 1.0;
         }
@@ -397,7 +448,7 @@ impl MmapTextViewer {
 
         for i in 0..sample_count {
             let idx = (i * lc) / sample_count;
-            let wi = self.compute_wrap_info(ui, idx, self.last_wrap_width);
+            let wi = self.compute_wrap_info(idx, self.last_wrap_width);
             total_rows += wi.visual_row_count as f32;
         }
 
@@ -465,7 +516,7 @@ impl MmapTextViewer {
     }
 
     /// Hit test: convert mouse position to TextPosition
-    fn hit_test(&self, ui: &Ui, mouse_x: f32, mouse_y: f32, start_y: f32, text_x: f32, line_height: f32) -> TextPosition {
+    fn hit_test(&self, _ui: &Ui, mouse_x: f32, mouse_y: f32, start_y: f32, text_x: f32, line_height: f32) -> TextPosition {
         let lc = self.line_count();
         if lc == 0 {
             return TextPosition::default();
@@ -519,7 +570,7 @@ impl MmapTextViewer {
             return TextPosition::new(cur_line, 0);
         }
 
-        let line_len = std::cmp::min(line_data.len(), MAX_DISPLAY_LINE_BYTES as usize) as u32;
+        let line_len = line_data.len() as u32;
         let (row_start, row_end) = if self.word_wrap && text_area_width > 0.0 {
             let key = WrapCacheKey {
                 line: cur_line,
@@ -545,19 +596,17 @@ impl MmapTextViewer {
             return TextPosition::new(cur_line, row_start);
         }
 
-        let mut x = 0.0f32;
-        let mut i = row_start;
-        while i < row_end {
-            let ch_str = std::str::from_utf8(&line_data[i as usize..i as usize + 1]).unwrap_or(" ");
-            let char_width = self.calc_text_size(ui, ch_str)[0];
-            if x + char_width * 0.5 > target_x {
-                return TextPosition::new(cur_line, i);
-            }
-            x += char_width;
-            i += 1;
+        // With monospace font, character index is simply target_x / char_width
+        let char_offset = if self.char_width > 0.0 {
+            (target_x / self.char_width + 0.5) as u32
+        } else {
+            0
+        };
+        let byte_pos = row_start + char_offset;
+        if byte_pos >= row_end {
+            return TextPosition::new(cur_line, row_end);
         }
-
-        TextPosition::new(cur_line, row_end)
+        TextPosition::new(cur_line, byte_pos)
     }
 
     /// Render the text viewer
@@ -584,8 +633,13 @@ impl MmapTextViewer {
             self.anchor_line = lc - 1;
         }
 
+        // Ensure char width is measured
+        if self.char_width == 0.0 {
+            self.update_char_width(ui);
+        }
+
         let line_height = ui.text_line_height_with_spacing();
-        let text_area_width = width - LINE_NUMBER_GUTTER_WIDTH - SCROLLBAR_WIDTH;
+        let text_area_width = width - LINE_NUMBER_GUTTER_WIDTH - SCROLLBAR_WIDTH - TEXT_LEFT_PADDING;
         self.last_wrap_width = text_area_width;
 
         // Clear wrap cache if width changed significantly
@@ -621,25 +675,25 @@ impl MmapTextViewer {
             let wheel = ui.io().mouse_wheel();
             if wheel != 0.0 {
                 let rows = (-wheel * 3.0) as i64;
-                self.scroll_by_visual_rows(ui, rows);
+                self.scroll_by_visual_rows(rows);
             }
         }
 
         // Keyboard navigation
         if viewer_focused {
             if ui.is_key_pressed(Key::DownArrow) {
-                self.scroll_by_visual_rows(ui, 1);
+                self.scroll_by_visual_rows(1);
             }
             if ui.is_key_pressed(Key::UpArrow) {
-                self.scroll_by_visual_rows(ui, -1);
+                self.scroll_by_visual_rows(-1);
             }
 
             let visible_rows = (height / line_height) as i64;
             if ui.is_key_pressed(Key::PageDown) {
-                self.scroll_by_visual_rows(ui, visible_rows);
+                self.scroll_by_visual_rows(visible_rows);
             }
             if ui.is_key_pressed(Key::PageUp) {
-                self.scroll_by_visual_rows(ui, -visible_rows);
+                self.scroll_by_visual_rows(-visible_rows);
             }
 
             if ui.is_key_pressed(Key::Home) {
@@ -666,7 +720,7 @@ impl MmapTextViewer {
         let draw_list = ui.get_window_draw_list();
         let start_x = window_pos[0];
         let start_y = window_pos[1];
-        let text_x = start_x + LINE_NUMBER_GUTTER_WIDTH + 4.0;
+        let text_x = start_x + LINE_NUMBER_GUTTER_WIDTH + TEXT_LEFT_PADDING;
 
         // Mouse selection handling
         if mouse_in_text_area && ui.is_mouse_clicked(MouseButton::Left) && !self.scrollbar_dragging {
@@ -732,9 +786,22 @@ impl MmapTextViewer {
         let mut current_line = self.anchor_line;
         let mut current_sub_row = self.anchor_sub_row;
 
+        // Max bytes to copy/display in no-wrap mode (enough to fill visible width)
+        let max_nowrap_bytes = if self.char_width > 0.0 {
+            ((text_area_width / self.char_width) * 1.5) as usize + 16
+        } else {
+            1024
+        };
+
         while cursor_y < start_y + height && current_line < lc {
-            // Copy line data to avoid borrow conflicts with wrap_cache
-            let line_data_vec: Option<Vec<u8>> = self.get_line_data(current_line).map(|d| d.to_vec());
+            // Copy line data to avoid borrow conflicts with wrap_cache.
+            // In no-wrap mode, truncate to visible width to avoid copying/rendering huge lines.
+            let line_data_vec: Option<Vec<u8>> = if self.word_wrap {
+                self.get_line_data(current_line).map(|d| d.to_vec())
+            } else {
+                self.get_line_data(current_line)
+                    .map(|d| d[..std::cmp::min(d.len(), max_nowrap_bytes)].to_vec())
+            };
             let line_data = line_data_vec.as_deref();
 
             if self.word_wrap && text_area_width > 0.0 {
@@ -745,7 +812,7 @@ impl MmapTextViewer {
                 let wi = if let Some(cached) = self.wrap_cache.get(&key) {
                     cached.clone()
                 } else {
-                    let computed = self.compute_wrap_info(ui, current_line, text_area_width);
+                    let computed = self.compute_wrap_info(current_line, text_area_width);
                     if self.wrap_cache.len() >= WRAP_CACHE_MAX_SIZE {
                         self.wrap_cache.clear();
                     }
@@ -761,7 +828,7 @@ impl MmapTextViewer {
                     // Line number (only on first row)
                     if row == 0 {
                         let line_num = format!("{}", current_line + 1);
-                        let num_width = self.calc_text_size(ui, &line_num)[0];
+                        let num_width = line_num.len() as f32 * self.char_width;
                         draw_list.add_text(
                             [start_x + LINE_NUMBER_GUTTER_WIDTH - num_width - 8.0, cursor_y],
                             gutter_color,
@@ -773,7 +840,7 @@ impl MmapTextViewer {
                         let row_start = wi.row_start_offsets[row as usize] as usize;
                         let row_end = wi.row_start_offsets.get(row as usize + 1)
                             .map(|&v| v as usize)
-                            .unwrap_or_else(|| std::cmp::min(data.len(), MAX_DISPLAY_LINE_BYTES as usize));
+                            .unwrap_or(data.len());
 
                         // Draw selection highlight
                         if self.selection_active {
@@ -791,8 +858,8 @@ impl MmapTextViewer {
                                     row_end
                                 };
                                 if hl_end > hl_start {
-                                    let x0 = text_x + self.compute_text_width_slice(ui, data, row_start, hl_start);
-                                    let x1 = text_x + self.compute_text_width_slice(ui, data, row_start, hl_end);
+                                    let x0 = text_x + self.compute_text_width_slice(data, row_start, hl_start);
+                                    let x1 = text_x + self.compute_text_width_slice(data, row_start, hl_end);
                                     draw_list.add_rect(
                                         [x0, cursor_y],
                                         [x1, cursor_y + line_height],
@@ -814,7 +881,7 @@ impl MmapTextViewer {
             } else {
                 // No word wrap
                 let line_num = format!("{}", current_line + 1);
-                let num_width = self.calc_text_size(ui, &line_num)[0];
+                let num_width = line_num.len() as f32 * self.char_width;
                 draw_list.add_text(
                     [start_x + LINE_NUMBER_GUTTER_WIDTH - num_width - 8.0, cursor_y],
                     gutter_color,
@@ -822,7 +889,7 @@ impl MmapTextViewer {
                 );
 
                 if let Some(data) = line_data {
-                    let display_len = std::cmp::min(data.len(), MAX_DISPLAY_LINE_BYTES as usize);
+                    let display_len = data.len();
 
                     // Draw selection highlight
                     if self.selection_active {
@@ -841,8 +908,8 @@ impl MmapTextViewer {
                             };
                             if hl_end > hl_start && hl_start < display_len {
                                 let hl_end = std::cmp::min(hl_end, display_len);
-                                let x0 = text_x + self.compute_text_width_slice(ui, data, 0, hl_start);
-                                let x1 = text_x + self.compute_text_width_slice(ui, data, 0, hl_end);
+                                let x0 = text_x + self.compute_text_width_slice(data, 0, hl_start);
+                                let x1 = text_x + self.compute_text_width_slice(data, 0, hl_end);
                                 draw_list.add_rect(
                                     [x0, cursor_y],
                                     [x1, cursor_y + line_height],
@@ -866,19 +933,18 @@ impl MmapTextViewer {
 
         // Scrollbar
         if self.word_wrap && self.avg_visual_rows_sample_line != lc {
-            self.estimate_avg_visual_rows(ui);
+            self.estimate_avg_visual_rows();
         }
         self.render_scrollbar(ui, &draw_list, start_x + width - SCROLLBAR_WIDTH, start_y, height, lc as f32, line_height);
     }
 
-    /// Compute text width for a range within line data (for slice input)
-    fn compute_text_width_slice(&self, ui: &Ui, data: &[u8], from: usize, to: usize) -> f32 {
+    /// Compute text width for a range within line data
+    fn compute_text_width_slice(&self, data: &[u8], from: usize, to: usize) -> f32 {
         if to <= from || from >= data.len() {
             return 0.0;
         }
-        let slice = &data[from..std::cmp::min(to, data.len())];
-        let text = String::from_utf8_lossy(slice);
-        self.calc_text_size(ui, text.as_ref())[0]
+        let len = std::cmp::min(to, data.len()) - from;
+        len as f32 * self.char_width
     }
 
     /// Render the scrollbar
@@ -900,9 +966,8 @@ impl MmapTextViewer {
 
         let thumb_ratio = viewport_rows / total_visual_rows;
         let thumb_h = (height * thumb_ratio).max(20.0);
-        let current_visual_row = self.anchor_line as f32 * avg + self.anchor_sub_row as f32;
-        let scroll_fraction = (current_visual_row / (total_visual_rows - viewport_rows)).clamp(0.0, 1.0);
-        let thumb_y = y + scroll_fraction * (height - thumb_h);
+        let cur_fraction = self.scroll_fraction();
+        let thumb_y = y + cur_fraction * (height - thumb_h);
 
         let mouse_pos = ui.io().mouse_pos();
         let mouse_in_scrollbar = mouse_pos[0] >= x
@@ -915,9 +980,9 @@ impl MmapTextViewer {
                 self.scrollbar_dragging = true;
                 self.scrollbar_drag_start_y = mouse_pos[1] - thumb_y;
             } else {
-                let click_fraction = (mouse_pos[1] - y) / height;
-                let target_line = (click_fraction * total_lines) as u64;
-                self.scroll_to_line(target_line);
+                // Click above/below thumb — jump to that fraction
+                let click_fraction = ((mouse_pos[1] - y - thumb_h * 0.5) / (height - thumb_h)).clamp(0.0, 1.0);
+                self.scroll_to_fraction(click_fraction);
                 self.scrollbar_dragging = true;
                 self.scrollbar_drag_start_y = thumb_h * 0.5;
             }
@@ -927,8 +992,7 @@ impl MmapTextViewer {
             if ui.is_mouse_down(MouseButton::Left) {
                 let new_thumb_y = mouse_pos[1] - self.scrollbar_drag_start_y;
                 let new_fraction = ((new_thumb_y - y) / (height - thumb_h)).clamp(0.0, 1.0);
-                let target_line = (new_fraction * (total_lines - 1.0).max(0.0)) as u64;
-                self.scroll_to_line(target_line);
+                self.scroll_to_fraction(new_fraction);
             } else {
                 self.scrollbar_dragging = false;
             }

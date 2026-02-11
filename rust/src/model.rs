@@ -1,6 +1,6 @@
 use crate::backend::Backend;
 use crate::events::{S3Bucket, S3Object, StateEvent};
-use crate::preview::{Compression, StreamingFilePreview, StreamingStatus, PREFETCH_BYTES};
+use crate::preview::{Compression, StreamingFilePreview, StreamingStatus};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -584,9 +584,9 @@ impl BrowserModel {
         // Evict old entries if cache is too large
         self.evict_old_previews();
 
-        // Request prefetch (64KB)
+        // Request full file download
         if let Some(b) = &self.backend {
-            b.streaming_get_object(bucket, key, preview, 0, Some(PREFETCH_BYTES));
+            b.streaming_get_object(bucket, key, preview, 0, None);
         }
     }
 
