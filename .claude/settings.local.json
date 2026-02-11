@@ -19,7 +19,8 @@
       "Bash(cargo build:*)",
       "Bash(wc:*)",
       "Bash(git log:*)",
-      "Bash(cargo test:*)"
+      "Bash(cargo test:*)",
+      "Bash(find:*)"
     ]
   }
 }

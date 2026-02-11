@@ -99,7 +99,7 @@ impl BrowserUI {
         }
 
         ui.same_line();
-        let cmd_r = ui.io().key_super() && ui.is_key_pressed(Key::R);
+        let cmd_r = ui.io().key_ctrl() && ui.is_key_pressed(Key::R);
         if ui.button("Refresh") || cmd_r {
             model.refresh();
         }

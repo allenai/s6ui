@@ -6,7 +6,21 @@ use crate::preview::StreamingFilePreview;
 use dear_imgui_rs::*;
 use memmap2::Mmap;
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::Arc;
+
+/// Copy text to the system clipboard using pbcopy (macOS).
+fn copy_to_clipboard(text: &str) {
+    if let Ok(mut child) = std::process::Command::new("pbcopy")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+    {
+        if let Some(stdin) = child.stdin.as_mut() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+    }
+}
 
 /// Position within text (line + byte offset within line)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -704,15 +718,24 @@ impl MmapTextViewer {
             }
         }
 
+        // Cmd+C to copy selection
+        if ui.io().key_ctrl() && ui.is_key_pressed(Key::C) && self.selection_active {
+            let text = self.get_selected_text();
+            if !text.is_empty() {
+                copy_to_clipboard(&text);
+            }
+        }
+
         // Context menu
         if mouse_in_text_area && ui.is_mouse_clicked(MouseButton::Right) {
             ui.open_popup("##textviewer_ctx");
         }
         if let Some(_popup) = ui.begin_popup("##textviewer_ctx") {
-            // Note: clipboard copy would require platform-specific integration
-            // dear-imgui-rs 0.8 doesn't expose set_clipboard_text
-            if ui.menu_item("Copy (Cmd+C)") {
-                // User needs to use keyboard shortcut for now
+            if self.selection_active && ui.menu_item("Copy") {
+                let text = self.get_selected_text();
+                if !text.is_empty() {
+                    copy_to_clipboard(&text);
+                }
             }
         }
 
