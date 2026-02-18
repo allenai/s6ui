@@ -34,18 +34,47 @@ void BrowserUI::render(int windowWidth, int windowHeight) {
 
     ImGui::Separator();
 
-    // Calculate pane sizes
+    // Calculate pane sizes with resizable splitter
     ImVec2 availSize = ImGui::GetContentRegionAvail();
-    float paneWidth = availSize.x * 0.5f - 4;  // Half width minus spacing
+    float splitterWidth = 6.0f;
+    float leftWidth = availSize.x * m_splitRatio - splitterWidth * 0.5f;
+    float rightWidth = availSize.x * (1.0f - m_splitRatio) - splitterWidth * 0.5f;
     float paneHeight = availSize.y;
 
     // Left pane (file browser + status bar)
-    renderLeftPane(paneWidth, paneHeight);
+    renderLeftPane(leftWidth, paneHeight);
 
-    ImGui::SameLine();
+    ImGui::SameLine(0, 0);
+
+    // Draggable splitter
+    ImVec4 bg = ImGui::GetStyleColorVec4(ImGuiCol_WindowBg);
+    ImGui::PushStyleColor(ImGuiCol_Button, bg);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, bg);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, bg);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
+
+    ImGui::Button("##splitter", ImVec2(splitterWidth, paneHeight));
+
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(3);
+
+    if (ImGui::IsItemHovered() || ImGui::IsItemActive()) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+    }
+
+    if (ImGui::IsItemActive()) {
+        float delta = ImGui::GetIO().MouseDelta.x;
+        if (delta != 0.0f) {
+            m_splitRatio += delta / availSize.x;
+            if (m_splitRatio < 0.1f) m_splitRatio = 0.1f;
+            if (m_splitRatio > 0.9f) m_splitRatio = 0.9f;
+        }
+    }
+
+    ImGui::SameLine(0, 0);
 
     // Right pane (preview)
-    renderPreviewPane(paneWidth, paneHeight);
+    renderPreviewPane(rightWidth, paneHeight);
 
     ImGui::End();
 }
