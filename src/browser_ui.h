@@ -32,6 +32,9 @@ private:
     // Path input buffer
     char m_pathInput[2048] = "s3://";
 
+    // Split pane ratio (0.0 to 1.0, fraction of width for left pane)
+    float m_splitRatio = 0.5f;
+
     // Preview renderers
     std::vector<std::unique_ptr<IPreviewRenderer>> m_previewRenderers;
     IPreviewRenderer* m_activeRenderer = nullptr;
