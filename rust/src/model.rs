@@ -1,6 +1,6 @@
-use crate::backend::Backend;
+use crate::backend::{Backend, RequestPriority};
 use crate::events::{S3Bucket, S3Object, StateEvent};
-use crate::preview::{Compression, StreamingFilePreview, StreamingStatus};
+use crate::preview::{Compression, PREFETCH_BYTES, StreamingFilePreview, StreamingStatus};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -18,6 +18,18 @@ pub enum DataStatus {
     Error(String),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FolderLoadMode {
+    FirstPage,
+    Full,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PreviewLoadMode {
+    Prefetch,
+    Full,
+}
+
 /// A cached folder's contents
 pub struct FolderNode {
     pub bucket: String,
@@ -31,6 +43,9 @@ pub struct FolderNode {
     pub sorted_view: Vec<usize>,
     pub folder_count: usize,
     cached_objects_size: usize,
+    request_id: u64,
+    mode: FolderLoadMode,
+    child_preloads_scheduled: bool,
 }
 
 impl FolderNode {
@@ -45,7 +60,23 @@ impl FolderNode {
             sorted_view: Vec::new(),
             folder_count: 0,
             cached_objects_size: 0,
+            request_id: 0,
+            mode: FolderLoadMode::FirstPage,
+            child_preloads_scheduled: false,
         }
+    }
+
+    fn reset_for_request(&mut self, request_id: u64, mode: FolderLoadMode) {
+        self.objects.clear();
+        self.next_continuation_token.clear();
+        self.loading = true;
+        self.status = DataStatus::Empty;
+        self.sorted_view.clear();
+        self.folder_count = 0;
+        self.cached_objects_size = 0;
+        self.request_id = request_id;
+        self.mode = mode;
+        self.child_preloads_scheduled = false;
     }
 
     pub fn is_loaded(&self) -> bool {
@@ -121,24 +152,33 @@ pub struct PreviewNode {
     last_accessed: Instant,
     /// True if this file type is not supported for preview
     unsupported: bool,
+    request_id: u64,
+    desired_mode: PreviewLoadMode,
 }
 
 impl PreviewNode {
-    fn new(bucket: String, key: String, preview: Arc<StreamingFilePreview>) -> Self {
+    fn new(
+        bucket: String,
+        key: String,
+        preview: Arc<StreamingFilePreview>,
+        request_id: u64,
+        desired_mode: PreviewLoadMode,
+    ) -> Self {
         Self {
             bucket,
             key,
             preview,
             last_accessed: Instant::now(),
             unsupported: false,
+            request_id,
+            desired_mode,
         }
     }
 
     fn new_unsupported(bucket: String, key: String) -> Self {
         // Create a dummy preview for unsupported files
         let preview = Arc::new(
-            StreamingFilePreview::new(Compression::None)
-                .expect("Failed to create dummy preview"),
+            StreamingFilePreview::new(Compression::None).expect("Failed to create dummy preview"),
         );
         Self {
             bucket,
@@ -146,6 +186,8 @@ impl PreviewNode {
             preview,
             last_accessed: Instant::now(),
             unsupported: true,
+            request_id: 0,
+            desired_mode: PreviewLoadMode::Prefetch,
         }
     }
 
@@ -198,18 +240,18 @@ impl PreviewNode {
         self.preview.read_lines(start_line, count)
     }
 
-    /// Check if more data can be downloaded
-    pub fn can_continue_download(&self) -> bool {
-        matches!(self.preview.status(), StreamingStatus::PrefetchReady)
-    }
-
     /// Check if download is complete
     pub fn is_complete(&self) -> bool {
         matches!(self.preview.status(), StreamingStatus::Complete)
     }
+
+    pub fn request_id(&self) -> u64 {
+        self.request_id
+    }
 }
 
 const PREVIEW_CACHE_MAX_ENTRIES: usize = 50;
+const CHILD_PRELOAD_COUNT: usize = 20;
 
 /// The browser model - owns state and processes commands
 pub struct BrowserModel {
@@ -234,6 +276,7 @@ pub struct BrowserModel {
     // Preview cache with LRU eviction
     previews: HashMap<String, PreviewNode>,
     pub selected_preview: Option<String>, // key into previews hashmap
+    next_request_id: u64,
 }
 
 impl BrowserModel {
@@ -250,6 +293,7 @@ impl BrowserModel {
             current_prefix: String::new(),
             previews: HashMap::new(),
             selected_preview: None,
+            next_request_id: 1,
         }
     }
 
@@ -280,6 +324,12 @@ impl BrowserModel {
         }
     }
 
+    fn next_request_id(&mut self) -> u64 {
+        let request_id = self.next_request_id;
+        self.next_request_id += 1;
+        request_id
+    }
+
     /// Process pending events from the backend. Returns true if any were processed.
     pub fn process_events(&mut self) -> bool {
         let events = match &self.backend {
@@ -305,55 +355,92 @@ impl BrowserModel {
                 StateEvent::ObjectsLoaded {
                     bucket,
                     prefix,
+                    request_id,
                     continuation_token,
                     objects,
                     next_continuation_token,
                     is_truncated,
                 } => {
-                    let node = self.get_or_create_node(&bucket, &prefix);
+                    let key = Self::make_node_key(&bucket, &prefix);
+                    let mut should_continue_full = false;
+                    let mut preload_children = Vec::new();
 
-                    if continuation_token.is_empty() {
-                        node.objects = objects;
-                    } else {
-                        // Append, deduplicating
-                        let existing_keys: HashSet<String> =
-                            node.objects.iter().map(|o| o.key.clone()).collect();
-                        for obj in objects {
-                            if !existing_keys.contains(&obj.key) {
-                                node.objects.push(obj);
+                    if let Some(node) = self.nodes.get_mut(&key) {
+                        if node.request_id != request_id {
+                            continue;
+                        }
+
+                        if continuation_token.is_empty() {
+                            node.objects = objects;
+                        } else {
+                            let existing_keys: HashSet<String> =
+                                node.objects.iter().map(|o| o.key.clone()).collect();
+                            for obj in objects {
+                                if !existing_keys.contains(&obj.key) {
+                                    node.objects.push(obj);
+                                }
                             }
+                        }
+
+                        node.next_continuation_token = next_continuation_token;
+                        node.loading = false;
+                        node.status = if is_truncated {
+                            DataStatus::Partial
+                        } else {
+                            DataStatus::Complete
+                        };
+
+                        let is_current_folder =
+                            bucket == self.current_bucket && prefix == self.current_prefix;
+                        if is_current_folder
+                            && node.mode == FolderLoadMode::Full
+                            && !node.child_preloads_scheduled
+                        {
+                            node.rebuild_sorted_view_if_needed();
+                            preload_children = node
+                                .sorted_view
+                                .iter()
+                                .take(CHILD_PRELOAD_COUNT)
+                                .map(|&idx| {
+                                    let obj = &node.objects[idx];
+                                    (obj.is_folder, obj.key.clone())
+                                })
+                                .collect();
+                            node.child_preloads_scheduled = true;
+                        }
+
+                        should_continue_full = is_current_folder
+                            && node.mode == FolderLoadMode::Full
+                            && node.is_truncated();
+                    }
+
+                    for (is_folder, child_key) in preload_children {
+                        if is_folder {
+                            self.prefetch_folder(&bucket, &child_key);
+                        } else {
+                            self.prefetch_file(&bucket, &child_key);
                         }
                     }
 
-                    node.next_continuation_token = next_continuation_token;
-                    node.loading = false;
-                    node.status = if is_truncated {
-                        DataStatus::Partial
-                    } else {
-                        DataStatus::Complete
-                    };
-
-                    // Auto-continue pagination for current folder
-                    if bucket == self.current_bucket && prefix == self.current_prefix {
-                        let should_load_more = {
-                            let node = self.nodes.get(&Self::make_node_key(&bucket, &prefix));
-                            node.map(|n| n.is_truncated()).unwrap_or(false)
-                        };
-                        if should_load_more {
-                            self.load_more(&bucket, &prefix);
-                        }
+                    if should_continue_full {
+                        self.load_more_with_priority(&bucket, &prefix, RequestPriority::High);
                     }
                 }
                 StateEvent::ObjectsError {
                     bucket,
                     prefix,
+                    request_id,
                     error,
                 } => {
-                    let node = self.get_or_create_node(&bucket, &prefix);
-                    node.loading = false;
-                    // Only set error status if we don't already have data
-                    if !node.is_loaded() {
-                        node.status = DataStatus::Error(error);
+                    let key = Self::make_node_key(&bucket, &prefix);
+                    if let Some(node) = self.nodes.get_mut(&key) {
+                        if node.request_id != request_id {
+                            continue;
+                        }
+                        node.loading = false;
+                        if !node.is_loaded() {
+                            node.status = DataStatus::Error(error);
+                        }
                     }
                 }
                 StateEvent::ObjectContentLoaded {
@@ -365,37 +452,74 @@ impl BrowserModel {
                     // but kept for compatibility
                     let _ = (bucket, key, content);
                 }
-                StateEvent::ObjectContentError {
-                    bucket,
-                    key,
-                    error,
-                } => {
+                StateEvent::ObjectContentError { bucket, key, error } => {
                     // Legacy event - no longer used for streaming previews
                     let _ = (bucket, key, error);
                 }
                 StateEvent::PreviewProgress {
                     bucket,
                     key,
+                    request_id,
                     decompressed_bytes: _,
                     source_bytes: _,
                     line_count: _,
-                    status: _,
+                    status,
                 } => {
-                    // Preview progress is stored in the Arc<StreamingFilePreview>
-                    // Just touch the node for LRU tracking
                     let cache_key = Self::make_preview_cache_key(&bucket, &key);
+                    let mut continue_download = None;
+
                     if let Some(node) = self.previews.get_mut(&cache_key) {
+                        if node.request_id != request_id {
+                            continue;
+                        }
                         node.touch();
+                        if node.desired_mode == PreviewLoadMode::Full
+                            && matches!(status, StreamingStatus::PrefetchReady)
+                        {
+                            continue_download = Some((
+                                node.bucket.clone(),
+                                node.key.clone(),
+                                Arc::clone(&node.preview),
+                                node.source_bytes(),
+                            ));
+                        }
+                    }
+
+                    if let Some((bucket, key, preview, source_bytes)) = continue_download {
+                        let new_request_id = self.next_request_id();
+                        if let Some(node) = self.previews.get_mut(&cache_key) {
+                            if node.request_id == request_id {
+                                node.request_id = new_request_id;
+                                node.desired_mode = PreviewLoadMode::Full;
+                            } else {
+                                continue;
+                            }
+                        }
+
+                        if let Some(b) = &self.backend {
+                            b.streaming_get_object(
+                                &bucket,
+                                &key,
+                                preview,
+                                source_bytes,
+                                None,
+                                RequestPriority::High,
+                                new_request_id,
+                            );
+                        }
                     }
                 }
                 StateEvent::PreviewError {
                     bucket,
                     key,
+                    request_id,
                     error: _,
                 } => {
-                    // Error is stored in the Arc<StreamingFilePreview>
                     let cache_key = Self::make_preview_cache_key(&bucket, &key);
                     if let Some(node) = self.previews.get_mut(&cache_key) {
+                        if node.request_id != request_id {
+                            continue;
+                        }
                         node.touch();
                     }
                 }
@@ -413,31 +537,43 @@ impl BrowserModel {
         self.selected_preview = None;
 
         if let Some(b) = &self.backend {
+            b.cancel_all();
             b.list_buckets();
         }
     }
 
-    pub fn load_folder(&mut self, bucket: &str, prefix: &str) {
+    pub fn ensure_current_folder_loaded(&mut self) {
+        if self.current_bucket.is_empty() {
+            return;
+        }
+        let bucket = self.current_bucket.clone();
+        let prefix = self.current_prefix.clone();
+        self.ensure_folder_full(&bucket, &prefix);
+    }
+
+    pub fn prefetch_folder(&mut self, bucket: &str, prefix: &str) {
         let key = Self::make_node_key(bucket, prefix);
         if let Some(node) = self.nodes.get(&key) {
-            if node.is_loaded() {
+            if node.loading || node.is_loaded() {
                 return;
             }
         }
 
-        let node = self.get_or_create_node(bucket, prefix);
-        node.objects.clear();
-        node.status = DataStatus::Empty;
-        node.loading = true;
-
-        if let Some(b) = &self.backend {
-            b.list_objects(bucket, prefix, "");
-        }
+        self.start_folder_request(
+            bucket,
+            prefix,
+            FolderLoadMode::FirstPage,
+            RequestPriority::Low,
+        );
     }
 
     pub fn load_more(&mut self, bucket: &str, prefix: &str) {
+        self.load_more_with_priority(bucket, prefix, RequestPriority::High);
+    }
+
+    fn load_more_with_priority(&mut self, bucket: &str, prefix: &str, priority: RequestPriority) {
         let key = Self::make_node_key(bucket, prefix);
-        let cont_token = {
+        let (cont_token, request_id) = {
             let node = match self.nodes.get(&key) {
                 Some(n) => n,
                 None => return,
@@ -445,7 +581,7 @@ impl BrowserModel {
             if !node.is_truncated() || node.loading {
                 return;
             }
-            node.next_continuation_token.clone()
+            (node.next_continuation_token.clone(), node.request_id)
         };
 
         if let Some(node) = self.nodes.get_mut(&key) {
@@ -453,7 +589,7 @@ impl BrowserModel {
         }
 
         if let Some(b) = &self.backend {
-            b.list_objects(bucket, prefix, &cont_token);
+            b.list_objects(bucket, prefix, &cont_token, priority, request_id);
         }
     }
 
@@ -464,6 +600,7 @@ impl BrowserModel {
         };
 
         if bucket.is_empty() {
+            self.cancel_pending_requests();
             self.clear_selection();
             self.current_bucket.clear();
             self.current_prefix.clear();
@@ -481,6 +618,7 @@ impl BrowserModel {
         }
 
         if self.current_prefix.is_empty() {
+            self.cancel_pending_requests();
             self.clear_selection();
             self.current_bucket.clear();
             self.current_prefix.clear();
@@ -502,21 +640,11 @@ impl BrowserModel {
     }
 
     pub fn navigate_into(&mut self, bucket: &str, prefix: &str) {
+        self.cancel_pending_requests();
         self.clear_selection();
         self.current_bucket = bucket.to_string();
         self.current_prefix = prefix.to_string();
-        self.load_folder(bucket, prefix);
-
-        // Resume pagination if folder was already loaded but truncated
-        let key = Self::make_node_key(bucket, prefix);
-        let should_load_more = self
-            .nodes
-            .get(&key)
-            .map(|n| n.is_loaded() && n.is_truncated() && !n.loading)
-            .unwrap_or(false);
-        if should_load_more {
-            self.load_more(bucket, prefix);
-        }
+        self.ensure_folder_full(bucket, prefix);
     }
 
     pub fn add_manual_bucket(&mut self, bucket_name: &str) {
@@ -531,89 +659,87 @@ impl BrowserModel {
 
     pub fn select_file(&mut self, bucket: &str, key: &str) {
         let cache_key = Self::make_preview_cache_key(bucket, key);
+        self.selected_preview = Some(cache_key.clone());
 
-        // Already selected?
-        if self.selected_preview.as_ref() == Some(&cache_key) {
-            // Touch for LRU
+        if !Self::is_preview_supported(key) {
+            self.previews.entry(cache_key).or_insert_with(|| {
+                PreviewNode::new_unsupported(bucket.to_string(), key.to_string())
+            });
+            return;
+        }
+
+        let existing = self.previews.get(&cache_key).map(|node| {
+            (
+                node.streaming_status(),
+                node.request_id,
+                Arc::clone(&node.preview),
+                node.source_bytes(),
+            )
+        });
+
+        if let Some((status, request_id, preview, source_bytes)) = existing {
             if let Some(node) = self.previews.get_mut(&cache_key) {
                 node.touch();
+                node.desired_mode = PreviewLoadMode::Full;
+            }
+
+            match status {
+                StreamingStatus::PrefetchReady => {
+                    self.start_preview_download(
+                        &cache_key,
+                        &bucket.to_string(),
+                        &key.to_string(),
+                        preview,
+                        source_bytes,
+                        RequestPriority::High,
+                    );
+                }
+                StreamingStatus::Downloading | StreamingStatus::Complete => {}
+                StreamingStatus::Prefetching | StreamingStatus::Error(_) => {
+                    if let Some(node) = self.previews.get(&cache_key) {
+                        if node.request_id != request_id {
+                            return;
+                        }
+                    }
+                    self.start_new_preview_request(
+                        bucket,
+                        key,
+                        PreviewLoadMode::Full,
+                        RequestPriority::High,
+                        None,
+                    );
+                }
             }
             return;
         }
 
-        self.selected_preview = Some(cache_key.clone());
+        self.start_new_preview_request(
+            bucket,
+            key,
+            PreviewLoadMode::Full,
+            RequestPriority::High,
+            None,
+        );
+    }
 
-        // Check if already in cache
+    pub fn prefetch_file(&mut self, bucket: &str, key: &str) {
+        if !Self::is_preview_supported(key) {
+            return;
+        }
+
+        let cache_key = Self::make_preview_cache_key(bucket, key);
         if let Some(node) = self.previews.get_mut(&cache_key) {
             node.touch();
             return;
         }
 
-        // Check if file type is supported
-        if !Self::is_preview_supported(key) {
-            let node = PreviewNode::new_unsupported(bucket.to_string(), key.to_string());
-            self.previews.insert(cache_key.clone(), node);
-            self.evict_old_previews();
-            return;
-        }
-
-        // Detect compression from filename
-        let compression = Compression::from_filename(key);
-
-        // Create streaming preview with temp file
-        let preview = match StreamingFilePreview::new(compression) {
-            Ok(p) => Arc::new(p),
-            Err(e) => {
-                // Create a failed preview node
-                let preview = Arc::new(
-                    StreamingFilePreview::new(Compression::None)
-                        .expect("Failed to create fallback preview"),
-                );
-                preview.set_status(StreamingStatus::Error(e));
-                let node = PreviewNode::new(bucket.to_string(), key.to_string(), preview);
-                self.previews.insert(cache_key.clone(), node);
-                self.evict_old_previews();
-                return;
-            }
-        };
-
-        // Create node
-        let node = PreviewNode::new(bucket.to_string(), key.to_string(), Arc::clone(&preview));
-        self.previews.insert(cache_key.clone(), node);
-
-        // Evict old entries if cache is too large
-        self.evict_old_previews();
-
-        // Request full file download
-        if let Some(b) = &self.backend {
-            b.streaming_get_object(bucket, key, preview, 0, None);
-        }
-    }
-
-    /// Continue downloading the currently selected preview (full file)
-    pub fn continue_download(&mut self) {
-        let (bucket, key, preview) = {
-            let node = match self.selected_preview() {
-                Some(n) => n,
-                None => return,
-            };
-
-            if !node.can_continue_download() {
-                return;
-            }
-
-            (
-                node.bucket.clone(),
-                node.key.clone(),
-                Arc::clone(&node.preview),
-            )
-        };
-
-        let source_bytes = preview.source_bytes();
-
-        if let Some(b) = &self.backend {
-            b.streaming_get_object(&bucket, &key, preview, source_bytes, None);
-        }
+        self.start_new_preview_request(
+            bucket,
+            key,
+            PreviewLoadMode::Prefetch,
+            RequestPriority::Low,
+            Some(PREFETCH_BYTES),
+        );
     }
 
     pub fn clear_selection(&mut self) {
@@ -639,14 +765,253 @@ impl BrowserModel {
         }
     }
 
+    fn cancel_pending_requests(&mut self) {
+        if let Some(b) = &self.backend {
+            b.cancel_pending(RequestPriority::High);
+            b.cancel_pending(RequestPriority::Low);
+        }
+
+        for node in self.nodes.values_mut() {
+            if !node.loading {
+                continue;
+            }
+
+            node.loading = false;
+            node.request_id = 0;
+            node.child_preloads_scheduled = false;
+
+            if !node.is_loaded() {
+                node.status = DataStatus::Empty;
+                node.next_continuation_token.clear();
+            }
+
+            if node.mode == FolderLoadMode::Full {
+                node.mode = FolderLoadMode::FirstPage;
+            }
+        }
+
+        for preview in self.previews.values_mut() {
+            if matches!(
+                preview.streaming_status(),
+                StreamingStatus::Prefetching | StreamingStatus::Downloading
+            ) {
+                preview
+                    .preview
+                    .set_status(StreamingStatus::Error("Cancelled".to_string()));
+                preview.request_id = 0;
+                preview.desired_mode = PreviewLoadMode::Prefetch;
+            }
+        }
+    }
+
+    fn ensure_folder_full(&mut self, bucket: &str, prefix: &str) {
+        enum Action {
+            StartFresh,
+            ContinuePartial,
+            ScheduleChildrenOnly,
+            None,
+        }
+
+        let key = Self::make_node_key(bucket, prefix);
+        let action = match self.nodes.get(&key) {
+            None => Action::StartFresh,
+            Some(node) if node.loading && node.mode == FolderLoadMode::Full => Action::None,
+            Some(node) if node.loading => Action::StartFresh,
+            Some(node) if matches!(node.status, DataStatus::Complete) => {
+                Action::ScheduleChildrenOnly
+            }
+            Some(node) if node.is_truncated() => Action::ContinuePartial,
+            Some(_) => Action::StartFresh,
+        };
+
+        match action {
+            Action::StartFresh => self.start_folder_request(
+                bucket,
+                prefix,
+                FolderLoadMode::Full,
+                RequestPriority::High,
+            ),
+            Action::ContinuePartial => {
+                let request_id = self.next_request_id();
+                let key = Self::make_node_key(bucket, prefix);
+                let continuation_token = match self.nodes.get_mut(&key) {
+                    Some(node) => {
+                        node.loading = true;
+                        node.mode = FolderLoadMode::Full;
+                        node.request_id = request_id;
+                        node.child_preloads_scheduled = false;
+                        node.next_continuation_token.clone()
+                    }
+                    None => return,
+                };
+
+                self.schedule_child_preloads(bucket, prefix);
+
+                if let Some(b) = &self.backend {
+                    b.list_objects(
+                        bucket,
+                        prefix,
+                        &continuation_token,
+                        RequestPriority::High,
+                        request_id,
+                    );
+                }
+            }
+            Action::ScheduleChildrenOnly => {
+                if let Some(node) = self.nodes.get_mut(&key) {
+                    node.mode = FolderLoadMode::Full;
+                }
+                self.schedule_child_preloads(bucket, prefix);
+            }
+            Action::None => {}
+        }
+    }
+
+    fn start_folder_request(
+        &mut self,
+        bucket: &str,
+        prefix: &str,
+        mode: FolderLoadMode,
+        priority: RequestPriority,
+    ) {
+        let request_id = self.next_request_id();
+        let node = self.get_or_create_node(bucket, prefix);
+        node.reset_for_request(request_id, mode);
+
+        if let Some(b) = &self.backend {
+            b.list_objects(bucket, prefix, "", priority, request_id);
+        }
+    }
+
+    fn schedule_child_preloads(&mut self, bucket: &str, prefix: &str) {
+        let key = Self::make_node_key(bucket, prefix);
+        let children = {
+            let node = match self.nodes.get_mut(&key) {
+                Some(node) => node,
+                None => return,
+            };
+
+            if node.child_preloads_scheduled {
+                return;
+            }
+
+            node.rebuild_sorted_view_if_needed();
+            node.child_preloads_scheduled = true;
+            node.sorted_view
+                .iter()
+                .take(CHILD_PRELOAD_COUNT)
+                .map(|&idx| {
+                    let obj = &node.objects[idx];
+                    (obj.is_folder, obj.key.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for (is_folder, child_key) in children {
+            if is_folder {
+                self.prefetch_folder(bucket, &child_key);
+            } else {
+                self.prefetch_file(bucket, &child_key);
+            }
+        }
+    }
+
+    fn start_new_preview_request(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        desired_mode: PreviewLoadMode,
+        priority: RequestPriority,
+        max_bytes: Option<u64>,
+    ) {
+        let cache_key = Self::make_preview_cache_key(bucket, key);
+        let request_id = self.next_request_id();
+        let compression = Compression::from_filename(key);
+
+        let preview = match StreamingFilePreview::new(compression) {
+            Ok(preview) => Arc::new(preview),
+            Err(error) => {
+                let preview = Arc::new(
+                    StreamingFilePreview::new(Compression::None)
+                        .expect("Failed to create fallback preview"),
+                );
+                preview.set_status(StreamingStatus::Error(error));
+                self.previews.insert(
+                    cache_key,
+                    PreviewNode::new(
+                        bucket.to_string(),
+                        key.to_string(),
+                        preview,
+                        request_id,
+                        desired_mode,
+                    ),
+                );
+                self.evict_old_previews();
+                return;
+            }
+        };
+
+        self.previews.insert(
+            cache_key,
+            PreviewNode::new(
+                bucket.to_string(),
+                key.to_string(),
+                Arc::clone(&preview),
+                request_id,
+                desired_mode,
+            ),
+        );
+        self.evict_old_previews();
+
+        if let Some(b) = &self.backend {
+            b.streaming_get_object(bucket, key, preview, 0, max_bytes, priority, request_id);
+        }
+    }
+
+    fn start_preview_download(
+        &mut self,
+        cache_key: &str,
+        bucket: &str,
+        key: &str,
+        preview: Arc<StreamingFilePreview>,
+        range_start: u64,
+        priority: RequestPriority,
+    ) {
+        let request_id = self.next_request_id();
+        if let Some(node) = self.previews.get_mut(cache_key) {
+            node.request_id = request_id;
+            node.desired_mode = PreviewLoadMode::Full;
+            node.touch();
+        } else {
+            return;
+        }
+
+        if let Some(b) = &self.backend {
+            b.streaming_get_object(
+                bucket,
+                key,
+                preview,
+                range_start,
+                None,
+                priority,
+                request_id,
+            );
+        }
+    }
+
     pub fn select_profile(&mut self, index: usize) {
         if index >= self.profiles.len() || index == self.selected_profile_idx {
             return;
         }
         self.selected_profile_idx = index;
+        if let Some(b) = &self.backend {
+            b.cancel_all();
+        }
         self.buckets.clear();
         self.buckets_error.clear();
         self.nodes.clear();
+        self.previews.clear();
+        self.selected_preview = None;
         self.current_bucket.clear();
         self.current_prefix.clear();
         // Note: the backend needs to be recreated by the caller with the new profile
@@ -771,5 +1136,301 @@ impl BrowserModel {
                 | ".gitignore"
                 | ".properties"
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum RecordedRequest {
+        List {
+            bucket: String,
+            prefix: String,
+            continuation_token: String,
+            priority: RequestPriority,
+            request_id: u64,
+        },
+        Stream {
+            bucket: String,
+            key: String,
+            range_start: u64,
+            max_bytes: Option<u64>,
+            priority: RequestPriority,
+            request_id: u64,
+        },
+    }
+
+    #[derive(Default)]
+    struct MockBackendState {
+        requests: Mutex<Vec<RecordedRequest>>,
+        events: Mutex<Vec<StateEvent>>,
+    }
+
+    #[derive(Clone, Default)]
+    struct MockBackend {
+        state: Arc<MockBackendState>,
+    }
+
+    impl MockBackend {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn requests(&self) -> Vec<RecordedRequest> {
+            self.state.lock_requests().clone()
+        }
+
+        fn drain_requests(&self) -> Vec<RecordedRequest> {
+            let mut requests = self.state.lock_requests();
+            std::mem::take(&mut *requests)
+        }
+
+        fn push_event(&self, event: StateEvent) {
+            self.state.lock_events().push(event);
+        }
+    }
+
+    impl MockBackendState {
+        fn lock_requests(&self) -> std::sync::MutexGuard<'_, Vec<RecordedRequest>> {
+            self.requests.lock().unwrap()
+        }
+
+        fn lock_events(&self) -> std::sync::MutexGuard<'_, Vec<StateEvent>> {
+            self.events.lock().unwrap()
+        }
+    }
+
+    impl Backend for MockBackend {
+        fn take_events(&self) -> Vec<StateEvent> {
+            let mut events = self.state.lock_events();
+            std::mem::take(&mut *events)
+        }
+
+        fn list_buckets(&self) {}
+
+        fn list_objects(
+            &self,
+            bucket: &str,
+            prefix: &str,
+            continuation_token: &str,
+            priority: RequestPriority,
+            request_id: u64,
+        ) {
+            self.state.lock_requests().push(RecordedRequest::List {
+                bucket: bucket.to_string(),
+                prefix: prefix.to_string(),
+                continuation_token: continuation_token.to_string(),
+                priority,
+                request_id,
+            });
+        }
+
+        fn get_object(&self, _bucket: &str, _key: &str, _max_bytes: usize) {}
+
+        fn streaming_get_object(
+            &self,
+            bucket: &str,
+            key: &str,
+            _preview: Arc<StreamingFilePreview>,
+            range_start: u64,
+            max_bytes: Option<u64>,
+            priority: RequestPriority,
+            request_id: u64,
+        ) {
+            self.state.lock_requests().push(RecordedRequest::Stream {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                range_start,
+                max_bytes,
+                priority,
+                request_id,
+            });
+        }
+
+        fn cancel_all(&self) {
+            self.state.lock_requests().clear();
+        }
+
+        fn cancel_pending(&self, _priority: RequestPriority) {}
+    }
+
+    fn model_with_backend() -> (BrowserModel, MockBackend) {
+        let backend = MockBackend::new();
+        let mut model = BrowserModel::new();
+        model.set_backend(Box::new(backend.clone()));
+        (model, backend)
+    }
+
+    #[test]
+    fn file_hover_prefetch_then_click_reissues_high_priority_full_download() {
+        let (mut model, backend) = model_with_backend();
+
+        model.prefetch_file("bucket", "path/file.txt");
+        assert_eq!(
+            backend.requests(),
+            vec![RecordedRequest::Stream {
+                bucket: "bucket".to_string(),
+                key: "path/file.txt".to_string(),
+                range_start: 0,
+                max_bytes: Some(PREFETCH_BYTES),
+                priority: RequestPriority::Low,
+                request_id: 1,
+            }]
+        );
+
+        model.select_file("bucket", "path/file.txt");
+        assert_eq!(
+            backend.requests(),
+            vec![
+                RecordedRequest::Stream {
+                    bucket: "bucket".to_string(),
+                    key: "path/file.txt".to_string(),
+                    range_start: 0,
+                    max_bytes: Some(PREFETCH_BYTES),
+                    priority: RequestPriority::Low,
+                    request_id: 1,
+                },
+                RecordedRequest::Stream {
+                    bucket: "bucket".to_string(),
+                    key: "path/file.txt".to_string(),
+                    range_start: 0,
+                    max_bytes: None,
+                    priority: RequestPriority::High,
+                    request_id: 2,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn folder_hover_prefetch_then_click_reissues_high_priority_full_listing() {
+        let (mut model, backend) = model_with_backend();
+
+        model.prefetch_folder("bucket", "prefix/");
+        assert_eq!(
+            backend.requests(),
+            vec![RecordedRequest::List {
+                bucket: "bucket".to_string(),
+                prefix: "prefix/".to_string(),
+                continuation_token: String::new(),
+                priority: RequestPriority::Low,
+                request_id: 1,
+            }]
+        );
+
+        model.navigate_into("bucket", "prefix/");
+        assert_eq!(
+            backend.requests(),
+            vec![
+                RecordedRequest::List {
+                    bucket: "bucket".to_string(),
+                    prefix: "prefix/".to_string(),
+                    continuation_token: String::new(),
+                    priority: RequestPriority::Low,
+                    request_id: 1,
+                },
+                RecordedRequest::List {
+                    bucket: "bucket".to_string(),
+                    prefix: "prefix/".to_string(),
+                    continuation_token: String::new(),
+                    priority: RequestPriority::High,
+                    request_id: 2,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn active_folder_first_page_schedules_child_preloads() {
+        let (mut model, backend) = model_with_backend();
+
+        model.navigate_into("bucket", "prefix/");
+        backend.drain_requests();
+
+        let request_id = model.get_node("bucket", "prefix/").unwrap().request_id;
+        backend.push_event(StateEvent::ObjectsLoaded {
+            bucket: "bucket".to_string(),
+            prefix: "prefix/".to_string(),
+            request_id,
+            continuation_token: String::new(),
+            objects: vec![
+                S3Object {
+                    key: "prefix/child/".to_string(),
+                    display_name: "child".to_string(),
+                    size: 0,
+                    last_modified: String::new(),
+                    is_folder: true,
+                },
+                S3Object {
+                    key: "prefix/file.txt".to_string(),
+                    display_name: "file.txt".to_string(),
+                    size: 16,
+                    last_modified: String::new(),
+                    is_folder: false,
+                },
+            ],
+            next_continuation_token: String::new(),
+            is_truncated: false,
+        });
+
+        model.process_events();
+
+        assert_eq!(
+            backend.requests(),
+            vec![
+                RecordedRequest::List {
+                    bucket: "bucket".to_string(),
+                    prefix: "prefix/child/".to_string(),
+                    continuation_token: String::new(),
+                    priority: RequestPriority::Low,
+                    request_id: 2,
+                },
+                RecordedRequest::Stream {
+                    bucket: "bucket".to_string(),
+                    key: "prefix/file.txt".to_string(),
+                    range_start: 0,
+                    max_bytes: Some(PREFETCH_BYTES),
+                    priority: RequestPriority::Low,
+                    request_id: 3,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn navigation_cancels_inflight_preview_and_allows_reload() {
+        let (mut model, backend) = model_with_backend();
+
+        model.select_file("bucket", "path/file.txt");
+        assert_eq!(backend.requests().len(), 1);
+
+        model.navigate_into("bucket", "other/");
+
+        let preview_key = BrowserModel::make_preview_cache_key("bucket", "path/file.txt");
+        let preview = model.previews.get(&preview_key).unwrap();
+        assert!(matches!(
+            preview.streaming_status(),
+            StreamingStatus::Error(ref error) if error == "Cancelled"
+        ));
+
+        backend.drain_requests();
+        model.select_file("bucket", "path/file.txt");
+        assert_eq!(backend.requests().len(), 1);
+        match &backend.requests()[0] {
+            RecordedRequest::Stream {
+                bucket,
+                key,
+                priority,
+                ..
+            } => {
+                assert_eq!(bucket, "bucket");
+                assert_eq!(key, "path/file.txt");
+                assert_eq!(*priority, RequestPriority::High);
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
     }
 }

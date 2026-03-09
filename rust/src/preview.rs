@@ -8,8 +8,8 @@ use memmap2::Mmap;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use zstd::stream::raw::Operation;
 
 /// Atomic counter for unique temp file names
@@ -78,68 +78,79 @@ impl Transform for IdentityTransform {
     }
 }
 
-/// Gzip decompression transform using accumulated buffer + GzDecoder
+/// Gzip decompression transform backed by flate2's incremental decompressor.
 pub struct GzipTransform {
-    buffer: Vec<u8>,
+    decoder: Option<flate2::bufread::GzDecoder<std::io::Cursor<Vec<u8>>>>,
     finished: bool,
 }
 
 impl GzipTransform {
     pub fn new() -> Self {
         Self {
-            buffer: Vec::new(),
+            decoder: None,
             finished: false,
         }
     }
 
-    fn try_decompress(&mut self, output: &mut Vec<u8>) -> Result<(), String> {
-        use flate2::bufread::GzDecoder;
+    fn drain_decoder(&mut self, output: &mut Vec<u8>, finalize: bool) -> Result<(), String> {
         use std::io::Read;
 
-        if self.buffer.is_empty() || self.finished {
+        if self.finished {
             return Ok(());
         }
 
-        let mut decoder = GzDecoder::new(&self.buffer[..]);
-        let mut decompressed = Vec::new();
+        let decoder = match self.decoder.as_mut() {
+            Some(decoder) => decoder,
+            None => return Ok(()),
+        };
 
         loop {
             let mut chunk = [0u8; 8192];
             match decoder.read(&mut chunk) {
                 Ok(0) => {
-                    // EOF - we've decompressed everything
-                    self.finished = true;
-                    break;
+                    if finalize {
+                        self.finished = true;
+                    }
+                    return Ok(());
                 }
-                Ok(n) => {
-                    decompressed.extend_from_slice(&chunk[..n]);
+                Ok(n) => output.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && !finalize => {
+                    return Ok(());
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    // Need more input data - this is normal for streaming
-                    break;
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && finalize => {
+                    return Err(format!("gzip decompress error: {}", e));
                 }
                 Err(e) => {
+                    if finalize && e.kind() == std::io::ErrorKind::InvalidData {
+                        return Err(format!("gzip decompress error: {}", e));
+                    }
+                    self.finished = true;
                     return Err(format!("gzip decompress error: {}", e));
                 }
             }
         }
-
-        output.extend_from_slice(&decompressed);
-        Ok(())
     }
 }
 
 impl Transform for GzipTransform {
     fn process(&mut self, input: &[u8], output: &mut Vec<u8>) -> Result<(), String> {
-        // Accumulate input
-        self.buffer.extend_from_slice(input);
-        // Try to decompress what we have
-        self.try_decompress(output)
+        if input.is_empty() {
+            return Ok(());
+        }
+
+        match self.decoder.as_mut() {
+            Some(decoder) => decoder.get_mut().get_mut().extend_from_slice(input),
+            None => {
+                self.decoder = Some(flate2::bufread::GzDecoder::new(std::io::Cursor::new(
+                    input.to_vec(),
+                )));
+            }
+        }
+        self.drain_decoder(output, false)
     }
 
     fn finish(&mut self, output: &mut Vec<u8>) -> Result<(), String> {
-        // Final decompression attempt
-        self.try_decompress(output)
+        self.drain_decoder(output, true)
     }
 }
 
@@ -252,7 +263,8 @@ impl StreamingFilePreview {
     /// Create a new streaming preview with temp file
     pub fn new(compression: Compression) -> Result<Self, String> {
         let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let temp_path = std::env::temp_dir().join(format!("s6ui-preview-{}-{}", std::process::id(), counter));
+        let temp_path =
+            std::env::temp_dir().join(format!("s6ui-preview-{}-{}", std::process::id(), counter));
 
         let temp_file = OpenOptions::new()
             .read(true)
@@ -294,11 +306,7 @@ impl StreamingFilePreview {
     /// Get total source size if known
     pub fn total_source_size(&self) -> Option<u64> {
         let size = self.total_source_size.load(Ordering::SeqCst);
-        if size > 0 {
-            Some(size)
-        } else {
-            None
-        }
+        if size > 0 { Some(size) } else { None }
     }
 
     /// Get bytes written (decompressed)
@@ -413,9 +421,9 @@ impl StreamingFilePreview {
         for (i, &byte) in state.partial_line[search_start..].iter().enumerate() {
             if byte == b'\n' {
                 let abs_pos = search_start + i;
-                let line_start = write_offset as i64
-                    - (partial_len as i64 - data.len() as i64)
-                    + abs_pos as i64 + 1;
+                let line_start = write_offset as i64 - (partial_len as i64 - data.len() as i64)
+                    + abs_pos as i64
+                    + 1;
                 if line_start >= 0 {
                     new_line_offsets.push(line_start as u64);
                 }
@@ -452,7 +460,10 @@ impl StreamingFilePreview {
     /// Mark as downloading (full file)
     pub fn set_downloading(&self) {
         let mut state = self.state.lock().unwrap();
-        if matches!(state.status, StreamingStatus::PrefetchReady | StreamingStatus::Prefetching) {
+        if matches!(
+            state.status,
+            StreamingStatus::PrefetchReady | StreamingStatus::Prefetching
+        ) {
             state.status = StreamingStatus::Downloading;
         }
     }
@@ -565,10 +576,22 @@ mod tests {
     #[test]
     fn test_compression_detection() {
         assert_eq!(Compression::from_filename("file.txt"), Compression::None);
-        assert_eq!(Compression::from_filename("file.json.gz"), Compression::Gzip);
-        assert_eq!(Compression::from_filename("file.log.gzip"), Compression::Gzip);
-        assert_eq!(Compression::from_filename("file.csv.zst"), Compression::Zstd);
-        assert_eq!(Compression::from_filename("file.data.zstd"), Compression::Zstd);
+        assert_eq!(
+            Compression::from_filename("file.json.gz"),
+            Compression::Gzip
+        );
+        assert_eq!(
+            Compression::from_filename("file.log.gzip"),
+            Compression::Gzip
+        );
+        assert_eq!(
+            Compression::from_filename("file.csv.zst"),
+            Compression::Zstd
+        );
+        assert_eq!(
+            Compression::from_filename("file.data.zstd"),
+            Compression::Zstd
+        );
     }
 
     #[test]

@@ -9,6 +9,8 @@ pub struct BrowserUI {
     text_viewer: MmapTextViewer,
     /// Currently loaded preview key (bucket/key)
     viewer_preview_key: Option<String>,
+    /// Request generation for the currently loaded preview key
+    viewer_preview_request_id: u64,
 }
 
 impl BrowserUI {
@@ -17,6 +19,7 @@ impl BrowserUI {
             path_input: "s3://".to_string(),
             text_viewer: MmapTextViewer::new(),
             viewer_preview_key: None,
+            viewer_preview_request_id: 0,
         }
     }
 
@@ -105,13 +108,7 @@ impl BrowserUI {
         }
     }
 
-    fn render_left_pane(
-        &mut self,
-        ui: &Ui,
-        model: &mut BrowserModel,
-        width: f32,
-        height: f32,
-    ) {
+    fn render_left_pane(&mut self, ui: &Ui, model: &mut BrowserModel, width: f32, height: f32) {
         ui.child_window("LeftPane")
             .size([width, height])
             .build(ui, || {
@@ -166,11 +163,20 @@ impl BrowserUI {
 
         // Clone bucket names to avoid borrow conflict
         let bucket_names: Vec<String> = model.buckets.iter().map(|b| b.name.clone()).collect();
+        let mut pending_hover_bucket: Option<String> = None;
         for name in &bucket_names {
             let label = format!("[B] {}", name);
             if ui.selectable(label) {
                 model.navigate_into(name, "");
+                return;
             }
+            if ui.is_item_hovered() {
+                pending_hover_bucket = Some(name.clone());
+            }
+        }
+
+        if let Some(bucket) = pending_hover_bucket {
+            model.prefetch_folder(&bucket, "");
         }
     }
 
@@ -181,7 +187,7 @@ impl BrowserUI {
         // Ensure folder is loaded
         let node_exists = model.get_node(&bucket, &prefix).is_some();
         if !node_exists {
-            model.load_folder(&bucket, &prefix);
+            model.ensure_current_folder_loaded();
             ui.text_colored([0.5, 0.5, 1.0, 1.0], "Loading...");
             return;
         }
@@ -218,6 +224,8 @@ impl BrowserUI {
         // Track pending action (can't mutate model while borrowing node)
         let mut pending_navigate: Option<String> = None;
         let mut pending_select: Option<String> = None;
+        let mut pending_hover_folder: Option<String> = None;
+        let mut pending_hover_file: Option<String> = None;
 
         // Use ListClipper for virtual scrolling - only access visible items
         {
@@ -235,6 +243,8 @@ impl BrowserUI {
                     let label = format!("[D] {}", obj.display_name);
                     if ui.selectable(label) {
                         pending_navigate = Some(obj.key.clone());
+                    } else if ui.is_item_hovered() {
+                        pending_hover_folder = Some(obj.key.clone());
                     }
                 } else {
                     let label = format!("    {}  ({})", obj.display_name, format_size(obj.size));
@@ -242,6 +252,8 @@ impl BrowserUI {
                     let is_selected = model.selected_preview.as_ref() == Some(&preview_key);
                     if ui.selectable_config(label).selected(is_selected).build() {
                         pending_select = Some(obj.key.clone());
+                    } else if ui.is_item_hovered() {
+                        pending_hover_file = Some(obj.key.clone());
                     }
                 }
             }
@@ -252,6 +264,10 @@ impl BrowserUI {
             model.navigate_into(&bucket, &key);
         } else if let Some(key) = pending_select {
             model.select_file(&bucket, &key);
+        } else if let Some(key) = pending_hover_folder {
+            model.prefetch_folder(&bucket, &key);
+        } else if let Some(key) = pending_hover_file {
+            model.prefetch_file(&bucket, &key);
         }
 
         // Loading indicator at bottom
@@ -351,10 +367,17 @@ impl BrowserUI {
             .build(ui, || {
                 // Check if we need to update the viewer's source
                 let current_preview_key = model.selected_preview.clone();
+                let current_preview_request_id = model
+                    .selected_preview()
+                    .map(|node| node.request_id())
+                    .unwrap_or(0);
 
                 // Update viewer if preview changed
-                if current_preview_key != self.viewer_preview_key {
+                if current_preview_key != self.viewer_preview_key
+                    || current_preview_request_id != self.viewer_preview_request_id
+                {
                     self.viewer_preview_key = current_preview_key.clone();
+                    self.viewer_preview_request_id = current_preview_request_id;
                     if let Some(node) = model.selected_preview() {
                         self.text_viewer.open(node.preview.clone());
                     } else {
@@ -422,8 +445,6 @@ impl BrowserUI {
 
                         ui.separator();
 
-                        // Get data needed for rendering before we drop the borrow
-                        let can_continue = node.can_continue_download();
                         let is_complete = node.is_complete();
 
                         match &status {
@@ -448,29 +469,13 @@ impl BrowserUI {
                                     ui.text_colored([0.5, 0.5, 1.0, 1.0], "Loading...");
                                 } else {
                                     // Calculate available height for content
-                                    let button_height = if can_continue {
-                                        ui.frame_height_with_spacing() + 8.0
-                                    } else {
-                                        0.0
-                                    };
-                                    let content_height = ui.content_region_avail()[1] - button_height;
+                                    let content_height = ui.content_region_avail()[1];
                                     let content_width = ui.content_region_avail()[0];
 
                                     // Render using MmapTextViewer
                                     self.text_viewer.render(ui, content_width, content_height);
 
-                                    // "Load more" button for prefetch-only downloads
-                                    if can_continue {
-                                        ui.spacing();
-                                        if ui.button("Download full file") {
-                                            model.continue_download();
-                                        }
-                                        ui.same_line();
-                                        ui.text_colored(
-                                            [0.7, 0.7, 0.7, 1.0],
-                                            "(Only first 64KB loaded)",
-                                        );
-                                    } else if !is_complete && matches!(status, PreviewStatus::Loading) {
+                                    if !is_complete && matches!(status, PreviewStatus::Loading) {
                                         ui.spacing();
                                         ui.text_colored([0.5, 0.5, 1.0, 1.0], "Downloading...");
                                     }

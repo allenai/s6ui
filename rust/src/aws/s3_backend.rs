@@ -1,12 +1,13 @@
 use crate::aws::credentials::AwsProfile;
 use crate::aws::signer;
 use crate::aws::xml;
-use crate::backend::Backend;
+use crate::backend::{Backend, RequestPriority};
 use crate::events::{S3Bucket, S3Object, StateEvent};
 use crate::preview::{StreamingFilePreview, StreamingStatus};
 
 use futures_util::StreamExt;
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
@@ -19,7 +20,9 @@ enum WorkItem {
     ListObjects {
         bucket: String,
         prefix: String,
+        request_id: u64,
         continuation_token: String,
+        cancel_token: CancellationToken,
     },
     GetObject {
         bucket: String,
@@ -30,10 +33,56 @@ enum WorkItem {
         bucket: String,
         key: String,
         preview: Arc<StreamingFilePreview>,
+        request_id: u64,
         range_start: u64,
         max_bytes: Option<u64>,
+        cancel_token: CancellationToken,
     },
     Shutdown,
+}
+
+#[derive(Clone)]
+struct CancellationToken {
+    inner: Arc<CancellationTokenInner>,
+}
+
+struct CancellationTokenInner {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
+
+impl CancellationToken {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(CancellationTokenInner {
+                cancelled: AtomicBool::new(false),
+                notify: Notify::new(),
+            }),
+        }
+    }
+
+    fn cancel(&self) {
+        if !self.inner.cancelled.swap(true, Ordering::SeqCst) {
+            self.inner.notify.notify_waiters();
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::SeqCst)
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            let notified = self.inner.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 /// Shared inner state for S3Backend (accessed by tokio tasks)
@@ -46,8 +95,10 @@ struct S3BackendInner {
     event_tx: mpsc::Sender<StateEvent>,
     event_proxy: EventLoopProxy<()>,
     region_cache: Mutex<HashMap<String, String>>,
+    high_active: Mutex<HashMap<u64, CancellationToken>>,
+    low_active: Mutex<HashMap<u64, CancellationToken>>,
     client: reqwest::Client,
-    shutdown: std::sync::atomic::AtomicBool,
+    shutdown: AtomicBool,
 }
 
 impl S3BackendInner {
@@ -64,6 +115,37 @@ impl S3BackendInner {
     fn cache_region(&self, bucket: &str, region: &str) {
         let mut cache = self.region_cache.lock().unwrap();
         cache.insert(bucket.to_string(), region.to_string());
+    }
+
+    fn register_active_request(
+        &self,
+        priority: RequestPriority,
+        request_id: u64,
+        cancel_token: CancellationToken,
+    ) {
+        let active = match priority {
+            RequestPriority::High => &self.high_active,
+            RequestPriority::Low => &self.low_active,
+        };
+        active.lock().unwrap().insert(request_id, cancel_token);
+    }
+
+    fn finish_active_request(&self, priority: RequestPriority, request_id: u64) {
+        let active = match priority {
+            RequestPriority::High => &self.high_active,
+            RequestPriority::Low => &self.low_active,
+        };
+        active.lock().unwrap().remove(&request_id);
+    }
+
+    fn cancel_active_requests(&self, priority: RequestPriority) {
+        let active = match priority {
+            RequestPriority::High => &self.high_active,
+            RequestPriority::Low => &self.low_active,
+        };
+        for token in active.lock().unwrap().values() {
+            token.cancel();
+        }
     }
 }
 
@@ -90,8 +172,10 @@ impl S3Backend {
             event_tx,
             event_proxy,
             region_cache: Mutex::new(HashMap::new()),
+            high_active: Mutex::new(HashMap::new()),
+            low_active: Mutex::new(HashMap::new()),
             client: reqwest::Client::new(),
-            shutdown: std::sync::atomic::AtomicBool::new(false),
+            shutdown: AtomicBool::new(false),
         });
 
         // Spawn high-priority workers
@@ -116,9 +200,9 @@ impl S3Backend {
 
 impl Drop for S3Backend {
     fn drop(&mut self) {
-        self.inner
-            .shutdown
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.inner.shutdown.store(true, Ordering::Relaxed);
+        self.inner.cancel_active_requests(RequestPriority::High);
+        self.inner.cancel_active_requests(RequestPriority::Low);
 
         // Enqueue shutdown items for all workers
         {
@@ -151,15 +235,29 @@ impl Backend for S3Backend {
         self.inner.high_notify.notify_one();
     }
 
-    fn list_objects(&self, bucket: &str, prefix: &str, continuation_token: &str) {
-        let mut q = self.inner.high_queue.lock().unwrap();
+    fn list_objects(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        continuation_token: &str,
+        priority: RequestPriority,
+        request_id: u64,
+    ) {
+        let cancel_token = CancellationToken::new();
+        let (queue, notify) = match priority {
+            RequestPriority::High => (&self.inner.high_queue, &self.inner.high_notify),
+            RequestPriority::Low => (&self.inner.low_queue, &self.inner.low_notify),
+        };
+        let mut q = queue.lock().unwrap();
         q.push_back(WorkItem::ListObjects {
             bucket: bucket.to_string(),
             prefix: prefix.to_string(),
+            request_id,
             continuation_token: continuation_token.to_string(),
+            cancel_token,
         });
         drop(q);
-        self.inner.high_notify.notify_one();
+        notify.notify_one();
     }
 
     fn get_object(&self, bucket: &str, key: &str, max_bytes: usize) {
@@ -180,27 +278,58 @@ impl Backend for S3Backend {
         preview: Arc<StreamingFilePreview>,
         range_start: u64,
         max_bytes: Option<u64>,
+        priority: RequestPriority,
+        request_id: u64,
     ) {
-        let mut q = self.inner.high_queue.lock().unwrap();
+        let cancel_token = CancellationToken::new();
+        let (queue, notify) = match priority {
+            RequestPriority::High => (&self.inner.high_queue, &self.inner.high_notify),
+            RequestPriority::Low => (&self.inner.low_queue, &self.inner.low_notify),
+        };
+        let mut q = queue.lock().unwrap();
         q.push_back(WorkItem::StreamingGetObject {
             bucket: bucket.to_string(),
             key: key.to_string(),
             preview,
+            request_id,
             range_start,
             max_bytes,
+            cancel_token,
         });
         drop(q);
-        self.inner.high_notify.notify_one();
+        notify.notify_one();
     }
 
     fn cancel_all(&self) {
-        self.inner.high_queue.lock().unwrap().clear();
-        self.inner.low_queue.lock().unwrap().clear();
+        self.cancel_pending(RequestPriority::High);
+        self.cancel_pending(RequestPriority::Low);
+    }
+
+    fn cancel_pending(&self, priority: RequestPriority) {
+        let queue = match priority {
+            RequestPriority::High => &self.inner.high_queue,
+            RequestPriority::Low => &self.inner.low_queue,
+        };
+        let cancelled_items = std::mem::take(&mut *queue.lock().unwrap());
+        for item in cancelled_items {
+            match item {
+                WorkItem::ListObjects { cancel_token, .. }
+                | WorkItem::StreamingGetObject { cancel_token, .. } => cancel_token.cancel(),
+                WorkItem::ListBuckets | WorkItem::GetObject { .. } | WorkItem::Shutdown => {}
+            }
+        }
+        self.inner.cancel_active_requests(priority);
     }
 }
 
 /// Worker loop that pulls items from the appropriate queue and processes them
 async fn worker_loop(inner: Arc<S3BackendInner>, high_priority: bool) {
+    let priority = if high_priority {
+        RequestPriority::High
+    } else {
+        RequestPriority::Low
+    };
+
     loop {
         // Wait for work
         let notify = if high_priority {
@@ -212,7 +341,7 @@ async fn worker_loop(inner: Arc<S3BackendInner>, high_priority: bool) {
 
         // Process all available items
         loop {
-            if inner.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            if inner.shutdown.load(Ordering::Relaxed) {
                 return;
             }
 
@@ -236,9 +365,24 @@ async fn worker_loop(inner: Arc<S3BackendInner>, high_priority: bool) {
                 WorkItem::ListObjects {
                     bucket,
                     prefix,
+                    request_id,
                     continuation_token,
+                    cancel_token,
                 } => {
-                    process_list_objects(&inner, &bucket, &prefix, &continuation_token).await;
+                    if cancel_token.is_cancelled() {
+                        continue;
+                    }
+                    inner.register_active_request(priority, request_id, cancel_token.clone());
+                    process_list_objects(
+                        &inner,
+                        &bucket,
+                        &prefix,
+                        request_id,
+                        &continuation_token,
+                        &cancel_token,
+                    )
+                    .await;
+                    inner.finish_active_request(priority, request_id);
                 }
                 WorkItem::GetObject {
                     bucket,
@@ -251,10 +395,27 @@ async fn worker_loop(inner: Arc<S3BackendInner>, high_priority: bool) {
                     bucket,
                     key,
                     preview,
+                    request_id,
                     range_start,
                     max_bytes,
+                    cancel_token,
                 } => {
-                    process_streaming_get_object(&inner, &bucket, &key, preview, range_start, max_bytes).await;
+                    if cancel_token.is_cancelled() {
+                        continue;
+                    }
+                    inner.register_active_request(priority, request_id, cancel_token.clone());
+                    process_streaming_get_object(
+                        &inner,
+                        &bucket,
+                        &key,
+                        preview,
+                        request_id,
+                        range_start,
+                        max_bytes,
+                        &cancel_token,
+                    )
+                    .await;
+                    inner.finish_active_request(priority, request_id);
                 }
             }
         }
@@ -400,7 +561,9 @@ async fn process_list_objects(
     inner: &S3BackendInner,
     bucket: &str,
     prefix: &str,
+    request_id: u64,
     continuation_token: &str,
+    cancel_token: &CancellationToken,
 ) {
     let mut region = resolve_region(inner, bucket);
 
@@ -410,7 +573,10 @@ async fn process_list_objects(
         let (host, path) = build_host_path(profile, bucket, "", &region);
 
         // Build query string
-        let mut query = format!("delimiter={}&list-type=2&max-keys=1000", signer::url_encode("/"));
+        let mut query = format!(
+            "delimiter={}&list-type=2&max-keys=1000",
+            signer::url_encode("/")
+        );
         if !prefix.is_empty() {
             query.push_str(&format!("&prefix={}", signer::url_encode(prefix)));
         }
@@ -450,7 +616,7 @@ async fn process_list_objects(
             signed.url.clone()
         };
 
-        match do_http_get(inner, &url, &signed.headers).await {
+        match do_http_get_cancellable(inner, &url, &signed.headers, cancel_token).await {
             Ok(body) => {
                 // Check for PermanentRedirect
                 if let Some(error_code) = xml::extract_tag(&body, "Code") {
@@ -469,6 +635,7 @@ async fn process_list_objects(
                     inner.push_event(StateEvent::ObjectsError {
                         bucket: bucket.to_string(),
                         prefix: prefix.to_string(),
+                        request_id,
                         error,
                     });
                 } else {
@@ -477,6 +644,7 @@ async fn process_list_objects(
                     inner.push_event(StateEvent::ObjectsLoaded {
                         bucket: bucket.to_string(),
                         prefix: prefix.to_string(),
+                        request_id,
                         continuation_token: continuation_token.to_string(),
                         objects: result.objects,
                         next_continuation_token: result.next_continuation_token,
@@ -484,11 +652,13 @@ async fn process_list_objects(
                     });
                 }
             }
-            Err(e) => {
+            Err(RequestError::Cancelled) => return,
+            Err(RequestError::Http(e)) => {
                 inner.push_event(StateEvent::ObjectsError {
                     bucket: bucket.to_string(),
                     prefix: prefix.to_string(),
-                    error: format!("HTTP error: {}", e),
+                    request_id,
+                    error: e,
                 });
             }
         }
@@ -601,9 +771,14 @@ async fn process_streaming_get_object(
     bucket: &str,
     key: &str,
     preview: Arc<StreamingFilePreview>,
+    request_id: u64,
     range_start: u64,
     max_bytes: Option<u64>,
+    cancel_token: &CancellationToken,
 ) {
+    if cancel_token.is_cancelled() {
+        return;
+    }
     let mut region = resolve_region(inner, bucket);
     let profile = &inner.profile;
     let is_prefetch = max_bytes.is_some();
@@ -658,13 +833,26 @@ async fn process_streaming_get_object(
             req = req.header("Range", &range_header);
         }
 
-        match req.send().await {
+        match send_request(req, cancel_token).await {
             Ok(resp) => {
                 let status = resp.status();
 
                 if !status.is_success() && status.as_u16() != 206 {
                     // Check for redirect or error
-                    let body = resp.text().await.unwrap_or_default();
+                    let body = match read_response_text(resp, cancel_token).await {
+                        Ok(body) => body,
+                        Err(RequestError::Cancelled) => return,
+                        Err(RequestError::Http(error)) => {
+                            preview.set_status(StreamingStatus::Error(error.clone()));
+                            inner.push_event(StateEvent::PreviewError {
+                                bucket: bucket.to_string(),
+                                key: key.to_string(),
+                                request_id,
+                                error,
+                            });
+                            return;
+                        }
+                    };
 
                     if let Some(error_code) = xml::extract_tag(&body, "Code") {
                         if error_code == "PermanentRedirect" && attempt == 0 {
@@ -683,6 +871,7 @@ async fn process_streaming_get_object(
                             inner.push_event(StateEvent::PreviewProgress {
                                 bucket: bucket.to_string(),
                                 key: key.to_string(),
+                                request_id,
                                 decompressed_bytes: 0,
                                 source_bytes: 0,
                                 line_count: 1,
@@ -698,6 +887,7 @@ async fn process_streaming_get_object(
                     inner.push_event(StateEvent::PreviewError {
                         bucket: bucket.to_string(),
                         key: key.to_string(),
+                        request_id,
                         error,
                     });
                     return;
@@ -715,7 +905,7 @@ async fn process_streaming_get_object(
                 // Stream the response body - preview handles decompression internally
                 let mut stream = resp.bytes_stream();
 
-                while let Some(chunk_result) = stream.next().await {
+                while let Some(chunk_result) = next_stream_chunk(&mut stream, cancel_token).await {
                     match chunk_result {
                         Ok(chunk) => {
                             // Append raw chunk - preview handles decompression
@@ -724,6 +914,7 @@ async fn process_streaming_get_object(
                                 inner.push_event(StateEvent::PreviewError {
                                     bucket: bucket.to_string(),
                                     key: key.to_string(),
+                                    request_id,
                                     error: e,
                                 });
                                 return;
@@ -733,6 +924,7 @@ async fn process_streaming_get_object(
                             inner.push_event(StateEvent::PreviewProgress {
                                 bucket: bucket.to_string(),
                                 key: key.to_string(),
+                                request_id,
                                 decompressed_bytes: preview.bytes_written(),
                                 source_bytes: preview.source_bytes(),
                                 line_count: preview.line_count(),
@@ -745,6 +937,7 @@ async fn process_streaming_get_object(
                             inner.push_event(StateEvent::PreviewError {
                                 bucket: bucket.to_string(),
                                 key: key.to_string(),
+                                request_id,
                                 error,
                             });
                             return;
@@ -758,6 +951,7 @@ async fn process_streaming_get_object(
                     inner.push_event(StateEvent::PreviewError {
                         bucket: bucket.to_string(),
                         key: key.to_string(),
+                        request_id,
                         error: e,
                     });
                     return;
@@ -774,6 +968,7 @@ async fn process_streaming_get_object(
                 inner.push_event(StateEvent::PreviewProgress {
                     bucket: bucket.to_string(),
                     key: key.to_string(),
+                    request_id,
                     decompressed_bytes: preview.bytes_written(),
                     source_bytes: preview.source_bytes(),
                     line_count: preview.line_count(),
@@ -782,12 +977,13 @@ async fn process_streaming_get_object(
 
                 return;
             }
-            Err(e) => {
-                let error = format!("HTTP error: {}", e);
+            Err(RequestError::Cancelled) => return,
+            Err(RequestError::Http(error)) => {
                 preview.set_status(StreamingStatus::Error(error.clone()));
                 inner.push_event(StateEvent::PreviewError {
                     bucket: bucket.to_string(),
                     key: key.to_string(),
+                    request_id,
                     error,
                 });
                 return;
@@ -861,6 +1057,52 @@ async fn do_http_get(
     }
 }
 
+async fn do_http_get_cancellable(
+    inner: &S3BackendInner,
+    url: &str,
+    headers: &std::collections::BTreeMap<String, String>,
+    cancel_token: &CancellationToken,
+) -> Result<String, RequestError> {
+    let mut req = inner.client.get(url);
+    for (k, v) in headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+
+    let resp = send_request(req, cancel_token).await?;
+    read_response_text(resp, cancel_token).await
+}
+
+async fn send_request(
+    request: reqwest::RequestBuilder,
+    cancel_token: &CancellationToken,
+) -> Result<reqwest::Response, RequestError> {
+    tokio::select! {
+        _ = cancel_token.cancelled() => Err(RequestError::Cancelled),
+        result = request.send() => result.map_err(|e| RequestError::Http(format!("HTTP error: {}", e))),
+    }
+}
+
+async fn read_response_text(
+    response: reqwest::Response,
+    cancel_token: &CancellationToken,
+) -> Result<String, RequestError> {
+    tokio::select! {
+        _ = cancel_token.cancelled() => Err(RequestError::Cancelled),
+        body = response.text() => body
+            .map_err(|e| RequestError::Http(format!("HTTP error: {}", e))),
+    }
+}
+
+async fn next_stream_chunk<T, S>(stream: &mut S, cancel_token: &CancellationToken) -> Option<T>
+where
+    S: futures_util::Stream<Item = T> + Unpin,
+{
+    tokio::select! {
+        _ = cancel_token.cancelled() => None,
+        chunk = stream.next() => chunk,
+    }
+}
+
 /// Parse ListBuckets XML response
 fn parse_list_buckets_xml(xml_body: &str) -> Vec<S3Bucket> {
     let mut buckets = Vec::new();
@@ -895,6 +1137,11 @@ struct ListObjectsResult {
     objects: Vec<S3Object>,
     next_continuation_token: String,
     is_truncated: bool,
+}
+
+enum RequestError {
+    Cancelled,
+    Http(String),
 }
 
 /// Parse ListObjectsV2 XML response

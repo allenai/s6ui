@@ -28,6 +28,7 @@ pub enum StateEvent {
     ObjectsLoaded {
         bucket: String,
         prefix: String,
+        request_id: u64,
         continuation_token: String,
         objects: Vec<S3Object>,
         next_continuation_token: String,
@@ -36,6 +37,7 @@ pub enum StateEvent {
     ObjectsError {
         bucket: String,
         prefix: String,
+        request_id: u64,
         error: String,
     },
     ObjectContentLoaded {
@@ -52,6 +54,7 @@ pub enum StateEvent {
     PreviewProgress {
         bucket: String,
         key: String,
+        request_id: u64,
         decompressed_bytes: u64,
         source_bytes: u64,
         line_count: usize,
@@ -61,6 +64,7 @@ pub enum StateEvent {
     PreviewError {
         bucket: String,
         key: String,
+        request_id: u64,
         error: String,
     },
 }
