@@ -36,6 +36,7 @@ pub enum StateEvent {
     ObjectsError {
         bucket: String,
         prefix: String,
+        continuation_token: String,
         error: String,
     },
     ObjectContentLoaded {

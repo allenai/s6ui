@@ -212,7 +212,10 @@ pub fn sign_request(
     headers.insert("x-amz-content-sha256".to_string(), payload_hash);
     headers.insert("Authorization".to_string(), authorization);
     if !session_token.is_empty() {
-        headers.insert("x-amz-security-token".to_string(), session_token.to_string());
+        headers.insert(
+            "x-amz-security-token".to_string(),
+            session_token.to_string(),
+        );
     }
 
     SignedRequest { url, headers }

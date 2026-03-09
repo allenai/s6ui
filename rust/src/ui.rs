@@ -20,7 +20,13 @@ impl BrowserUI {
         }
     }
 
-    pub fn render(&mut self, ui: &Ui, model: &mut BrowserModel, window_size: [f32; 2]) {
+    pub fn render(
+        &mut self,
+        ui: &Ui,
+        model: &mut BrowserModel,
+        window_size: [f32; 2],
+        show_debug_overlay: bool,
+    ) {
         ui.window("S6 UI")
             .position([0.0, 0.0], Condition::Always)
             .size(window_size, Condition::Always)
@@ -46,6 +52,10 @@ impl BrowserUI {
                 // render_preview_pane needs mutable model for continue_download
                 self.render_preview_pane(ui, model, pane_width, pane_height);
             });
+
+        if show_debug_overlay {
+            self.render_debug_overlay(ui, model, window_size);
+        }
     }
 
     fn render_top_bar(&mut self, ui: &Ui, model: &mut BrowserModel) {
@@ -105,13 +115,7 @@ impl BrowserUI {
         }
     }
 
-    fn render_left_pane(
-        &mut self,
-        ui: &Ui,
-        model: &mut BrowserModel,
-        width: f32,
-        height: f32,
-    ) {
+    fn render_left_pane(&mut self, ui: &Ui, model: &mut BrowserModel, width: f32, height: f32) {
         ui.child_window("LeftPane")
             .size([width, height])
             .build(ui, || {
@@ -166,11 +170,21 @@ impl BrowserUI {
 
         // Clone bucket names to avoid borrow conflict
         let bucket_names: Vec<String> = model.buckets.iter().map(|b| b.name.clone()).collect();
+        let mut pending_open_bucket: Option<String> = None;
+        let mut pending_hover_bucket: Option<String> = None;
         for name in &bucket_names {
             let label = format!("[B] {}", name);
             if ui.selectable(label) {
-                model.navigate_into(name, "");
+                pending_open_bucket = Some(name.clone());
+            } else if ui.is_item_hovered() {
+                pending_hover_bucket = Some(name.clone());
             }
+        }
+
+        if let Some(bucket) = pending_open_bucket {
+            model.open_folder(&bucket, "");
+        } else if let Some(bucket) = pending_hover_bucket {
+            model.preload_folder_page(&bucket, "");
         }
     }
 
@@ -218,6 +232,8 @@ impl BrowserUI {
         // Track pending action (can't mutate model while borrowing node)
         let mut pending_navigate: Option<String> = None;
         let mut pending_select: Option<String> = None;
+        let mut pending_hover_folder: Option<String> = None;
+        let mut pending_hover_file: Option<String> = None;
 
         // Use ListClipper for virtual scrolling - only access visible items
         {
@@ -233,15 +249,21 @@ impl BrowserUI {
 
                 if is_folder_row {
                     let label = format!("[D] {}", obj.display_name);
-                    if ui.selectable(label) {
+                    let clicked = ui.selectable(label);
+                    if clicked {
                         pending_navigate = Some(obj.key.clone());
+                    } else if ui.is_item_hovered() {
+                        pending_hover_folder = Some(obj.key.clone());
                     }
                 } else {
                     let label = format!("    {}  ({})", obj.display_name, format_size(obj.size));
                     let preview_key = format!("{}/{}", bucket, obj.key);
                     let is_selected = model.selected_preview.as_ref() == Some(&preview_key);
-                    if ui.selectable_config(label).selected(is_selected).build() {
+                    let clicked = ui.selectable_config(label).selected(is_selected).build();
+                    if clicked {
                         pending_select = Some(obj.key.clone());
+                    } else if ui.is_item_hovered() {
+                        pending_hover_file = Some(obj.key.clone());
                     }
                 }
             }
@@ -249,9 +271,13 @@ impl BrowserUI {
 
         // Apply pending actions after borrow ends
         if let Some(key) = pending_navigate {
-            model.navigate_into(&bucket, &key);
+            model.open_folder(&bucket, &key);
         } else if let Some(key) = pending_select {
             model.select_file(&bucket, &key);
+        } else if let Some(key) = pending_hover_folder {
+            model.preload_folder_page(&bucket, &key);
+        } else if let Some(key) = pending_hover_file {
+            model.preload_file_head(&bucket, &key);
         }
 
         // Loading indicator at bottom
@@ -453,7 +479,8 @@ impl BrowserUI {
                                     } else {
                                         0.0
                                     };
-                                    let content_height = ui.content_region_avail()[1] - button_height;
+                                    let content_height =
+                                        ui.content_region_avail()[1] - button_height;
                                     let content_width = ui.content_region_avail()[0];
 
                                     // Render using MmapTextViewer
@@ -470,13 +497,100 @@ impl BrowserUI {
                                             [0.7, 0.7, 0.7, 1.0],
                                             "(Only first 64KB loaded)",
                                         );
-                                    } else if !is_complete && matches!(status, PreviewStatus::Loading) {
+                                    } else if !is_complete
+                                        && matches!(status, PreviewStatus::Loading)
+                                    {
                                         ui.spacing();
                                         ui.text_colored([0.5, 0.5, 1.0, 1.0], "Downloading...");
                                     }
                                 }
                             }
                         }
+                    }
+                }
+            });
+    }
+
+    fn render_debug_overlay(&self, ui: &Ui, model: &BrowserModel, window_size: [f32; 2]) {
+        let overlay_width = 380.0f32;
+        let overlay_x = (window_size[0] - overlay_width - 12.0).max(8.0);
+
+        ui.window("Runtime Debug")
+            .position([overlay_x, 12.0], Condition::Always)
+            .size([overlay_width, 0.0], Condition::Always)
+            .flags(
+                WindowFlags::NO_RESIZE
+                    | WindowFlags::NO_MOVE
+                    | WindowFlags::NO_COLLAPSE
+                    | WindowFlags::NO_SAVED_SETTINGS,
+            )
+            .build(|| {
+                ui.text(format!(
+                    "Request Gen: {}   Folder Req: {}   Auto Preload N: {}",
+                    model.debug_request_generation(),
+                    model.debug_folder_request_count(),
+                    model.auto_preload_count()
+                ));
+                ui.separator();
+
+                match model.backend_debug_snapshot() {
+                    Some(b) => {
+                        ui.text("Backend");
+                        ui.text(format!(
+                            "Queue high={} low={} | Active high={} low={}",
+                            b.high_queue_len,
+                            b.low_queue_len,
+                            b.active_high_requests,
+                            b.active_low_requests
+                        ));
+                        ui.text(format!(
+                            "Active list_buckets={} list_objects={} get_object={} streaming_get={}",
+                            b.active_list_buckets,
+                            b.active_list_objects,
+                            b.active_get_object,
+                            b.active_streaming_get_object
+                        ));
+                    }
+                    None => {
+                        ui.text_colored([0.7, 0.7, 0.7, 1.0], "Backend: not initialized");
+                    }
+                }
+
+                ui.separator();
+                ui.text("Selected Transfer");
+                match model.selected_preview_debug() {
+                    Some(t) => {
+                        ui.text(format!("Object: s3://{}/{}", t.bucket, t.key));
+                        ui.text(format!(
+                            "Status: {}  InFlight: {}  CanContinue: {}  Complete: {}",
+                            debug_preview_status_label(&t.status),
+                            yes_no(t.request_started),
+                            yes_no(t.can_continue_download),
+                            yes_no(t.is_complete)
+                        ));
+                        ui.text(format!(
+                            "Decompressed: {}   Source: {}",
+                            format_size_u64(t.bytes_written),
+                            format_size_u64(t.source_bytes)
+                        ));
+                        if let Some(total) = t.total_source_size {
+                            let pct = if total > 0 {
+                                (t.source_bytes as f64 * 100.0 / total as f64).clamp(0.0, 100.0)
+                            } else {
+                                0.0
+                            };
+                            ui.text(format!(
+                                "Source Total: {} ({:.1}%)",
+                                format_size_u64(total),
+                                pct
+                            ));
+                        }
+                        if let PreviewStatus::Error(err) = &t.status {
+                            ui.text_colored([1.0, 0.35, 0.35, 1.0], format!("Error: {}", err));
+                        }
+                    }
+                    None => {
+                        ui.text_colored([0.7, 0.7, 0.7, 1.0], "No file selected");
                     }
                 }
             });
@@ -507,6 +621,24 @@ fn format_size(bytes: i64) -> String {
         return format!("{} MB", format_number(bytes / (1024 * 1024)));
     }
     format!("{} GB", format_number(bytes / (1024 * 1024 * 1024)))
+}
+
+fn format_size_u64(bytes: u64) -> String {
+    let clamped = bytes.min(i64::MAX as u64) as i64;
+    format_size(clamped)
+}
+
+fn debug_preview_status_label(status: &PreviewStatus) -> &'static str {
+    match status {
+        PreviewStatus::Loading => "loading",
+        PreviewStatus::Ready => "ready",
+        PreviewStatus::Unsupported => "unsupported",
+        PreviewStatus::Error(_) => "error",
+    }
+}
+
+fn yes_no(v: bool) -> &'static str {
+    if v { "yes" } else { "no" }
 }
 
 fn build_s3_path(bucket: &str, prefix: &str) -> String {

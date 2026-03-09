@@ -8,8 +8,8 @@ use memmap2::Mmap;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use zstd::stream::raw::Operation;
 
 /// Atomic counter for unique temp file names
@@ -242,6 +242,8 @@ pub struct StreamingFilePreview {
     temp_path: PathBuf,
     /// Total size of source if known (Content-Length)
     total_source_size: AtomicU64,
+    /// Cooperative cancellation flag for in-flight backend requests.
+    cancel_requested: std::sync::atomic::AtomicBool,
     /// Compression type
     compression: Compression,
     /// Mutable state protected by mutex
@@ -252,7 +254,8 @@ impl StreamingFilePreview {
     /// Create a new streaming preview with temp file
     pub fn new(compression: Compression) -> Result<Self, String> {
         let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let temp_path = std::env::temp_dir().join(format!("s6ui-preview-{}-{}", std::process::id(), counter));
+        let temp_path =
+            std::env::temp_dir().join(format!("s6ui-preview-{}-{}", std::process::id(), counter));
 
         let temp_file = OpenOptions::new()
             .read(true)
@@ -268,6 +271,7 @@ impl StreamingFilePreview {
             temp_file,
             temp_path,
             total_source_size: AtomicU64::new(0),
+            cancel_requested: std::sync::atomic::AtomicBool::new(false),
             compression,
             state: Mutex::new(StreamingState {
                 bytes_written: 0,
@@ -294,11 +298,22 @@ impl StreamingFilePreview {
     /// Get total source size if known
     pub fn total_source_size(&self) -> Option<u64> {
         let size = self.total_source_size.load(Ordering::SeqCst);
-        if size > 0 {
-            Some(size)
-        } else {
-            None
-        }
+        if size > 0 { Some(size) } else { None }
+    }
+
+    /// Request cancellation for active backend work using this preview.
+    pub fn cancel_requests(&self) {
+        self.cancel_requested.store(true, Ordering::SeqCst);
+    }
+
+    /// Clear cancellation before starting a new backend request.
+    pub fn clear_cancel_request(&self) {
+        self.cancel_requested.store(false, Ordering::SeqCst);
+    }
+
+    /// Check whether cancellation has been requested.
+    pub fn is_cancel_requested(&self) -> bool {
+        self.cancel_requested.load(Ordering::SeqCst)
     }
 
     /// Get bytes written (decompressed)
@@ -413,9 +428,9 @@ impl StreamingFilePreview {
         for (i, &byte) in state.partial_line[search_start..].iter().enumerate() {
             if byte == b'\n' {
                 let abs_pos = search_start + i;
-                let line_start = write_offset as i64
-                    - (partial_len as i64 - data.len() as i64)
-                    + abs_pos as i64 + 1;
+                let line_start = write_offset as i64 - (partial_len as i64 - data.len() as i64)
+                    + abs_pos as i64
+                    + 1;
                 if line_start >= 0 {
                     new_line_offsets.push(line_start as u64);
                 }
@@ -452,7 +467,10 @@ impl StreamingFilePreview {
     /// Mark as downloading (full file)
     pub fn set_downloading(&self) {
         let mut state = self.state.lock().unwrap();
-        if matches!(state.status, StreamingStatus::PrefetchReady | StreamingStatus::Prefetching) {
+        if matches!(
+            state.status,
+            StreamingStatus::PrefetchReady | StreamingStatus::Prefetching
+        ) {
             state.status = StreamingStatus::Downloading;
         }
     }
@@ -565,10 +583,22 @@ mod tests {
     #[test]
     fn test_compression_detection() {
         assert_eq!(Compression::from_filename("file.txt"), Compression::None);
-        assert_eq!(Compression::from_filename("file.json.gz"), Compression::Gzip);
-        assert_eq!(Compression::from_filename("file.log.gzip"), Compression::Gzip);
-        assert_eq!(Compression::from_filename("file.csv.zst"), Compression::Zstd);
-        assert_eq!(Compression::from_filename("file.data.zstd"), Compression::Zstd);
+        assert_eq!(
+            Compression::from_filename("file.json.gz"),
+            Compression::Gzip
+        );
+        assert_eq!(
+            Compression::from_filename("file.log.gzip"),
+            Compression::Gzip
+        );
+        assert_eq!(
+            Compression::from_filename("file.csv.zst"),
+            Compression::Zstd
+        );
+        assert_eq!(
+            Compression::from_filename("file.data.zstd"),
+            Compression::Zstd
+        );
     }
 
     #[test]

@@ -1,12 +1,13 @@
 use crate::aws::credentials::AwsProfile;
 use crate::aws::signer;
 use crate::aws::xml;
-use crate::backend::Backend;
+use crate::backend::{Backend, BackendDebugSnapshot, RequestPriority};
 use crate::events::{S3Bucket, S3Object, StateEvent};
 use crate::preview::{StreamingFilePreview, StreamingStatus};
 
 use futures_util::StreamExt;
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
@@ -39,6 +40,7 @@ enum WorkItem {
 /// Shared inner state for S3Backend (accessed by tokio tasks)
 struct S3BackendInner {
     profile: AwsProfile,
+    verbose: bool,
     high_queue: Mutex<VecDeque<WorkItem>>,
     low_queue: Mutex<VecDeque<WorkItem>>,
     high_notify: Notify,
@@ -47,13 +49,25 @@ struct S3BackendInner {
     event_proxy: EventLoopProxy<()>,
     region_cache: Mutex<HashMap<String, String>>,
     client: reqwest::Client,
-    shutdown: std::sync::atomic::AtomicBool,
+    shutdown: AtomicBool,
+    active_high_requests: AtomicUsize,
+    active_low_requests: AtomicUsize,
+    active_list_buckets: AtomicUsize,
+    active_list_objects: AtomicUsize,
+    active_get_object: AtomicUsize,
+    active_streaming_get_object: AtomicUsize,
 }
 
 impl S3BackendInner {
     fn push_event(&self, event: StateEvent) {
         let _ = self.event_tx.send(event);
         let _ = self.event_proxy.send_event(());
+    }
+
+    fn log_verbose(&self, stage: &str, message: &str) {
+        if self.verbose {
+            eprintln!("[req {stage}] {message}");
+        }
     }
 
     fn get_cached_region(&self, bucket: &str) -> Option<String> {
@@ -79,10 +93,12 @@ impl S3Backend {
         profile: AwsProfile,
         runtime_handle: Handle,
         event_proxy: EventLoopProxy<()>,
+        verbose: bool,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::channel();
         let inner = Arc::new(S3BackendInner {
             profile,
+            verbose,
             high_queue: Mutex::new(VecDeque::new()),
             low_queue: Mutex::new(VecDeque::new()),
             high_notify: Notify::new(),
@@ -91,17 +107,23 @@ impl S3Backend {
             event_proxy,
             region_cache: Mutex::new(HashMap::new()),
             client: reqwest::Client::new(),
-            shutdown: std::sync::atomic::AtomicBool::new(false),
+            shutdown: AtomicBool::new(false),
+            active_high_requests: AtomicUsize::new(0),
+            active_low_requests: AtomicUsize::new(0),
+            active_list_buckets: AtomicUsize::new(0),
+            active_list_objects: AtomicUsize::new(0),
+            active_get_object: AtomicUsize::new(0),
+            active_streaming_get_object: AtomicUsize::new(0),
         });
 
         // Spawn high-priority workers
-        for _ in 0..4 {
+        for _ in 0..8 {
             let inner = Arc::clone(&inner);
             runtime_handle.spawn(worker_loop(inner, true));
         }
 
         // Spawn low-priority workers
-        for _ in 0..2 {
+        for _ in 0..8 {
             let inner = Arc::clone(&inner);
             runtime_handle.spawn(worker_loop(inner, false));
         }
@@ -112,13 +134,193 @@ impl S3Backend {
             _runtime_handle: runtime_handle,
         }
     }
+
+    fn enqueue_work_item(&self, item: WorkItem, priority: RequestPriority) {
+        let item_label = work_item_label(&item);
+        let (queue, notify) = match priority {
+            RequestPriority::High => (&self.inner.high_queue, &self.inner.high_notify),
+            RequestPriority::Low => (&self.inner.low_queue, &self.inner.low_notify),
+        };
+        let mut q = queue.lock().unwrap();
+        q.push_back(item);
+        let queue_len = q.len();
+        drop(q);
+        self.inner.log_verbose(
+            "queued",
+            &format!(
+                "prio={} item={} q={queue_len}",
+                priority_name(priority),
+                item_label
+            ),
+        );
+        notify.notify_one();
+    }
+
+    fn promote_list_objects_if_queued(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        continuation_token: &str,
+    ) -> bool {
+        let mut low_q = self.inner.low_queue.lock().unwrap();
+        let pos = low_q.iter().position(|item| {
+            matches!(
+                item,
+                WorkItem::ListObjects {
+                    bucket: b,
+                    prefix: p,
+                    continuation_token: t,
+                } if b == bucket && p == prefix && t == continuation_token
+            )
+        });
+        if pos.is_none() {
+            return false;
+        }
+        let _ = low_q.remove(pos.unwrap());
+        drop(low_q);
+
+        self.inner.log_verbose(
+            "queued",
+            &format!(
+                "promote prio=high item=list_objects b={} p={} ct={}",
+                bucket,
+                display_empty(prefix),
+                display_empty(continuation_token),
+            ),
+        );
+
+        self.enqueue_work_item(
+            WorkItem::ListObjects {
+                bucket: bucket.to_string(),
+                prefix: prefix.to_string(),
+                continuation_token: continuation_token.to_string(),
+            },
+            RequestPriority::High,
+        );
+        true
+    }
+
+    fn promote_streaming_get_object_if_queued(
+        &self,
+        bucket: &str,
+        key: &str,
+        range_start: u64,
+        max_bytes: Option<u64>,
+        preview: Arc<StreamingFilePreview>,
+    ) -> bool {
+        let mut low_q = self.inner.low_queue.lock().unwrap();
+        let pos = low_q.iter().position(|item| {
+            matches!(
+                item,
+                WorkItem::StreamingGetObject {
+                    bucket: b,
+                    key: k,
+                    range_start: rs,
+                    max_bytes: mb,
+                    ..
+                } if b == bucket && k == key && *rs == range_start && *mb == max_bytes
+            )
+        });
+        if pos.is_none() {
+            return false;
+        }
+        let _ = low_q.remove(pos.unwrap());
+        drop(low_q);
+
+        self.inner.log_verbose(
+            "queued",
+            &format!(
+                "promote prio=high item=streaming_get_object b={} k={} rs={} max={}",
+                bucket,
+                key,
+                range_start,
+                display_optional_u64(max_bytes),
+            ),
+        );
+
+        self.enqueue_work_item(
+            WorkItem::StreamingGetObject {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                preview,
+                range_start,
+                max_bytes,
+            },
+            RequestPriority::High,
+        );
+        true
+    }
+}
+
+fn priority_name(priority: RequestPriority) -> &'static str {
+    match priority {
+        RequestPriority::High => "high",
+        RequestPriority::Low => "low",
+    }
+}
+
+fn queue_name(high_priority: bool) -> &'static str {
+    if high_priority { "high" } else { "low" }
+}
+
+fn display_empty(value: &str) -> &str {
+    if value.is_empty() { "-" } else { value }
+}
+
+fn display_optional_u64(value: Option<u64>) -> String {
+    match value {
+        Some(v) => v.to_string(),
+        None => "-".to_string(),
+    }
+}
+
+fn work_item_label(item: &WorkItem) -> String {
+    match item {
+        WorkItem::ListBuckets => "list_buckets".to_string(),
+        WorkItem::ListObjects {
+            bucket,
+            prefix,
+            continuation_token,
+        } => format!(
+            "list_objects b={} p={} ct={}",
+            bucket,
+            display_empty(prefix),
+            display_empty(continuation_token),
+        ),
+        WorkItem::GetObject {
+            bucket,
+            key,
+            max_bytes,
+        } => format!(
+            "get_object b={} k={} max={}",
+            bucket,
+            key,
+            if *max_bytes == 0 {
+                "-".to_string()
+            } else {
+                max_bytes.to_string()
+            },
+        ),
+        WorkItem::StreamingGetObject {
+            bucket,
+            key,
+            range_start,
+            max_bytes,
+            ..
+        } => format!(
+            "streaming_get_object b={} k={} rs={} max={}",
+            bucket,
+            key,
+            range_start,
+            display_optional_u64(*max_bytes),
+        ),
+        WorkItem::Shutdown => "shutdown".to_string(),
+    }
 }
 
 impl Drop for S3Backend {
     fn drop(&mut self) {
-        self.inner
-            .shutdown
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.inner.shutdown.store(true, Ordering::Relaxed);
 
         // Enqueue shutdown items for all workers
         {
@@ -145,58 +347,185 @@ impl Backend for S3Backend {
     }
 
     fn list_buckets(&self) {
-        let mut q = self.inner.high_queue.lock().unwrap();
-        q.push_back(WorkItem::ListBuckets);
-        drop(q);
-        self.inner.high_notify.notify_one();
+        self.inner
+            .log_verbose("issued", "prio=high item=list_buckets");
+        self.enqueue_work_item(WorkItem::ListBuckets, RequestPriority::High);
     }
 
-    fn list_objects(&self, bucket: &str, prefix: &str, continuation_token: &str) {
-        let mut q = self.inner.high_queue.lock().unwrap();
-        q.push_back(WorkItem::ListObjects {
-            bucket: bucket.to_string(),
-            prefix: prefix.to_string(),
-            continuation_token: continuation_token.to_string(),
-        });
-        drop(q);
-        self.inner.high_notify.notify_one();
+    fn list_objects_with_priority(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        continuation_token: &str,
+        priority: RequestPriority,
+    ) {
+        self.inner.log_verbose(
+            "issued",
+            &format!(
+                "prio={} item=list_objects b={} p={} ct={}",
+                priority_name(priority),
+                bucket,
+                display_empty(prefix),
+                display_empty(continuation_token),
+            ),
+        );
+
+        if priority == RequestPriority::High
+            && self.promote_list_objects_if_queued(bucket, prefix, continuation_token)
+        {
+            return;
+        }
+
+        self.enqueue_work_item(
+            WorkItem::ListObjects {
+                bucket: bucket.to_string(),
+                prefix: prefix.to_string(),
+                continuation_token: continuation_token.to_string(),
+            },
+            priority,
+        );
     }
 
     fn get_object(&self, bucket: &str, key: &str, max_bytes: usize) {
-        let mut q = self.inner.high_queue.lock().unwrap();
-        q.push_back(WorkItem::GetObject {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            max_bytes,
-        });
-        drop(q);
-        self.inner.high_notify.notify_one();
+        self.inner.log_verbose(
+            "issued",
+            &format!(
+                "prio=high item=get_object b={} k={} max={}",
+                bucket,
+                key,
+                if max_bytes == 0 {
+                    "-".to_string()
+                } else {
+                    max_bytes.to_string()
+                },
+            ),
+        );
+        self.enqueue_work_item(
+            WorkItem::GetObject {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                max_bytes,
+            },
+            RequestPriority::High,
+        );
     }
 
-    fn streaming_get_object(
+    fn streaming_get_object_with_priority(
         &self,
         bucket: &str,
         key: &str,
         preview: Arc<StreamingFilePreview>,
         range_start: u64,
         max_bytes: Option<u64>,
+        priority: RequestPriority,
     ) {
-        let mut q = self.inner.high_queue.lock().unwrap();
-        q.push_back(WorkItem::StreamingGetObject {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            preview,
-            range_start,
-            max_bytes,
-        });
-        drop(q);
-        self.inner.high_notify.notify_one();
+        self.inner.log_verbose(
+            "issued",
+            &format!(
+                "prio={} item=streaming_get_object b={} k={} rs={} max={}",
+                priority_name(priority),
+                bucket,
+                key,
+                range_start,
+                display_optional_u64(max_bytes),
+            ),
+        );
+
+        if priority == RequestPriority::High
+            && self.promote_streaming_get_object_if_queued(
+                bucket,
+                key,
+                range_start,
+                max_bytes,
+                Arc::clone(&preview),
+            )
+        {
+            return;
+        }
+
+        self.enqueue_work_item(
+            WorkItem::StreamingGetObject {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                preview,
+                range_start,
+                max_bytes,
+            },
+            priority,
+        );
     }
 
     fn cancel_all(&self) {
-        self.inner.high_queue.lock().unwrap().clear();
-        self.inner.low_queue.lock().unwrap().clear();
+        let cleared_high = {
+            let mut high_q = self.inner.high_queue.lock().unwrap();
+            let count = high_q.len();
+            high_q.clear();
+            count
+        };
+        let cleared_low = {
+            let mut low_q = self.inner.low_queue.lock().unwrap();
+            let count = low_q.len();
+            low_q.clear();
+            count
+        };
+        self.inner.log_verbose(
+            "cancelled",
+            &format!("queued_clear_all high={cleared_high} low={cleared_low}"),
+        );
     }
+
+    fn cancel_streaming_requests_except(&self, bucket: &str, key: &str) {
+        let removed_high = {
+            let mut high_q = self.inner.high_queue.lock().unwrap();
+            retain_streaming_requests_for_key(&mut high_q, bucket, key)
+        };
+        let removed_low = {
+            let mut low_q = self.inner.low_queue.lock().unwrap();
+            retain_streaming_requests_for_key(&mut low_q, bucket, key)
+        };
+        self.inner.log_verbose(
+            "cancelled",
+            &format!(
+                "queued_streaming_except keep={}/{} removed={}",
+                bucket,
+                key,
+                removed_high + removed_low
+            ),
+        );
+    }
+
+    fn debug_snapshot(&self) -> BackendDebugSnapshot {
+        BackendDebugSnapshot {
+            high_queue_len: self.inner.high_queue.lock().unwrap().len(),
+            low_queue_len: self.inner.low_queue.lock().unwrap().len(),
+            active_high_requests: self.inner.active_high_requests.load(Ordering::Relaxed),
+            active_low_requests: self.inner.active_low_requests.load(Ordering::Relaxed),
+            active_list_buckets: self.inner.active_list_buckets.load(Ordering::Relaxed),
+            active_list_objects: self.inner.active_list_objects.load(Ordering::Relaxed),
+            active_get_object: self.inner.active_get_object.load(Ordering::Relaxed),
+            active_streaming_get_object: self
+                .inner
+                .active_streaming_get_object
+                .load(Ordering::Relaxed),
+        }
+    }
+}
+
+fn retain_streaming_requests_for_key(
+    queue: &mut VecDeque<WorkItem>,
+    bucket: &str,
+    key: &str,
+) -> usize {
+    let before = queue.len();
+    queue.retain(|item| match item {
+        WorkItem::StreamingGetObject {
+            bucket: queued_bucket,
+            key: queued_key,
+            ..
+        } => queued_bucket == bucket && queued_key == key,
+        _ => true,
+    });
+    before.saturating_sub(queue.len())
 }
 
 /// Worker loop that pulls items from the appropriate queue and processes them
@@ -212,7 +541,7 @@ async fn worker_loop(inner: Arc<S3BackendInner>, high_priority: bool) {
 
         // Process all available items
         loop {
-            if inner.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            if inner.shutdown.load(Ordering::Relaxed) {
                 return;
             }
 
@@ -229,6 +558,54 @@ async fn worker_loop(inner: Arc<S3BackendInner>, high_priority: bool) {
                 Some(item) => item,
                 None => break,
             };
+            let item_label = work_item_label(&item);
+
+            let (queue_counter, kind_counter) = match &item {
+                WorkItem::Shutdown => {
+                    if high_priority {
+                        (&inner.active_high_requests, None)
+                    } else {
+                        (&inner.active_low_requests, None)
+                    }
+                }
+                WorkItem::ListBuckets => (
+                    if high_priority {
+                        &inner.active_high_requests
+                    } else {
+                        &inner.active_low_requests
+                    },
+                    Some(&inner.active_list_buckets),
+                ),
+                WorkItem::ListObjects { .. } => (
+                    if high_priority {
+                        &inner.active_high_requests
+                    } else {
+                        &inner.active_low_requests
+                    },
+                    Some(&inner.active_list_objects),
+                ),
+                WorkItem::GetObject { .. } => (
+                    if high_priority {
+                        &inner.active_high_requests
+                    } else {
+                        &inner.active_low_requests
+                    },
+                    Some(&inner.active_get_object),
+                ),
+                WorkItem::StreamingGetObject { .. } => (
+                    if high_priority {
+                        &inner.active_high_requests
+                    } else {
+                        &inner.active_low_requests
+                    },
+                    Some(&inner.active_streaming_get_object),
+                ),
+            };
+
+            if let Some(kind_counter) = kind_counter {
+                queue_counter.fetch_add(1, Ordering::Relaxed);
+                kind_counter.fetch_add(1, Ordering::Relaxed);
+            }
 
             match item {
                 WorkItem::Shutdown => return,
@@ -254,9 +631,27 @@ async fn worker_loop(inner: Arc<S3BackendInner>, high_priority: bool) {
                     range_start,
                     max_bytes,
                 } => {
-                    process_streaming_get_object(&inner, &bucket, &key, preview, range_start, max_bytes).await;
+                    process_streaming_get_object(
+                        &inner,
+                        &bucket,
+                        &key,
+                        preview,
+                        range_start,
+                        max_bytes,
+                    )
+                    .await;
                 }
             }
+
+            if let Some(kind_counter) = kind_counter {
+                kind_counter.fetch_sub(1, Ordering::Relaxed);
+                queue_counter.fetch_sub(1, Ordering::Relaxed);
+            }
+
+            inner.log_verbose(
+                "finished",
+                &format!("queue={} item={item_label}", queue_name(high_priority)),
+            );
         }
     }
 }
@@ -410,7 +805,10 @@ async fn process_list_objects(
         let (host, path) = build_host_path(profile, bucket, "", &region);
 
         // Build query string
-        let mut query = format!("delimiter={}&list-type=2&max-keys=1000", signer::url_encode("/"));
+        let mut query = format!(
+            "delimiter={}&list-type=2&max-keys=1000",
+            signer::url_encode("/")
+        );
         if !prefix.is_empty() {
             query.push_str(&format!("&prefix={}", signer::url_encode(prefix)));
         }
@@ -469,6 +867,7 @@ async fn process_list_objects(
                     inner.push_event(StateEvent::ObjectsError {
                         bucket: bucket.to_string(),
                         prefix: prefix.to_string(),
+                        continuation_token: continuation_token.to_string(),
                         error,
                     });
                 } else {
@@ -488,6 +887,7 @@ async fn process_list_objects(
                 inner.push_event(StateEvent::ObjectsError {
                     bucket: bucket.to_string(),
                     prefix: prefix.to_string(),
+                    continuation_token: continuation_token.to_string(),
                     error: format!("HTTP error: {}", e),
                 });
             }
@@ -604,6 +1004,22 @@ async fn process_streaming_get_object(
     range_start: u64,
     max_bytes: Option<u64>,
 ) {
+    let max_bytes_label = display_optional_u64(max_bytes);
+    let log_cancel = |stage: &str| {
+        inner.log_verbose(
+            "cancelled",
+            &format!(
+                "inflight item=streaming_get_object b={} k={} rs={} max={} at={}",
+                bucket, key, range_start, max_bytes_label, stage
+            ),
+        );
+    };
+
+    if preview.is_cancel_requested() {
+        log_cancel("before_start");
+        return;
+    }
+
     let mut region = resolve_region(inner, bucket);
     let profile = &inner.profile;
     let is_prefetch = max_bytes.is_some();
@@ -616,6 +1032,11 @@ async fn process_streaming_get_object(
     }
 
     for attempt in 0..2 {
+        if preview.is_cancel_requested() {
+            log_cancel("before_attempt");
+            return;
+        }
+
         let (host, path) = build_host_path(profile, bucket, key, &region);
 
         // Build Range header
@@ -661,6 +1082,7 @@ async fn process_streaming_get_object(
         match req.send().await {
             Ok(resp) => {
                 let status = resp.status();
+                let status_code = status.as_u16();
 
                 if !status.is_success() && status.as_u16() != 206 {
                     // Check for redirect or error
@@ -716,8 +1138,16 @@ async fn process_streaming_get_object(
                 let mut stream = resp.bytes_stream();
 
                 while let Some(chunk_result) = stream.next().await {
+                    if preview.is_cancel_requested() {
+                        log_cancel("during_stream");
+                        return;
+                    }
                     match chunk_result {
                         Ok(chunk) => {
+                            if preview.is_cancel_requested() {
+                                log_cancel("before_append");
+                                return;
+                            }
                             // Append raw chunk - preview handles decompression
                             if let Err(e) = preview.append_chunk(&chunk) {
                                 preview.set_status(StreamingStatus::Error(e.clone()));
@@ -752,6 +1182,11 @@ async fn process_streaming_get_object(
                     }
                 }
 
+                if preview.is_cancel_requested() {
+                    log_cancel("before_finalize");
+                    return;
+                }
+
                 // Finalize stream (flush any remaining decompression state)
                 if let Err(e) = preview.finish_stream() {
                     preview.set_status(StreamingStatus::Error(e.clone()));
@@ -765,7 +1200,17 @@ async fn process_streaming_get_object(
 
                 // Set final status
                 if is_prefetch {
-                    preview.set_prefetch_ready();
+                    let downloaded_source = preview.source_bytes().saturating_sub(range_start);
+                    let reached_eof = status_code != 206
+                        || max_bytes
+                            .map(|limit| downloaded_source < limit)
+                            .unwrap_or(false);
+
+                    if reached_eof {
+                        preview.set_complete();
+                    } else {
+                        preview.set_prefetch_ready();
+                    }
                 } else {
                     preview.set_complete();
                 }
