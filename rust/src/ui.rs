@@ -143,6 +143,8 @@ impl BrowserUI {
     }
 
     fn render_bucket_list(&self, ui: &Ui, model: &mut BrowserModel) {
+        model.ensure_buckets_loaded();
+
         if model.buckets_loading {
             ui.text_colored([0.5, 0.5, 1.0, 1.0], "Loading buckets...");
             return;

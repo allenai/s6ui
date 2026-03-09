@@ -265,6 +265,7 @@ pub struct BrowserModel {
     pub buckets: Vec<S3Bucket>,
     pub buckets_loading: bool,
     pub buckets_error: String,
+    buckets_request_id: u64,
 
     // Folder nodes cache
     nodes: HashMap<String, FolderNode>,
@@ -288,6 +289,7 @@ impl BrowserModel {
             buckets: Vec::new(),
             buckets_loading: false,
             buckets_error: String::new(),
+            buckets_request_id: 0,
             nodes: HashMap::new(),
             current_bucket: String::new(),
             current_prefix: String::new(),
@@ -343,12 +345,21 @@ impl BrowserModel {
 
         for event in events {
             match event {
-                StateEvent::BucketsLoaded { buckets } => {
+                StateEvent::BucketsLoaded {
+                    request_id,
+                    buckets,
+                } => {
+                    if request_id != self.buckets_request_id {
+                        continue;
+                    }
                     self.buckets = buckets;
                     self.buckets_loading = false;
                     self.buckets_error.clear();
                 }
-                StateEvent::BucketsError { error } => {
+                StateEvent::BucketsError { request_id, error } => {
+                    if request_id != self.buckets_request_id {
+                        continue;
+                    }
                     self.buckets_loading = false;
                     self.buckets_error = error;
                 }
@@ -443,19 +454,6 @@ impl BrowserModel {
                         }
                     }
                 }
-                StateEvent::ObjectContentLoaded {
-                    bucket,
-                    key,
-                    content,
-                } => {
-                    // Legacy event - no longer used for streaming previews
-                    // but kept for compatibility
-                    let _ = (bucket, key, content);
-                }
-                StateEvent::ObjectContentError { bucket, key, error } => {
-                    // Legacy event - no longer used for streaming previews
-                    let _ = (bucket, key, error);
-                }
                 StateEvent::PreviewProgress {
                     bucket,
                     key,
@@ -531,15 +529,21 @@ impl BrowserModel {
     pub fn refresh(&mut self) {
         self.buckets.clear();
         self.buckets_error.clear();
-        self.buckets_loading = true;
         self.nodes.clear();
         self.previews.clear();
         self.selected_preview = None;
 
         if let Some(b) = &self.backend {
             b.cancel_all();
-            b.list_buckets();
         }
+        self.request_buckets();
+    }
+
+    pub fn ensure_buckets_loaded(&mut self) {
+        if self.buckets_loading || !self.buckets.is_empty() || !self.buckets_error.is_empty() {
+            return;
+        }
+        self.request_buckets();
     }
 
     pub fn ensure_current_folder_loaded(&mut self) {
@@ -762,6 +766,21 @@ impl BrowserModel {
             } else {
                 break;
             }
+        }
+    }
+
+    fn request_buckets(&mut self) {
+        if self.backend.is_none() {
+            return;
+        }
+
+        self.buckets_loading = true;
+        self.buckets_error.clear();
+        let request_id = self.next_request_id();
+        self.buckets_request_id = request_id;
+
+        if let Some(backend) = &self.backend {
+            backend.list_buckets(request_id);
         }
     }
 
@@ -1146,6 +1165,9 @@ mod tests {
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum RecordedRequest {
+        Buckets {
+            request_id: u64,
+        },
         List {
             bucket: String,
             prefix: String,
@@ -1209,7 +1231,11 @@ mod tests {
             std::mem::take(&mut *events)
         }
 
-        fn list_buckets(&self) {}
+        fn list_buckets(&self, request_id: u64) {
+            self.state
+                .lock_requests()
+                .push(RecordedRequest::Buckets { request_id });
+        }
 
         fn list_objects(
             &self,
@@ -1227,8 +1253,6 @@ mod tests {
                 request_id,
             });
         }
-
-        fn get_object(&self, _bucket: &str, _key: &str, _max_bytes: usize) {}
 
         fn streaming_get_object(
             &self,
@@ -1262,6 +1286,48 @@ mod tests {
         let mut model = BrowserModel::new();
         model.set_backend(Box::new(backend.clone()));
         (model, backend)
+    }
+
+    #[test]
+    fn refresh_ignores_stale_bucket_results() {
+        let (mut model, backend) = model_with_backend();
+
+        model.refresh();
+        let first_request_id = match &backend.requests()[0] {
+            RecordedRequest::Buckets { request_id } => *request_id,
+            other => panic!("unexpected request: {other:?}"),
+        };
+
+        backend.drain_requests();
+        model.refresh();
+        let second_request_id = match &backend.requests()[0] {
+            RecordedRequest::Buckets { request_id } => *request_id,
+            other => panic!("unexpected request: {other:?}"),
+        };
+
+        backend.push_event(StateEvent::BucketsLoaded {
+            request_id: first_request_id,
+            buckets: vec![S3Bucket {
+                name: "stale".to_string(),
+                creation_date: String::new(),
+            }],
+        });
+        model.process_events();
+        assert!(model.buckets.is_empty());
+        assert!(model.buckets_loading);
+
+        backend.push_event(StateEvent::BucketsLoaded {
+            request_id: second_request_id,
+            buckets: vec![S3Bucket {
+                name: "fresh".to_string(),
+                creation_date: String::new(),
+            }],
+        });
+        model.process_events();
+
+        assert_eq!(model.buckets.len(), 1);
+        assert_eq!(model.buckets[0].name, "fresh");
+        assert!(!model.buckets_loading);
     }
 
     #[test]

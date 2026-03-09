@@ -17,7 +17,7 @@ pub trait Backend: Send {
     fn take_events(&self) -> Vec<StateEvent>;
 
     /// Request bucket list.
-    fn list_buckets(&self);
+    fn list_buckets(&self, request_id: u64);
 
     /// Request objects in a bucket/prefix.
     /// continuation_token is empty for first request.
@@ -29,10 +29,6 @@ pub trait Backend: Send {
         priority: RequestPriority,
         request_id: u64,
     );
-
-    /// Request object content (for preview).
-    /// max_bytes limits download size (0 = no limit).
-    fn get_object(&self, bucket: &str, key: &str, max_bytes: usize);
 
     /// Request streaming object download with on-the-fly decompression.
     /// Writes decompressed content to the StreamingFilePreview's temp file.

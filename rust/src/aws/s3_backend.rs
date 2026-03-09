@@ -16,18 +16,16 @@ use winit::event_loop::EventLoopProxy;
 
 /// Work item types for the background workers
 enum WorkItem {
-    ListBuckets,
+    ListBuckets {
+        request_id: u64,
+        cancel_token: CancellationToken,
+    },
     ListObjects {
         bucket: String,
         prefix: String,
         request_id: u64,
         continuation_token: String,
         cancel_token: CancellationToken,
-    },
-    GetObject {
-        bucket: String,
-        key: String,
-        max_bytes: usize,
     },
     StreamingGetObject {
         bucket: String,
@@ -228,9 +226,13 @@ impl Backend for S3Backend {
         self.event_rx.try_iter().collect()
     }
 
-    fn list_buckets(&self) {
+    fn list_buckets(&self, request_id: u64) {
+        let cancel_token = CancellationToken::new();
         let mut q = self.inner.high_queue.lock().unwrap();
-        q.push_back(WorkItem::ListBuckets);
+        q.push_back(WorkItem::ListBuckets {
+            request_id,
+            cancel_token,
+        });
         drop(q);
         self.inner.high_notify.notify_one();
     }
@@ -258,17 +260,6 @@ impl Backend for S3Backend {
         });
         drop(q);
         notify.notify_one();
-    }
-
-    fn get_object(&self, bucket: &str, key: &str, max_bytes: usize) {
-        let mut q = self.inner.high_queue.lock().unwrap();
-        q.push_back(WorkItem::GetObject {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            max_bytes,
-        });
-        drop(q);
-        self.inner.high_notify.notify_one();
     }
 
     fn streaming_get_object(
@@ -313,9 +304,10 @@ impl Backend for S3Backend {
         let cancelled_items = std::mem::take(&mut *queue.lock().unwrap());
         for item in cancelled_items {
             match item {
-                WorkItem::ListObjects { cancel_token, .. }
+                WorkItem::ListBuckets { cancel_token, .. }
+                | WorkItem::ListObjects { cancel_token, .. }
                 | WorkItem::StreamingGetObject { cancel_token, .. } => cancel_token.cancel(),
-                WorkItem::ListBuckets | WorkItem::GetObject { .. } | WorkItem::Shutdown => {}
+                WorkItem::Shutdown => {}
             }
         }
         self.inner.cancel_active_requests(priority);
@@ -361,7 +353,17 @@ async fn worker_loop(inner: Arc<S3BackendInner>, high_priority: bool) {
 
             match item {
                 WorkItem::Shutdown => return,
-                WorkItem::ListBuckets => process_list_buckets(&inner).await,
+                WorkItem::ListBuckets {
+                    request_id,
+                    cancel_token,
+                } => {
+                    if cancel_token.is_cancelled() {
+                        continue;
+                    }
+                    inner.register_active_request(priority, request_id, cancel_token.clone());
+                    process_list_buckets(&inner, request_id, &cancel_token).await;
+                    inner.finish_active_request(priority, request_id);
+                }
                 WorkItem::ListObjects {
                     bucket,
                     prefix,
@@ -383,13 +385,6 @@ async fn worker_loop(inner: Arc<S3BackendInner>, high_priority: bool) {
                     )
                     .await;
                     inner.finish_active_request(priority, request_id);
-                }
-                WorkItem::GetObject {
-                    bucket,
-                    key,
-                    max_bytes,
-                } => {
-                    process_get_object(&inner, &bucket, &key, max_bytes).await;
                 }
                 WorkItem::StreamingGetObject {
                     bucket,
@@ -498,7 +493,11 @@ fn resolve_region(inner: &S3BackendInner, bucket: &str) -> String {
     }
 }
 
-async fn process_list_buckets(inner: &S3BackendInner) {
+async fn process_list_buckets(
+    inner: &S3BackendInner,
+    request_id: u64,
+    cancel_token: &CancellationToken,
+) {
     let profile = &inner.profile;
     let region = if profile.region.is_empty() {
         "us-east-1".to_string()
@@ -540,18 +539,23 @@ async fn process_list_buckets(inner: &S3BackendInner) {
         signed.url.clone()
     };
 
-    match do_http_get(inner, &url, &signed.headers).await {
+    match do_http_get_cancellable(inner, &url, &signed.headers, cancel_token).await {
         Ok(body) => {
             if let Some(error) = xml::extract_error(&body) {
-                inner.push_event(StateEvent::BucketsError { error });
+                inner.push_event(StateEvent::BucketsError { request_id, error });
             } else {
                 let buckets = parse_list_buckets_xml(&body);
-                inner.push_event(StateEvent::BucketsLoaded { buckets });
+                inner.push_event(StateEvent::BucketsLoaded {
+                    request_id,
+                    buckets,
+                });
             }
         }
-        Err(e) => {
+        Err(RequestError::Cancelled) => {}
+        Err(RequestError::Http(error)) => {
             inner.push_event(StateEvent::BucketsError {
-                error: format!("HTTP error: {}", e),
+                request_id,
+                error,
             });
         }
     }
@@ -659,105 +663,6 @@ async fn process_list_objects(
                     prefix: prefix.to_string(),
                     request_id,
                     error: e,
-                });
-            }
-        }
-        return;
-    }
-}
-
-async fn process_get_object(inner: &S3BackendInner, bucket: &str, key: &str, max_bytes: usize) {
-    let mut region = resolve_region(inner, bucket);
-
-    let profile = &inner.profile;
-
-    for attempt in 0..2 {
-        let (host, path) = build_host_path(profile, bucket, key, &region);
-
-        let signed = signer::sign_request(
-            "GET",
-            &host,
-            &path,
-            "",
-            &region,
-            "s3",
-            &profile.access_key_id,
-            &profile.secret_access_key,
-            "",
-            &profile.session_token,
-        );
-
-        let url = if !profile.endpoint_url.is_empty() {
-            let scheme = if profile.endpoint_url.starts_with("http://") {
-                "http"
-            } else {
-                "https"
-            };
-            format!("{}://{}{}", scheme, host, path)
-        } else {
-            signed.url.clone()
-        };
-
-        // Build request with optional Range header
-        let mut req = inner.client.get(&url);
-        for (k, v) in &signed.headers {
-            req = req.header(k.as_str(), v.as_str());
-        }
-        if max_bytes > 0 {
-            req = req.header("Range", format!("bytes=0-{}", max_bytes - 1));
-        }
-
-        match req.send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-
-                if status.is_success() || status.as_u16() == 206 {
-                    inner.cache_region(bucket, &region);
-                    inner.push_event(StateEvent::ObjectContentLoaded {
-                        bucket: bucket.to_string(),
-                        key: key.to_string(),
-                        content: body,
-                    });
-                    return;
-                }
-
-                // Check for PermanentRedirect
-                if let Some(error_code) = xml::extract_tag(&body, "Code") {
-                    if error_code == "PermanentRedirect" && attempt == 0 {
-                        if let Some(new_region) = try_extract_redirect_region(&body, bucket) {
-                            if new_region != region {
-                                region = new_region;
-                                inner.cache_region(bucket, &region);
-                                continue;
-                            }
-                        }
-                    }
-
-                    // InvalidRange means empty file
-                    if error_code == "InvalidRange" {
-                        inner.push_event(StateEvent::ObjectContentLoaded {
-                            bucket: bucket.to_string(),
-                            key: key.to_string(),
-                            content: String::new(),
-                        });
-                        return;
-                    }
-                }
-
-                let error = xml::extract_error(&body)
-                    .unwrap_or_else(|| format!("HTTP {}", status.as_u16()));
-                inner.push_event(StateEvent::ObjectContentError {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
-                    error,
-                });
-            }
-            Err(e) => {
-                inner.push_event(StateEvent::ObjectContentError {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
-                    error: format!("HTTP error: {}", e),
                 });
             }
         }
@@ -1029,32 +934,6 @@ fn try_extract_redirect_region(body: &str, bucket: &str) -> Option<String> {
 
     // Last resort default
     Some("us-east-1".to_string())
-}
-
-/// Perform an HTTP GET request using reqwest
-async fn do_http_get(
-    inner: &S3BackendInner,
-    url: &str,
-    headers: &std::collections::BTreeMap<String, String>,
-) -> Result<String, String> {
-    let mut req = inner.client.get(url);
-    for (k, v) in headers {
-        req = req.header(k.as_str(), v.as_str());
-    }
-
-    match req.send().await {
-        Ok(resp) => {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            if status.is_success() {
-                Ok(body)
-            } else {
-                // Return the body even on error status (contains XML error info)
-                Ok(body)
-            }
-        }
-        Err(e) => Err(e.to_string()),
-    }
 }
 
 async fn do_http_get_cancellable(

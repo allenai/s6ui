@@ -20,9 +20,11 @@ use crate::preview::StreamingStatus;
 /// Events emitted by the backend for the model to process
 pub enum StateEvent {
     BucketsLoaded {
+        request_id: u64,
         buckets: Vec<S3Bucket>,
     },
     BucketsError {
+        request_id: u64,
         error: String,
     },
     ObjectsLoaded {
@@ -38,16 +40,6 @@ pub enum StateEvent {
         bucket: String,
         prefix: String,
         request_id: u64,
-        error: String,
-    },
-    ObjectContentLoaded {
-        bucket: String,
-        key: String,
-        content: String,
-    },
-    ObjectContentError {
-        bucket: String,
-        key: String,
         error: String,
     },
     /// Streaming preview progress update
