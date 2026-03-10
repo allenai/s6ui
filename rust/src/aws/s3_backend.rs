@@ -668,12 +668,27 @@ fn build_host_path(
     }
 }
 
-/// Extract region from S3 endpoint like "bucket.s3.us-west-2.amazonaws.com"
+/// Extract region from S3 endpoint like:
+/// - "bucket.s3.us-west-2.amazonaws.com"
+/// - "bucket.s3-us-west-2.amazonaws.com"
+/// - "s3.us-west-2.amazonaws.com"
+/// - "s3-us-west-2.amazonaws.com"
 fn extract_region_from_endpoint(endpoint: &str) -> Option<String> {
-    // Look for "s3." pattern
-    let s3_pos = endpoint.find("s3.")?;
-    let region_start = s3_pos + 3;
-    let rest = &endpoint[region_start..];
+    let endpoint = endpoint
+        .strip_prefix("https://")
+        .or_else(|| endpoint.strip_prefix("http://"))
+        .unwrap_or(endpoint)
+        .trim_end_matches('/');
+    let host = endpoint.split('/').next().unwrap_or(endpoint);
+
+    let rest = if let Some(s3_pos) = host.find("s3.") {
+        &host[s3_pos + 3..]
+    } else if let Some(s3_pos) = host.find("s3-") {
+        &host[s3_pos + 3..]
+    } else {
+        return None;
+    };
+
     let region_end = rest.find('.')?;
     if region_end == 0 {
         return None;
@@ -685,6 +700,28 @@ fn extract_region_from_endpoint(endpoint: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+fn extract_region_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    headers
+        .get("x-amz-bucket-region")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn is_region_redirect_response(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    error_code: Option<&str>,
+) -> bool {
+    status.is_redirection()
+        || extract_region_from_headers(headers).is_some()
+        || matches!(
+            error_code,
+            Some("PermanentRedirect" | "AuthorizationHeaderMalformed" | "IncorrectEndpoint")
+        )
 }
 
 /// Resolve the region for a bucket: cached > profile default
@@ -847,22 +884,76 @@ async fn process_list_objects(
             signed.url.clone()
         };
 
-        match do_http_get_cancellable(inner, &url, &signed.headers, cancel_token).await {
-            Ok(body) => {
-                // Check for PermanentRedirect
-                if let Some(error_code) = xml::extract_tag(&body, "Code") {
-                    if error_code == "PermanentRedirect" && attempt == 0 {
-                        if let Some(new_region) = try_extract_redirect_region(&body, bucket) {
-                            if new_region != region {
-                                region = new_region;
-                                inner.cache_region(bucket, &region);
-                                continue;
-                            }
+        let mut req = inner.client.get(&url);
+        for (k, v) in &signed.headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+
+        match send_request(req, cancel_token).await {
+            Ok(resp) => {
+                let status = resp.status();
+                let headers = resp.headers().clone();
+                let body = match read_response_text(resp, cancel_token).await {
+                    Ok(body) => body,
+                    Err(RequestError::Cancelled) => {
+                        if inner.verbose {
+                            eprintln!(
+                                "[s6ui] cancelled id={} priority={} kind=list_objects bucket={} prefix={} continuation={}",
+                                request_id,
+                                priority.as_str(),
+                                bucket,
+                                prefix,
+                                continuation_state(continuation_token),
+                            );
+                        }
+                        return;
+                    }
+                    Err(RequestError::Http(error)) => {
+                        inner.push_event(StateEvent::ObjectsError {
+                            bucket: bucket.to_string(),
+                            prefix: prefix.to_string(),
+                            request_id,
+                            error,
+                        });
+                        if inner.verbose {
+                            eprintln!(
+                                "[s6ui] ended id={} priority={} kind=list_objects bucket={} prefix={} continuation={}",
+                                request_id,
+                                priority.as_str(),
+                                bucket,
+                                prefix,
+                                continuation_state(continuation_token),
+                            );
+                        }
+                        return;
+                    }
+                };
+
+                let error_code = xml::extract_tag(&body, "Code");
+                if attempt == 0
+                    && is_region_redirect_response(status, &headers, error_code.as_deref())
+                {
+                    if let Some(new_region) =
+                        try_extract_redirect_region(Some(&headers), &body, bucket)
+                    {
+                        if new_region != region {
+                            region = new_region;
+                            inner.cache_region(bucket, &region);
+                            continue;
                         }
                     }
                 }
 
-                if let Some(error) = xml::extract_error(&body) {
+                if !status.is_success() {
+                    let error = xml::extract_error(&body)
+                        .unwrap_or_else(|| format!("HTTP {}", status.as_u16()));
+                    inner.push_event(StateEvent::ObjectsError {
+                        bucket: bucket.to_string(),
+                        prefix: prefix.to_string(),
+                        request_id,
+                        error,
+                    });
+                } else if let Some(error) = xml::extract_error(&body) {
                     inner.push_event(StateEvent::ObjectsError {
                         bucket: bucket.to_string(),
                         prefix: prefix.to_string(),
@@ -1013,6 +1104,7 @@ async fn process_streaming_get_object(
         match send_request(req, cancel_token).await {
             Ok(resp) => {
                 let status = resp.status();
+                let headers = resp.headers().clone();
 
                 if !status.is_success() && status.as_u16() != 206 {
                     // Check for redirect or error
@@ -1054,17 +1146,22 @@ async fn process_streaming_get_object(
                         }
                     };
 
-                    if let Some(error_code) = xml::extract_tag(&body, "Code") {
-                        if error_code == "PermanentRedirect" && attempt == 0 {
-                            if let Some(new_region) = try_extract_redirect_region(&body, bucket) {
-                                if new_region != region {
-                                    region = new_region;
-                                    inner.cache_region(bucket, &region);
-                                    continue;
-                                }
+                    let error_code = xml::extract_tag(&body, "Code");
+                    if attempt == 0
+                        && is_region_redirect_response(status, &headers, error_code.as_deref())
+                    {
+                        if let Some(new_region) =
+                            try_extract_redirect_region(Some(&headers), &body, bucket)
+                        {
+                            if new_region != region {
+                                region = new_region;
+                                inner.cache_region(bucket, &region);
+                                continue;
                             }
                         }
+                    }
 
+                    if let Some(error_code) = error_code.as_deref() {
                         // InvalidRange means empty file
                         if error_code == "InvalidRange" {
                             preview.set_complete();
@@ -1114,7 +1211,7 @@ async fn process_streaming_get_object(
                 let content_length = resp.content_length();
                 if let Some(total_source_size) = response_total_source_size(
                     status,
-                    resp.headers(),
+                    &headers,
                     content_length,
                     range_start,
                     max_bytes,
@@ -1290,7 +1387,24 @@ async fn process_streaming_get_object(
 }
 
 /// Try to extract the correct region from a PermanentRedirect response
-fn try_extract_redirect_region(body: &str, bucket: &str) -> Option<String> {
+fn try_extract_redirect_region(
+    headers: Option<&reqwest::header::HeaderMap>,
+    body: &str,
+    bucket: &str,
+) -> Option<String> {
+    if let Some(headers) = headers {
+        if let Some(region) = extract_region_from_headers(headers) {
+            return Some(region);
+        }
+    }
+
+    if let Some(region) = xml::extract_tag(body, "Region") {
+        let region = region.trim();
+        if !region.is_empty() {
+            return Some(region.to_string());
+        }
+    }
+
     // Try from Endpoint tag
     if let Some(endpoint) = xml::extract_tag(body, "Endpoint") {
         if let Some(region) = extract_region_from_endpoint(&endpoint) {
@@ -1324,8 +1438,7 @@ fn try_extract_redirect_region(body: &str, bucket: &str) -> Option<String> {
         }
     }
 
-    // Last resort default
-    Some("us-east-1".to_string())
+    None
 }
 
 async fn do_http_get_cancellable(
@@ -1492,6 +1605,7 @@ fn parse_list_objects_xml(xml_body: &str, _prefix: &str) -> ListObjectsResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::header::{HeaderMap, HeaderValue};
 
     #[test]
     fn test_parse_content_range_total() {
@@ -1509,5 +1623,60 @@ mod tests {
         assert!(!should_finalize_preview(Some(65536), 0, 65536));
         assert!(!should_finalize_preview(Some(65536), 123456, 65536));
         assert!(should_finalize_preview(Some(65536), 123456, 123456));
+    }
+
+    #[test]
+    fn test_extract_region_from_endpoint_supports_dash_and_dot_formats() {
+        assert_eq!(
+            extract_region_from_endpoint("bucket.s3.us-west-2.amazonaws.com"),
+            Some("us-west-2".to_string())
+        );
+        assert_eq!(
+            extract_region_from_endpoint("bucket.s3-us-west-2.amazonaws.com"),
+            Some("us-west-2".to_string())
+        );
+        assert_eq!(
+            extract_region_from_endpoint("https://bucket.s3-us-west-2.amazonaws.com/path"),
+            Some("us-west-2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_try_extract_redirect_region_prefers_bucket_region_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-bucket-region", HeaderValue::from_static("us-west-2"));
+
+        assert_eq!(
+            try_extract_redirect_region(Some(&headers), "", "allennlp-finbarrt"),
+            Some("us-west-2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_try_extract_redirect_region_parses_dashed_endpoint() {
+        let body = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>PermanentRedirect</Code>
+  <Endpoint>allennlp-finbarrt.s3-us-west-2.amazonaws.com</Endpoint>
+</Error>"#;
+
+        assert_eq!(
+            try_extract_redirect_region(None, body, "allennlp-finbarrt"),
+            Some("us-west-2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_try_extract_redirect_region_reads_region_tag() {
+        let body = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>AuthorizationHeaderMalformed</Code>
+  <Region>us-west-2</Region>
+</Error>"#;
+
+        assert_eq!(
+            try_extract_redirect_region(None, body, "bucket"),
+            Some("us-west-2".to_string())
+        );
     }
 }
