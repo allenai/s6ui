@@ -3,6 +3,7 @@ mod backend;
 mod events;
 mod model;
 mod preview;
+mod settings;
 mod text_viewer;
 mod ui;
 
@@ -109,6 +110,17 @@ impl App {
         let mut model = BrowserModel::new();
         model.profiles = credentials::load_aws_profiles();
         model.selected_profile_idx = credentials::default_profile_index(&model.profiles);
+        let saved_settings = settings::load_settings();
+        if opts.initial_path.is_none() && !saved_settings.profile_name.is_empty() {
+            if let Some(idx) = model
+                .profiles
+                .iter()
+                .position(|profile| profile.name == saved_settings.profile_name)
+            {
+                model.selected_profile_idx = idx;
+            }
+        }
+        model.set_settings(saved_settings);
 
         Self {
             window: None,
@@ -140,6 +152,13 @@ impl App {
 
             if let Some(path) = self.initial_path.take() {
                 self.model.navigate_to(&path);
+            } else if !self.model.settings().bucket.is_empty() {
+                let path = format!(
+                    "s3://{}/{}",
+                    self.model.settings().bucket,
+                    self.model.settings().prefix
+                );
+                self.model.navigate_to(&path);
             } else {
                 self.model.refresh();
             }
@@ -161,6 +180,26 @@ impl App {
             );
             self.model.set_backend(Box::new(backend));
             self.model.refresh();
+        }
+    }
+
+    fn persist_settings(&mut self) {
+        let profile_name = self
+            .model
+            .profiles
+            .get(self.model.selected_profile_idx)
+            .map(|profile| profile.name.clone())
+            .unwrap_or_default();
+        let bucket = self.model.current_bucket.clone();
+        let prefix = self.model.current_prefix.clone();
+
+        let settings = self.model.settings_mut();
+        settings.profile_name = profile_name;
+        settings.bucket = bucket;
+        settings.prefix = prefix;
+
+        if let Err(err) = settings::save_settings(settings) {
+            eprintln!("Failed to save settings: {err}");
         }
     }
 }
@@ -436,6 +475,10 @@ impl ApplicationHandler<()> for App {
         if let Some(window) = &self.window {
             window.window.request_redraw();
         }
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.persist_settings();
     }
 }
 

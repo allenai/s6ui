@@ -83,7 +83,9 @@ impl BrowserUI {
         ui.same_line();
 
         let refresh_width = 70.0;
-        let path_width = ui.window_size()[0] - ui.cursor_pos()[0] - refresh_width - 12.0;
+        let recent_paths_width = ui.frame_height();
+        let path_width =
+            ui.window_size()[0] - ui.cursor_pos()[0] - refresh_width - recent_paths_width - 16.0;
         ui.set_next_item_width(path_width);
 
         if ui
@@ -99,6 +101,25 @@ impl BrowserUI {
         let current_path = build_s3_path(&model.current_bucket, &model.current_prefix);
         if current_path != self.path_input && !ui.is_item_active() {
             self.path_input = current_path;
+        }
+
+        ui.same_line();
+        if ui.arrow_button("##recent_paths", Direction::Down) {
+            ui.open_popup("RecentPathsPopup");
+        }
+
+        if let Some(_popup) = ui.begin_popup("RecentPathsPopup") {
+            let top_paths = model.top_frecent_paths(20);
+            if top_paths.is_empty() {
+                ui.text_colored([0.5, 0.5, 0.5, 1.0], "No recent paths");
+            } else {
+                for path in top_paths {
+                    if ui.selectable(path.as_str()) {
+                        self.path_input = path.clone();
+                        model.navigate_to(&path);
+                    }
+                }
+            }
         }
 
         ui.same_line();

@@ -1,9 +1,10 @@
 use crate::backend::{Backend, RequestPriority};
 use crate::events::{S3Bucket, S3Object, StateEvent};
 use crate::preview::{Compression, PREFETCH_BYTES, StreamingFilePreview, StreamingStatus};
+use crate::settings::{AppSettings, PathEntry};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Loading state for folder data (orthogonal to `loading: bool` which tracks in-flight requests)
 #[derive(Clone, PartialEq)]
@@ -252,10 +253,34 @@ impl PreviewNode {
 
 const PREVIEW_CACHE_MAX_ENTRIES: usize = 50;
 const CHILD_PRELOAD_COUNT: usize = 20;
+const MAX_FRECENT_PATHS: usize = 500;
+
+fn current_unix_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn frecency_score(entry: &PathEntry, now: i64) -> f64 {
+    let age = now.saturating_sub(entry.last_accessed);
+    let weight = if age < 3_600 {
+        4.0
+    } else if age < 86_400 {
+        2.0
+    } else if age < 604_800 {
+        1.0
+    } else {
+        0.5
+    };
+
+    entry.score * weight
+}
 
 /// The browser model - owns state and processes commands
 pub struct BrowserModel {
     backend: Option<Box<dyn Backend>>,
+    settings: AppSettings,
 
     // Profiles
     pub profiles: Vec<crate::aws::credentials::AwsProfile>,
@@ -284,6 +309,7 @@ impl BrowserModel {
     pub fn new() -> Self {
         Self {
             backend: None,
+            settings: AppSettings::default(),
             profiles: Vec::new(),
             selected_profile_idx: 0,
             buckets: Vec::new(),
@@ -301,6 +327,18 @@ impl BrowserModel {
 
     pub fn set_backend(&mut self, backend: Box<dyn Backend>) {
         self.backend = Some(backend);
+    }
+
+    pub fn set_settings(&mut self, settings: AppSettings) {
+        self.settings = settings;
+    }
+
+    pub fn settings(&self) -> &AppSettings {
+        &self.settings
+    }
+
+    pub fn settings_mut(&mut self) -> &mut AppSettings {
+        &mut self.settings
     }
 
     pub fn is_at_root(&self) -> bool {
@@ -648,6 +686,14 @@ impl BrowserModel {
         self.clear_selection();
         self.current_bucket = bucket.to_string();
         self.current_prefix = prefix.to_string();
+        if !bucket.is_empty() {
+            let path = if prefix.is_empty() {
+                format!("s3://{bucket}/")
+            } else {
+                format!("s3://{bucket}/{prefix}")
+            };
+            self.record_recent_path(&path);
+        }
         self.ensure_folder_full(bucket, prefix);
         self.prefetch_parent_folder(bucket, prefix);
     }
@@ -749,6 +795,56 @@ impl BrowserModel {
 
     pub fn clear_selection(&mut self) {
         self.selected_preview = None;
+    }
+
+    pub fn record_recent_path(&mut self, path: &str) {
+        if path.is_empty() || path == "s3://" {
+            return;
+        }
+
+        let Some(profile_name) = self.selected_profile_name().map(str::to_owned) else {
+            return;
+        };
+
+        let entries = self.settings.frecent_paths.entry(profile_name).or_default();
+        let now = current_unix_timestamp();
+
+        if let Some(entry) = entries.iter_mut().find(|entry| entry.path == path) {
+            entry.score += 1.0;
+            entry.last_accessed = now;
+        } else {
+            entries.push(PathEntry {
+                path: path.to_string(),
+                score: 1.0,
+                last_accessed: now,
+            });
+        }
+
+        if entries.len() > MAX_FRECENT_PATHS {
+            entries.sort_by(|a, b| b.score.total_cmp(&a.score));
+            entries.truncate(MAX_FRECENT_PATHS);
+        }
+    }
+
+    pub fn top_frecent_paths(&self, count: usize) -> Vec<String> {
+        let Some(profile_name) = self.selected_profile_name() else {
+            return Vec::new();
+        };
+        let Some(entries) = self.settings.frecent_paths.get(profile_name) else {
+            return Vec::new();
+        };
+
+        let now = current_unix_timestamp();
+        let mut scored: Vec<(f64, &str)> = entries
+            .iter()
+            .map(|entry| (frecency_score(entry, now), entry.path.as_str()))
+            .collect();
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+        scored
+            .into_iter()
+            .take(count)
+            .map(|(_, path)| path.to_string())
+            .collect()
     }
 
     /// Evict oldest preview entries if cache exceeds limit
@@ -1179,6 +1275,13 @@ impl BrowserModel {
                 | ".properties"
         )
     }
+
+    fn selected_profile_name(&self) -> Option<&str> {
+        self.profiles
+            .get(self.selected_profile_idx)
+            .map(|profile| profile.name.as_str())
+            .filter(|name| !name.is_empty())
+    }
 }
 
 #[cfg(test)]
@@ -1555,5 +1658,44 @@ mod tests {
             }
             other => panic!("unexpected request: {other:?}"),
         }
+    }
+
+    #[test]
+    fn recent_paths_are_tracked_per_profile() {
+        let mut model = BrowserModel::new();
+        model.profiles = vec![
+            crate::aws::credentials::AwsProfile {
+                name: "default".to_string(),
+                ..Default::default()
+            },
+            crate::aws::credentials::AwsProfile {
+                name: "other".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        model.navigate_into("alpha", "first/");
+        assert_eq!(model.top_frecent_paths(5), vec!["s3://alpha/first/"]);
+
+        model.select_profile(1);
+        assert!(model.top_frecent_paths(5).is_empty());
+
+        model.navigate_into("beta", "");
+        assert_eq!(model.top_frecent_paths(5), vec!["s3://beta/"]);
+
+        model.select_profile(0);
+        assert_eq!(model.top_frecent_paths(5), vec!["s3://alpha/first/"]);
+    }
+
+    #[test]
+    fn root_path_is_not_recorded_as_recent() {
+        let mut model = BrowserModel::new();
+        model.profiles = vec![crate::aws::credentials::AwsProfile {
+            name: "default".to_string(),
+            ..Default::default()
+        }];
+
+        model.navigate_to("s3://");
+        assert!(model.top_frecent_paths(5).is_empty());
     }
 }
