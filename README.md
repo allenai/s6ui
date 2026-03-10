@@ -1,44 +1,56 @@
 # s6ui
 
-`s6ui` is a fast GUI for browsing AWS S3 buckets. If you like `s5cmd`, then you will like `s6ui`.
+`s6ui` is a fast Rust GUI for browsing AWS S3 buckets. If you like `s5cmd`, then you will like `s6ui`.
 
-<img width="1312" height="940" alt="Screenshot 2026-01-14 at 2 36 06 PM" src="https://github.com/user-attachments/assets/1c05b724-018d-43fc-8716-e06882f8b851" />
+<img width="1312" height="940" alt="Screenshot 2026-01-14 at 2 36 06 PM" src="https://github.com/user-attachments/assets/1c05b724-018d-43fc-8716-e06882f8b851" />
 
+The app is built with [Dear ImGui](https://github.com/ocornut/imgui), `wgpu`, and `winit`.
+It hides latency by prefetching bucket listings and previews when you hover over entries, so navigation feels immediate even against large prefixes.
 
-s6ui lets you browse an AWS S3 bucket with a lightweight GUI powered by [DearImGui](https://github.com/ocornut/imgui).
-s6ui hides latency by prefetching things when you hover your cursor over them. By the time you click on something, it will load instantly.
+There are built-in tools for previewing large datasets. `.gz` and `.zstd` files are decoded on the fly, and previews are streamed so you do not need to wait for a full multi-GB object download before seeing useful content.
 
-There are some tools built-in to help with previewing large datasets. Click on a file
-containing [Dolma documents](https://github.com/allenai/dolma), and you can quickly see a preview of the contents. .gz and .zstd decoders are included. You don't even need to wait to load a full 1GB file,
-everything is streamed to make this as fast as possible. It's a quick way to see what's inside your bucket or dataset.
+### Install from Homebrew
 
-### How to intall from Homebrew (MacOSX)
 ```bash
 brew tap allenai/s6ui
 brew install s6ui
 ```
 
-### How to build from source
-Right now we support MacOSX, (soon Linux).
+### Build from source
 
-Install dependencies with `brew install glfw`
-then just run `make`
+Install a current Rust toolchain, then build or run the app from the repository root:
 
-### How to use
+```bash
+cargo build --release
+cargo run --release
+```
 
-Just type `s6ui` to launch it.
+On Ubuntu, install the same native packages used in CI before building:
 
-You can specify `s6ui s3://my_bucket/path` to immediately jump to that path.
+```bash
+sudo apt-get update
+sudo apt-get install -y pkg-config libssl-dev libx11-xcb-dev libxcursor-dev libxi-dev libxinerama-dev libxrandr-dev libxkbcommon-dev libwayland-dev
+```
 
-### AWS Authentication
+### Usage
 
-s6ui supports multiple methods for AWS authentication:
+Run `target/release/s6ui` after `cargo build --release`, or just use:
 
-#### Option 1: Static Credentials File
+```bash
+cargo run --release -- s3://my-bucket/path
+```
+
+You can pass an initial S3 path to jump directly into a bucket or prefix.
+
+### AWS authentication
+
+`s6ui` supports multiple AWS authentication methods.
+
+#### Option 1: Static credentials file
 
 Create or edit `~/.aws/credentials` with your AWS access keys:
 
-```
+```ini
 [default]
 aws_access_key_id = YOUR_ACCESS_KEY_ID
 aws_secret_access_key = YOUR_SECRET_ACCESS_KEY
@@ -46,7 +58,7 @@ aws_secret_access_key = YOUR_SECRET_ACCESS_KEY
 
 You can also define multiple profiles:
 
-```
+```ini
 [default]
 aws_access_key_id = YOUR_ACCESS_KEY_ID
 aws_secret_access_key = YOUR_SECRET_ACCESS_KEY
@@ -57,15 +69,15 @@ aws_secret_access_key = WORK_SECRET_ACCESS_KEY
 endpoint_url = https://custom-weka-server.org:9000
 ```
 
-To use a specific profile, set the `AWS_PROFILE` environment variable:
+To use a specific profile, set `AWS_PROFILE`:
 
 ```bash
-AWS_PROFILE=work ./s6ui
+AWS_PROFILE=work cargo run --release
 ```
 
 Regions are auto-detected.
 
-#### Option 2: AWS SSO Configuration
+#### Option 2: AWS SSO configuration
 
 Configure AWS SSO using the AWS CLI:
 
@@ -75,13 +87,13 @@ aws configure sso
 
 Follow the prompts to set up your SSO profile. This will create configuration in `~/.aws/config`.
 
-To use an SSO profile, set the `AWS_PROFILE` environment variable:
+To use an SSO profile, set `AWS_PROFILE`:
 
 ```bash
-AWS_PROFILE=my-sso-profile ./s6ui
+AWS_PROFILE=my-sso-profile cargo run --release
 ```
 
-s6ui will automatically handle SSO authentication and token refresh as needed.
+`s6ui` will automatically handle SSO authentication and token refresh as needed.
 
 <!-- start team -->
 

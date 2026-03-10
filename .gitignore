@@ -1,21 +1,11 @@
-# Compiled binaries
-imgui_demo
-s6ui
-test_viewer
+# Rust build outputs
+/target
 
 # Logs
 s6ui.log
-
-# Build directory
-build/
 
 # ImGui generated config
 imgui.ini
 
 # macOS
 .DS_Store
-
-# Generated app bundle
-s6ui.app/
-resources/s6ui.iconset/
-resources/s6ui.icns

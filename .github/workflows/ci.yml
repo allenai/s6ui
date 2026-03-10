@@ -17,14 +17,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: brew install glfw
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
 
-      - name: Build
-        run: make
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Build release binary
+        run: cargo build --release
 
       - name: Verify version
-        run: ./s6ui --version
+        run: ./target/release/s6ui --version
 
   build-linux:
     runs-on: ubuntu-latest
@@ -35,13 +43,19 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libglfw3-dev libcurl4-openssl-dev libssl-dev libgl-dev
+          sudo apt-get install -y pkg-config libssl-dev libx11-xcb-dev libxcursor-dev libxi-dev libxinerama-dev libxrandr-dev libxkbcommon-dev libwayland-dev
 
-      - name: Build
-        run: make
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Build release binary
+        run: cargo build --release
 
       - name: Verify version
-        run: ./s6ui --version
+        run: ./target/release/s6ui --version
 
   release:
     runs-on: ubuntu-latest
@@ -57,17 +71,14 @@ jobs:
         id: get_version
         run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
 
-      - name: Verify tag matches version.h
+      - name: Verify tag matches Cargo.toml
         run: |
-          MAJOR=$(grep '#define VERSION_MAJOR' src/version.h | awk '{print $3}')
-          MINOR=$(grep '#define VERSION_MINOR' src/version.h | awk '{print $3}')
-          PATCH=$(grep '#define VERSION_PATCH' src/version.h | awk '{print $3}')
-          VERSION_H="v${MAJOR}.${MINOR}.${PATCH}"
+          VERSION_TOML=$(sed -nE 's/^version = "([^"]+)"/v\1/p' Cargo.toml | head -1)
           TAG_VERSION="${{ steps.get_version.outputs.VERSION }}"
-          echo "version.h: $VERSION_H"
+          echo "Cargo.toml: $VERSION_TOML"
           echo "git tag:   $TAG_VERSION"
-          if [ "$VERSION_H" != "$TAG_VERSION" ]; then
-            echo "::error::Version mismatch! version.h says $VERSION_H but tag is $TAG_VERSION"
+          if [ "$VERSION_TOML" != "$TAG_VERSION" ]; then
+            echo "::error::Version mismatch! Cargo.toml says $VERSION_TOML but tag is $TAG_VERSION"
             exit 1
           fi
 
