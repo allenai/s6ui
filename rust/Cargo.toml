@@ -17,6 +17,7 @@ pollster = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
+arboard = "3"
 
 # AWS credentials + signing
 ring = "0.17"

@@ -128,7 +128,7 @@ impl BrowserUI {
         }
 
         ui.same_line();
-        let cmd_r = ui.io().key_ctrl() && ui.is_key_pressed(Key::R);
+        let cmd_r = shortcut_mod_active(ui.io()) && ui.is_key_pressed(Key::R);
         if ui.button("Refresh") || cmd_r {
             model.refresh();
         }
@@ -171,12 +171,12 @@ impl BrowserUI {
     fn render_bucket_list(&self, ui: &Ui, model: &mut BrowserModel) {
         model.ensure_buckets_loaded();
 
-        if model.buckets_loading {
+        if model.buckets_loading && model.buckets.is_empty() {
             ui.text_colored([0.5, 0.5, 1.0, 1.0], "Loading buckets...");
             return;
         }
 
-        if !model.buckets_error.is_empty() {
+        if !model.buckets_error.is_empty() && model.buckets.is_empty() {
             ui.text_colored(
                 [1.0, 0.3, 0.3, 1.0],
                 format!("Error: {}", model.buckets_error),
@@ -460,10 +460,12 @@ impl BrowserUI {
 
         // Show progress info
         let status = node.status();
+        let bytes = node.bytes_written();
+        let is_complete = node.is_complete();
+        let is_empty_complete = is_empty_complete_preview(bytes, is_complete);
         match &status {
             PreviewStatus::Loading => {
                 ui.same_line();
-                let bytes = node.bytes_written();
                 let source = node.source_bytes();
                 if bytes > 0 {
                     ui.text_colored(
@@ -480,23 +482,24 @@ impl BrowserUI {
             }
             PreviewStatus::Ready => {
                 ui.same_line();
-                let bytes = node.bytes_written();
-                let lines = self.text_viewer.line_count();
-                ui.text_colored(
-                    [0.5, 0.5, 0.5, 1.0],
-                    format!(
-                        " ({}, {} lines)",
-                        format_size(bytes as i64),
-                        format_number(lines as i64)
-                    ),
-                );
+                if is_empty_complete {
+                    ui.text_colored([0.5, 0.5, 0.5, 1.0], " (empty file)");
+                } else {
+                    let lines = self.text_viewer.line_count();
+                    ui.text_colored(
+                        [0.5, 0.5, 0.5, 1.0],
+                        format!(
+                            " ({}, {} lines)",
+                            format_size(bytes as i64),
+                            format_number(lines as i64)
+                        ),
+                    );
+                }
             }
             _ => {}
         }
 
         ui.separator();
-
-        let is_complete = node.is_complete();
 
         match &status {
             PreviewStatus::Unsupported => {
@@ -510,7 +513,9 @@ impl BrowserUI {
             }
             PreviewStatus::Loading | PreviewStatus::Ready => {
                 // Show loading if no data yet
-                if self.text_viewer.file_size() == 0 {
+                if is_empty_complete {
+                    ui.text_disabled("Empty file");
+                } else if self.text_viewer.file_size() == 0 {
                     ui.text_colored([0.5, 0.5, 1.0, 1.0], "Loading...");
                 } else if !self.text_viewer.is_open() {
                     // File has data but mmap failed - try to re-open
@@ -578,5 +583,29 @@ fn build_s3_path(bucket: &str, prefix: &str) -> String {
         format!("s3://{}/", bucket)
     } else {
         format!("s3://{}/{}", bucket, prefix)
+    }
+}
+
+fn is_empty_complete_preview(bytes_written: u64, is_complete: bool) -> bool {
+    is_complete && bytes_written == 0
+}
+
+fn shortcut_mod_active(io: &Io) -> bool {
+    if io.config_macosx_behaviors() {
+        io.key_super()
+    } else {
+        io.key_ctrl()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_empty_complete_preview;
+
+    #[test]
+    fn complete_zero_byte_preview_uses_empty_state() {
+        assert!(is_empty_complete_preview(0, true));
+        assert!(!is_empty_complete_preview(0, false));
+        assert!(!is_empty_complete_preview(1, true));
     }
 }

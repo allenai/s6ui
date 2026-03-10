@@ -2,24 +2,15 @@
 //!
 //! Port of C++ MmapTextViewer for efficient viewing of large text files.
 
+use crate::app_clipboard::copy_text_to_clipboard;
 use crate::preview::StreamingFilePreview;
 use dear_imgui_rs::*;
 use memmap2::Mmap;
 use std::collections::HashMap;
-use std::io::Write;
 use std::sync::Arc;
 
-/// Copy text to the system clipboard using pbcopy (macOS).
 fn copy_to_clipboard(text: &str) {
-    if let Ok(mut child) = std::process::Command::new("pbcopy")
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-    {
-        if let Some(stdin) = child.stdin.as_mut() {
-            let _ = stdin.write_all(text.as_bytes());
-        }
-        let _ = child.wait();
-    }
+    copy_text_to_clipboard(text);
 }
 
 /// Position within text (line + byte offset within line)
@@ -737,8 +728,8 @@ impl MmapTextViewer {
             }
         }
 
-        // Cmd+C to copy selection
-        if ui.io().key_ctrl() && ui.is_key_pressed(Key::C) && self.selection_active {
+        // Copy selection with the platform shortcut modifier (Cmd on macOS, Ctrl elsewhere).
+        if shortcut_mod_active(ui.io()) && ui.is_key_pressed(Key::C) && self.selection_active {
             let text = self.get_selected_text();
             if !text.is_empty() {
                 copy_to_clipboard(&text);
@@ -1110,6 +1101,14 @@ impl MmapTextViewer {
             .rounding(4.0)
             .filled(true)
             .build();
+    }
+}
+
+fn shortcut_mod_active(io: &Io) -> bool {
+    if io.config_macosx_behaviors() {
+        io.key_super()
+    } else {
+        io.key_ctrl()
     }
 }
 

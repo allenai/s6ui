@@ -1,3 +1,4 @@
+mod app_clipboard;
 mod aws;
 mod backend;
 mod events;
@@ -8,6 +9,7 @@ mod settings;
 mod text_viewer;
 mod ui;
 
+use app_clipboard::SystemClipboardBackend;
 use aws::credentials;
 use aws::s3_backend::S3Backend;
 use dear_imgui_rs::*;
@@ -286,6 +288,7 @@ impl AppWindow {
 
         let mut context = Context::create();
         context.set_ini_filename(None::<String>).unwrap();
+        context.set_clipboard_backend(SystemClipboardBackend::new());
 
         let mut platform = WinitPlatform::new(&mut context);
         platform.attach_window(&window, dear_imgui_winit::HiDpiMode::Default, &mut context);

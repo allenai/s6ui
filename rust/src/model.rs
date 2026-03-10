@@ -261,6 +261,7 @@ pub struct BrowserModel {
     pub buckets: Vec<S3Bucket>,
     pub buckets_loading: bool,
     pub buckets_error: String,
+    buckets_complete: bool,
     buckets_request_id: u64,
 
     // Folder nodes cache
@@ -286,6 +287,7 @@ impl BrowserModel {
             buckets: Vec::new(),
             buckets_loading: false,
             buckets_error: String::new(),
+            buckets_complete: false,
             buckets_request_id: 0,
             nodes: HashMap::new(),
             current_bucket: String::new(),
@@ -352,6 +354,7 @@ impl BrowserModel {
                     self.buckets = buckets;
                     self.buckets_loading = false;
                     self.buckets_error.clear();
+                    self.buckets_complete = true;
                 }
                 StateEvent::BucketsError { request_id, error } => {
                     if request_id != self.buckets_request_id {
@@ -359,6 +362,7 @@ impl BrowserModel {
                     }
                     self.buckets_loading = false;
                     self.buckets_error = error;
+                    self.buckets_complete = false;
                 }
                 StateEvent::ObjectsLoaded {
                     bucket,
@@ -522,6 +526,7 @@ impl BrowserModel {
     pub fn refresh(&mut self) {
         self.buckets.clear();
         self.buckets_error.clear();
+        self.buckets_complete = false;
         self.nodes.clear();
         self.previews.clear();
         self.selected_preview = None;
@@ -533,7 +538,7 @@ impl BrowserModel {
     }
 
     pub fn ensure_buckets_loaded(&mut self) {
-        if self.buckets_loading || !self.buckets.is_empty() || !self.buckets_error.is_empty() {
+        if self.buckets_loading || self.buckets_complete || !self.buckets_error.is_empty() {
             return;
         }
         self.request_buckets();
@@ -601,6 +606,7 @@ impl BrowserModel {
             self.clear_selection();
             self.current_bucket.clear();
             self.current_prefix.clear();
+            self.ensure_buckets_loaded();
             return;
         }
 
@@ -619,6 +625,7 @@ impl BrowserModel {
             self.clear_selection();
             self.current_bucket.clear();
             self.current_prefix.clear();
+            self.ensure_buckets_loaded();
             return;
         }
 
@@ -1085,6 +1092,7 @@ impl BrowserModel {
         }
         self.buckets.clear();
         self.buckets_error.clear();
+        self.buckets_complete = false;
         self.nodes.clear();
         self.previews.clear();
         self.selected_preview = None;
@@ -1647,5 +1655,27 @@ mod tests {
 
         model.navigate_to("s3://");
         assert!(model.top_frecent_paths(5).is_empty());
+    }
+
+    #[test]
+    fn navigating_up_to_root_requests_full_bucket_list_after_manual_bucket_navigation() {
+        let (mut model, backend) = model_with_backend();
+
+        model.navigate_to("s3://manual-bucket/prefix/");
+        assert_eq!(model.buckets.len(), 1);
+        assert_eq!(model.buckets[0].name, "manual-bucket");
+
+        backend.drain_requests();
+        model.navigate_up();
+        backend.drain_requests();
+
+        model.navigate_up();
+
+        assert!(model.is_at_root());
+        assert_eq!(backend.requests().len(), 1);
+        assert!(matches!(
+            backend.requests().as_slice(),
+            [RecordedRequest::Buckets { .. }]
+        ));
     }
 }
