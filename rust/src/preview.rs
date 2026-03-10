@@ -293,6 +293,18 @@ impl StreamingFilePreview {
         })
     }
 
+    /// Create a fully-populated preview from in-memory text.
+    pub fn from_text(text: &str) -> Result<Self, String> {
+        let preview = Self::new(Compression::None)?;
+        preview.set_total_source_size(text.len() as u64);
+        if !text.is_empty() {
+            preview.append_chunk(text.as_bytes())?;
+        }
+        preview.finish_stream()?;
+        preview.set_complete();
+        Ok(preview)
+    }
+
     /// Get compression type
     pub fn compression(&self) -> Compression {
         self.compression
@@ -514,6 +526,52 @@ impl StreamingFilePreview {
         result
     }
 
+    /// Read a single line for display.
+    pub fn read_line(&self, line: usize) -> String {
+        let (start, end, bytes_written) = {
+            let state = self.state.lock().unwrap();
+            let Some(&start) = state.line_offsets.get(line) else {
+                return String::new();
+            };
+            let end = state.line_offsets.get(line + 1).copied();
+            (start, end, state.bytes_written)
+        };
+
+        let end = end.unwrap_or(bytes_written);
+        if start >= end {
+            return String::new();
+        }
+
+        let len = (end - start) as usize;
+        let mut buf = vec![0u8; len];
+        if self.temp_file.read_at(&mut buf, start).is_err() {
+            return String::new();
+        }
+
+        if buf.last() == Some(&b'\n') {
+            buf.pop();
+        }
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// Returns true if the line is terminated by a newline or the stream is complete.
+    pub fn is_line_complete(&self, line: usize) -> bool {
+        let state = self.state.lock().unwrap();
+        if line >= state.line_offsets.len() {
+            return false;
+        }
+
+        if line + 1 < state.line_offsets.len() {
+            return true;
+        }
+
+        matches!(state.status, StreamingStatus::Complete)
+    }
+
     /// Memory map the temp file for efficient access
     pub fn mmap(&self) -> Result<Mmap, std::io::Error> {
         unsafe { Mmap::map(&self.temp_file) }
@@ -556,6 +614,21 @@ mod tests {
 
         let lines = preview.read_lines(0, 3);
         assert_eq!(lines, vec!["line1", "line2", "line3"]);
+    }
+
+    #[test]
+    fn test_read_line_and_line_completion() {
+        let preview = StreamingFilePreview::new(Compression::None).unwrap();
+
+        preview.append_chunk(b"line1\nline2").unwrap();
+
+        assert_eq!(preview.read_line(0), "line1");
+        assert_eq!(preview.read_line(1), "line2");
+        assert!(preview.is_line_complete(0));
+        assert!(!preview.is_line_complete(1));
+
+        preview.set_complete();
+        assert!(preview.is_line_complete(1));
     }
 
     #[test]

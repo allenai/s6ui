@@ -1,6 +1,7 @@
 mod aws;
 mod backend;
 mod events;
+mod jsonl_viewer;
 mod model;
 mod preview;
 mod settings;

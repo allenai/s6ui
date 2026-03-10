@@ -1,16 +1,20 @@
-use crate::model::{BrowserModel, PreviewStatus};
+use crate::jsonl_viewer::JsonlPreviewer;
+use crate::model::{BrowserModel, PreviewNode, PreviewStatus};
+use crate::preview::StreamingFilePreview;
 use crate::text_viewer::MmapTextViewer;
 use dear_imgui_rs::*;
 use std::borrow::Cow;
+use std::sync::Arc;
 
 pub struct BrowserUI {
     path_input: String,
     /// Text viewer for file preview
     text_viewer: MmapTextViewer,
+    jsonl_previewer: JsonlPreviewer,
     /// Currently loaded preview key (bucket/key)
     viewer_preview_key: Option<String>,
-    /// Request generation for the currently loaded preview key
-    viewer_preview_request_id: u64,
+    /// Backing preview object for the currently loaded preview key
+    viewer_preview_source_id: Option<usize>,
 }
 
 impl BrowserUI {
@@ -18,8 +22,9 @@ impl BrowserUI {
         Self {
             path_input: "s3://".to_string(),
             text_viewer: MmapTextViewer::new(),
+            jsonl_previewer: JsonlPreviewer::new(),
             viewer_preview_key: None,
-            viewer_preview_request_id: 0,
+            viewer_preview_source_id: None,
         }
     }
 
@@ -390,17 +395,16 @@ impl BrowserUI {
             .build(ui, || {
                 // Check if we need to update the viewer's source
                 let current_preview_key = model.selected_preview.clone();
-                let current_preview_request_id = model
+                let current_preview_source_id = model
                     .selected_preview()
-                    .map(|node| node.request_id())
-                    .unwrap_or(0);
+                    .map(|node| Self::preview_source_id(&node.preview));
 
                 // Update viewer if preview changed
                 if current_preview_key != self.viewer_preview_key
-                    || current_preview_request_id != self.viewer_preview_request_id
+                    || current_preview_source_id != self.viewer_preview_source_id
                 {
                     self.viewer_preview_key = current_preview_key.clone();
-                    self.viewer_preview_request_id = current_preview_request_id;
+                    self.viewer_preview_source_id = current_preview_source_id;
                     if let Some(node) = model.selected_preview() {
                         self.text_viewer.open(node.preview.clone());
                     } else {
@@ -417,97 +421,127 @@ impl BrowserUI {
                         ui.text_colored([0.5, 0.5, 0.5, 1.0], "Select a file to preview");
                     }
                     Some(node) => {
-                        let filename = match node.key.rfind('/') {
-                            Some(i) => &node.key[i + 1..],
-                            None => node.key.as_str(),
-                        };
+                        let filename = Self::filename_for_key(&node.key);
 
-                        // Header with filename and wrap toggle
-                        ui.text(format!("Preview: {}", filename));
-                        ui.same_line();
-                        let mut wrap = self.text_viewer.word_wrap();
-                        if ui.checkbox("Wrap", &mut wrap) {
-                            self.text_viewer.set_word_wrap(wrap);
+                        let handled_by_jsonl = JsonlPreviewer::can_handle(&node.key)
+                            && self
+                                .jsonl_previewer
+                                .render(ui, node, filename, width, height);
+                        if handled_by_jsonl {
+                            return;
                         }
 
-                        // Show progress info
-                        let status = node.status();
-                        match &status {
-                            PreviewStatus::Loading => {
-                                ui.same_line();
-                                let bytes = node.bytes_written();
-                                let source = node.source_bytes();
-                                if bytes > 0 {
-                                    ui.text_colored(
-                                        [0.5, 0.5, 1.0, 1.0],
-                                        format!(
-                                            " ({} decompressed from {} source)",
-                                            format_size(bytes as i64),
-                                            format_size(source as i64)
-                                        ),
-                                    );
-                                } else {
-                                    ui.text_colored([0.5, 0.5, 1.0, 1.0], " Loading...");
-                                }
-                            }
-                            PreviewStatus::Ready => {
-                                ui.same_line();
-                                let bytes = node.bytes_written();
-                                let lines = self.text_viewer.line_count();
-                                ui.text_colored(
-                                    [0.5, 0.5, 0.5, 1.0],
-                                    format!(
-                                        " ({}, {} lines)",
-                                        format_size(bytes as i64),
-                                        format_number(lines as i64)
-                                    ),
-                                );
-                            }
-                            _ => {}
+                        if JsonlPreviewer::can_handle(&node.key)
+                            && self
+                                .jsonl_previewer
+                                .is_fallback_for(&node.bucket, &node.key)
+                        {
+                            ui.text_colored(
+                                [0.65, 0.65, 0.65, 1.0],
+                                "JSONL parsing failed, showing raw preview",
+                            );
+                            ui.separator();
                         }
 
-                        ui.separator();
-
-                        let is_complete = node.is_complete();
-
-                        match &status {
-                            PreviewStatus::Unsupported => {
-                                ui.text_colored(
-                                    [0.7, 0.7, 0.7, 1.0],
-                                    "Preview not supported for this file type",
-                                );
-                            }
-                            PreviewStatus::Error(err) => {
-                                ui.text_colored([1.0, 0.3, 0.3, 1.0], format!("Error: {}", err));
-                            }
-                            PreviewStatus::Loading | PreviewStatus::Ready => {
-                                // Show loading if no data yet
-                                if self.text_viewer.file_size() == 0 {
-                                    ui.text_colored([0.5, 0.5, 1.0, 1.0], "Loading...");
-                                } else if !self.text_viewer.is_open() {
-                                    // File has data but mmap failed - try to re-open
-                                    if let Some(n) = model.selected_preview() {
-                                        self.text_viewer.open(n.preview.clone());
-                                    }
-                                    ui.text_colored([0.5, 0.5, 1.0, 1.0], "Loading...");
-                                } else {
-                                    // Calculate available height for content
-                                    let content_height = ui.content_region_avail()[1];
-                                    let content_width = ui.content_region_avail()[0];
-
-                                    // Render using MmapTextViewer
-                                    self.text_viewer.render(ui, content_width, content_height);
-
-                                    if !is_complete && matches!(status, PreviewStatus::Loading) {
-                                        ui.spacing();
-                                        ui.text_colored([0.5, 0.5, 1.0, 1.0], "Downloading...");
-                                    }
-                                }
-                            }
-                        }
+                        self.render_text_preview_content(ui, node, filename);
                     }
                 }
             });
+    }
+
+    fn render_text_preview_content(&mut self, ui: &Ui, node: &PreviewNode, filename: &str) {
+        // Header with filename and wrap toggle
+        ui.text(format!("Preview: {}", filename));
+        ui.same_line();
+        let mut wrap = self.text_viewer.word_wrap();
+        if ui.checkbox("Wrap", &mut wrap) {
+            self.text_viewer.set_word_wrap(wrap);
+        }
+
+        // Show progress info
+        let status = node.status();
+        match &status {
+            PreviewStatus::Loading => {
+                ui.same_line();
+                let bytes = node.bytes_written();
+                let source = node.source_bytes();
+                if bytes > 0 {
+                    ui.text_colored(
+                        [0.5, 0.5, 1.0, 1.0],
+                        format!(
+                            " ({} decompressed from {} source)",
+                            format_size(bytes as i64),
+                            format_size(source as i64)
+                        ),
+                    );
+                } else {
+                    ui.text_colored([0.5, 0.5, 1.0, 1.0], " Loading...");
+                }
+            }
+            PreviewStatus::Ready => {
+                ui.same_line();
+                let bytes = node.bytes_written();
+                let lines = self.text_viewer.line_count();
+                ui.text_colored(
+                    [0.5, 0.5, 0.5, 1.0],
+                    format!(
+                        " ({}, {} lines)",
+                        format_size(bytes as i64),
+                        format_number(lines as i64)
+                    ),
+                );
+            }
+            _ => {}
+        }
+
+        ui.separator();
+
+        let is_complete = node.is_complete();
+
+        match &status {
+            PreviewStatus::Unsupported => {
+                ui.text_colored(
+                    [0.7, 0.7, 0.7, 1.0],
+                    "Preview not supported for this file type",
+                );
+            }
+            PreviewStatus::Error(err) => {
+                ui.text_colored([1.0, 0.3, 0.3, 1.0], format!("Error: {}", err));
+            }
+            PreviewStatus::Loading | PreviewStatus::Ready => {
+                // Show loading if no data yet
+                if self.text_viewer.file_size() == 0 {
+                    ui.text_colored([0.5, 0.5, 1.0, 1.0], "Loading...");
+                } else if !self.text_viewer.is_open() {
+                    // File has data but mmap failed - try to re-open
+                    self.text_viewer.open(node.preview.clone());
+                    ui.text_colored([0.5, 0.5, 1.0, 1.0], "Loading...");
+                } else {
+                    // Calculate available height for content
+                    let content_height = ui.content_region_avail()[1];
+                    let content_width = ui.content_region_avail()[0];
+
+                    // Render using MmapTextViewer
+                    self.text_viewer.render(ui, content_width, content_height);
+
+                    if !is_complete && matches!(status, PreviewStatus::Loading) {
+                        ui.spacing();
+                        ui.text_colored([0.5, 0.5, 1.0, 1.0], "Downloading...");
+                    }
+                }
+            }
+        }
+    }
+
+    fn filename_for_key(key: &str) -> &str {
+        match key.rfind('/') {
+            Some(i) => &key[i + 1..],
+            None => key,
+        }
+    }
+
+    fn preview_source_id(preview: &Arc<StreamingFilePreview>) -> usize {
+        Arc::as_ptr(preview) as usize
     }
 }
 
