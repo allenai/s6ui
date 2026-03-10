@@ -385,7 +385,14 @@ impl MmapTextViewer {
             }
 
             // Track potential break points
-            if ch == b' ' || ch == b'\t' || ch == b'-' || ch == b'/' || ch == b'\\' || ch == b',' || ch == b';' {
+            if ch == b' '
+                || ch == b'\t'
+                || ch == b'-'
+                || ch == b'/'
+                || ch == b'\\'
+                || ch == b','
+                || ch == b';'
+            {
                 last_break_offset = i + 1;
             }
 
@@ -410,8 +417,9 @@ impl MmapTextViewer {
                         line: self.anchor_line,
                         width_px: self.last_wrap_width as i32,
                     };
-                    let wi = self.wrap_cache.get(&key).cloned()
-                        .unwrap_or_else(|| self.compute_wrap_info(self.anchor_line, self.last_wrap_width));
+                    let wi = self.wrap_cache.get(&key).cloned().unwrap_or_else(|| {
+                        self.compute_wrap_info(self.anchor_line, self.last_wrap_width)
+                    });
 
                     if self.anchor_sub_row + 1 < wi.visual_row_count {
                         self.anchor_sub_row += 1;
@@ -435,8 +443,9 @@ impl MmapTextViewer {
                             line: self.anchor_line,
                             width_px: self.last_wrap_width as i32,
                         };
-                        let wi = self.wrap_cache.get(&key).cloned()
-                            .unwrap_or_else(|| self.compute_wrap_info(self.anchor_line, self.last_wrap_width));
+                        let wi = self.wrap_cache.get(&key).cloned().unwrap_or_else(|| {
+                            self.compute_wrap_info(self.anchor_line, self.last_wrap_width)
+                        });
                         self.anchor_sub_row = wi.visual_row_count - 1;
                     }
                 } else if self.anchor_line > 0 {
@@ -530,7 +539,15 @@ impl MmapTextViewer {
     }
 
     /// Hit test: convert mouse position to TextPosition
-    fn hit_test(&self, _ui: &Ui, mouse_x: f32, mouse_y: f32, start_y: f32, text_x: f32, line_height: f32) -> TextPosition {
+    fn hit_test(
+        &self,
+        _ui: &Ui,
+        mouse_x: f32,
+        mouse_y: f32,
+        start_y: f32,
+        text_x: f32,
+        line_height: f32,
+    ) -> TextPosition {
         let lc = self.line_count();
         if lc == 0 {
             return TextPosition::default();
@@ -551,7 +568,9 @@ impl MmapTextViewer {
                     line: cur_line,
                     width_px: text_area_width as i32,
                 };
-                let total_rows = self.wrap_cache.get(&key)
+                let total_rows = self
+                    .wrap_cache
+                    .get(&key)
                     .map(|wi| wi.visual_row_count)
                     .unwrap_or(1);
 
@@ -593,7 +612,11 @@ impl MmapTextViewer {
             if let Some(wi) = self.wrap_cache.get(&key) {
                 if (cur_sub_row as usize) < wi.row_start_offsets.len() {
                     let rs = wi.row_start_offsets[cur_sub_row as usize];
-                    let re = wi.row_start_offsets.get(cur_sub_row as usize + 1).copied().unwrap_or(line_len);
+                    let re = wi
+                        .row_start_offsets
+                        .get(cur_sub_row as usize + 1)
+                        .copied()
+                        .unwrap_or(line_len);
                     (rs, re)
                 } else {
                     (0, line_len)
@@ -653,7 +676,8 @@ impl MmapTextViewer {
         }
 
         let line_height = ui.text_line_height_with_spacing();
-        let text_area_width = width - LINE_NUMBER_GUTTER_WIDTH - SCROLLBAR_WIDTH - TEXT_LEFT_PADDING;
+        let text_area_width =
+            width - LINE_NUMBER_GUTTER_WIDTH - SCROLLBAR_WIDTH - TEXT_LEFT_PADDING;
         self.last_wrap_width = text_area_width;
 
         // Clear wrap cache if width changed significantly
@@ -746,7 +770,8 @@ impl MmapTextViewer {
         let text_x = start_x + LINE_NUMBER_GUTTER_WIDTH + TEXT_LEFT_PADDING;
 
         // Mouse selection handling
-        if mouse_in_text_area && ui.is_mouse_clicked(MouseButton::Left) && !self.scrollbar_dragging {
+        if mouse_in_text_area && ui.is_mouse_clicked(MouseButton::Left) && !self.scrollbar_dragging
+        {
             let pos = self.hit_test(ui, mouse_pos[0], mouse_pos[1], start_y, text_x, line_height);
             self.selection_anchor = pos;
             self.selection_end = pos;
@@ -756,7 +781,8 @@ impl MmapTextViewer {
 
         if self.mouse_down {
             if ui.is_mouse_down(MouseButton::Left) {
-                let pos = self.hit_test(ui, mouse_pos[0], mouse_pos[1], start_y, text_x, line_height);
+                let pos =
+                    self.hit_test(ui, mouse_pos[0], mouse_pos[1], start_y, text_x, line_height);
                 self.selection_end = pos;
                 if self.selection_anchor != self.selection_end {
                     self.selection_active = true;
@@ -778,18 +804,24 @@ impl MmapTextViewer {
         };
 
         // Background
-        draw_list.add_rect(
-            [start_x, start_y],
-            [start_x + width, start_y + height],
-            [0.08, 0.08, 0.08, 1.0],
-        ).filled(true).build();
+        draw_list
+            .add_rect(
+                [start_x, start_y],
+                [start_x + width, start_y + height],
+                [0.08, 0.08, 0.08, 1.0],
+            )
+            .filled(true)
+            .build();
 
         // Gutter background
-        draw_list.add_rect(
-            [start_x, start_y],
-            [start_x + LINE_NUMBER_GUTTER_WIDTH, start_y + height],
-            [0.12, 0.12, 0.12, 1.0],
-        ).filled(true).build();
+        draw_list
+            .add_rect(
+                [start_x, start_y],
+                [start_x + LINE_NUMBER_GUTTER_WIDTH, start_y + height],
+                [0.12, 0.12, 0.12, 1.0],
+            )
+            .filled(true)
+            .build();
 
         // Selection color
         let sel_color: [f32; 4] = [0.24, 0.40, 0.70, 0.5];
@@ -853,7 +885,10 @@ impl MmapTextViewer {
                         let line_num = format!("{}", current_line + 1);
                         let num_width = line_num.len() as f32 * self.char_width;
                         draw_list.add_text(
-                            [start_x + LINE_NUMBER_GUTTER_WIDTH - num_width - 8.0, cursor_y],
+                            [
+                                start_x + LINE_NUMBER_GUTTER_WIDTH - num_width - 8.0,
+                                cursor_y,
+                            ],
                             gutter_color,
                             &line_num,
                         );
@@ -861,7 +896,9 @@ impl MmapTextViewer {
 
                     if let Some(data) = line_data {
                         let row_start = wi.row_start_offsets[row as usize] as usize;
-                        let row_end = wi.row_start_offsets.get(row as usize + 1)
+                        let row_end = wi
+                            .row_start_offsets
+                            .get(row as usize + 1)
                             .map(|&v| v as usize)
                             .unwrap_or(data.len());
 
@@ -870,24 +907,33 @@ impl MmapTextViewer {
                             let row_begin = TextPosition::new(current_line, row_start as u32);
                             let row_end_pos = TextPosition::new(current_line, row_end as u32);
                             if !(sel_end < row_begin || row_end_pos < sel_start) {
-                                let hl_start = if sel_start.line == current_line && sel_start.byte_offset as usize > row_start {
+                                let hl_start = if sel_start.line == current_line
+                                    && sel_start.byte_offset as usize > row_start
+                                {
                                     sel_start.byte_offset as usize
                                 } else {
                                     row_start
                                 };
-                                let hl_end = if sel_end.line == current_line && (sel_end.byte_offset as usize) < row_end {
+                                let hl_end = if sel_end.line == current_line
+                                    && (sel_end.byte_offset as usize) < row_end
+                                {
                                     sel_end.byte_offset as usize
                                 } else {
                                     row_end
                                 };
                                 if hl_end > hl_start {
-                                    let x0 = text_x + self.compute_text_width_slice(data, row_start, hl_start);
-                                    let x1 = text_x + self.compute_text_width_slice(data, row_start, hl_end);
-                                    draw_list.add_rect(
-                                        [x0, cursor_y],
-                                        [x1, cursor_y + line_height],
-                                        sel_color,
-                                    ).filled(true).build();
+                                    let x0 = text_x
+                                        + self.compute_text_width_slice(data, row_start, hl_start);
+                                    let x1 = text_x
+                                        + self.compute_text_width_slice(data, row_start, hl_end);
+                                    draw_list
+                                        .add_rect(
+                                            [x0, cursor_y],
+                                            [x1, cursor_y + line_height],
+                                            sel_color,
+                                        )
+                                        .filled(true)
+                                        .build();
                                 }
                             }
                         }
@@ -906,7 +952,10 @@ impl MmapTextViewer {
                 let line_num = format!("{}", current_line + 1);
                 let num_width = line_num.len() as f32 * self.char_width;
                 draw_list.add_text(
-                    [start_x + LINE_NUMBER_GUTTER_WIDTH - num_width - 8.0, cursor_y],
+                    [
+                        start_x + LINE_NUMBER_GUTTER_WIDTH - num_width - 8.0,
+                        cursor_y,
+                    ],
                     gutter_color,
                     &line_num,
                 );
@@ -933,11 +982,14 @@ impl MmapTextViewer {
                                 let hl_end = std::cmp::min(hl_end, display_len);
                                 let x0 = text_x + self.compute_text_width_slice(data, 0, hl_start);
                                 let x1 = text_x + self.compute_text_width_slice(data, 0, hl_end);
-                                draw_list.add_rect(
-                                    [x0, cursor_y],
-                                    [x1, cursor_y + line_height],
-                                    sel_color,
-                                ).filled(true).build();
+                                draw_list
+                                    .add_rect(
+                                        [x0, cursor_y],
+                                        [x1, cursor_y + line_height],
+                                        sel_color,
+                                    )
+                                    .filled(true)
+                                    .build();
                             }
                         }
                     }
@@ -958,7 +1010,15 @@ impl MmapTextViewer {
         if self.word_wrap && self.avg_visual_rows_sample_line != lc {
             self.estimate_avg_visual_rows();
         }
-        self.render_scrollbar(ui, &draw_list, start_x + width - SCROLLBAR_WIDTH, start_y, height, lc as f32, line_height);
+        self.render_scrollbar(
+            ui,
+            &draw_list,
+            start_x + width - SCROLLBAR_WIDTH,
+            start_y,
+            height,
+            lc as f32,
+            line_height,
+        );
     }
 
     /// Compute text width for a range within line data
@@ -971,17 +1031,33 @@ impl MmapTextViewer {
     }
 
     /// Render the scrollbar
-    fn render_scrollbar(&mut self, ui: &Ui, draw_list: &DrawListMut, x: f32, y: f32, height: f32, total_lines: f32, line_height: f32) {
-        let avg = if self.word_wrap { self.avg_visual_rows } else { 1.0 };
+    fn render_scrollbar(
+        &mut self,
+        ui: &Ui,
+        draw_list: &DrawListMut,
+        x: f32,
+        y: f32,
+        height: f32,
+        total_lines: f32,
+        line_height: f32,
+    ) {
+        let avg = if self.word_wrap {
+            self.avg_visual_rows
+        } else {
+            1.0
+        };
         let total_visual_rows = total_lines * avg;
         let viewport_rows = height / line_height;
 
         // Background
-        draw_list.add_rect(
-            [x, y],
-            [x + SCROLLBAR_WIDTH, y + height],
-            [0.12, 0.12, 0.12, 1.0],
-        ).filled(true).build();
+        draw_list
+            .add_rect(
+                [x, y],
+                [x + SCROLLBAR_WIDTH, y + height],
+                [0.12, 0.12, 0.12, 1.0],
+            )
+            .filled(true)
+            .build();
 
         if total_visual_rows <= viewport_rows {
             return;
@@ -1004,7 +1080,8 @@ impl MmapTextViewer {
                 self.scrollbar_drag_start_y = mouse_pos[1] - thumb_y;
             } else {
                 // Click above/below thumb — jump to that fraction
-                let click_fraction = ((mouse_pos[1] - y - thumb_h * 0.5) / (height - thumb_h)).clamp(0.0, 1.0);
+                let click_fraction =
+                    ((mouse_pos[1] - y - thumb_h * 0.5) / (height - thumb_h)).clamp(0.0, 1.0);
                 self.scroll_to_fraction(click_fraction);
                 self.scrollbar_dragging = true;
                 self.scrollbar_drag_start_y = thumb_h * 0.5;
@@ -1029,14 +1106,15 @@ impl MmapTextViewer {
             [0.40, 0.40, 0.40, 1.0]
         };
 
-        draw_list.add_rect(
-            [x + 2.0, thumb_y],
-            [x + SCROLLBAR_WIDTH - 2.0, thumb_y + thumb_h],
-            thumb_color,
-        )
-        .rounding(4.0)
-        .filled(true)
-        .build();
+        draw_list
+            .add_rect(
+                [x + 2.0, thumb_y],
+                [x + SCROLLBAR_WIDTH - 2.0, thumb_y + thumb_h],
+                thumb_color,
+            )
+            .rounding(4.0)
+            .filled(true)
+            .build();
     }
 }
 

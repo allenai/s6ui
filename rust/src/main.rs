@@ -93,6 +93,7 @@ struct App {
     runtime: tokio::runtime::Runtime,
     event_proxy: Option<EventLoopProxy<()>>,
     backend_initialized: bool,
+    verbose_logging: bool,
     show_debug_window: bool,
     initial_path: Option<String>,
 }
@@ -116,6 +117,7 @@ impl App {
             runtime,
             event_proxy: Some(event_proxy),
             backend_initialized: false,
+            verbose_logging: opts.verbose,
             show_debug_window: opts.debug,
             initial_path: opts.initial_path,
         }
@@ -128,7 +130,12 @@ impl App {
 
         let profile = self.model.profiles[self.model.selected_profile_idx].clone();
         if let Some(proxy) = self.event_proxy.clone() {
-            let backend = S3Backend::new(profile, self.runtime.handle().clone(), proxy);
+            let backend = S3Backend::new(
+                profile,
+                self.runtime.handle().clone(),
+                proxy,
+                self.verbose_logging,
+            );
             self.model.set_backend(Box::new(backend));
 
             if let Some(path) = self.initial_path.take() {
@@ -146,7 +153,12 @@ impl App {
         }
         let profile = self.model.profiles[self.model.selected_profile_idx].clone();
         if let Some(proxy) = self.event_proxy.clone() {
-            let backend = S3Backend::new(profile, self.runtime.handle().clone(), proxy);
+            let backend = S3Backend::new(
+                profile,
+                self.runtime.handle().clone(),
+                proxy,
+                self.verbose_logging,
+            );
             self.model.set_backend(Box::new(backend));
             self.model.refresh();
         }
@@ -177,8 +189,7 @@ impl AppWindow {
         }))
         .expect("Failed to find an appropriate adapter");
 
-        let (device, queue) =
-            block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))?;
+        let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))?;
 
         let physical_size = window.inner_size();
         let caps = surface.get_capabilities(&adapter);
@@ -213,8 +224,8 @@ impl AppWindow {
 
         let init_info =
             dear_imgui_wgpu::WgpuInitInfo::new(device.clone(), queue.clone(), surface_desc.format);
-        let mut renderer = WgpuRenderer::new(init_info, &mut context)
-            .expect("Failed to initialize WGPU renderer");
+        let mut renderer =
+            WgpuRenderer::new(init_info, &mut context).expect("Failed to initialize WGPU renderer");
         renderer.set_gamma_mode(dear_imgui_wgpu::GammaMode::Auto);
 
         let imgui = ImguiState {
@@ -402,9 +413,11 @@ impl ApplicationHandler<()> for App {
 
                 {
                     let window = self.window.as_mut().unwrap();
-                    if let Err(e) =
-                        window.render(&mut self.model, &mut self.browser_ui, self.show_debug_window)
-                    {
+                    if let Err(e) = window.render(
+                        &mut self.model,
+                        &mut self.browser_ui,
+                        self.show_debug_window,
+                    ) {
                         eprintln!("Render error: {e}");
                     }
                 }

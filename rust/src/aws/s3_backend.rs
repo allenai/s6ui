@@ -97,6 +97,7 @@ struct S3BackendInner {
     low_active: Mutex<HashMap<u64, CancellationToken>>,
     client: reqwest::Client,
     shutdown: AtomicBool,
+    verbose: bool,
 }
 
 impl S3BackendInner {
@@ -159,6 +160,7 @@ impl S3Backend {
         profile: AwsProfile,
         runtime_handle: Handle,
         event_proxy: EventLoopProxy<()>,
+        verbose: bool,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::channel();
         let inner = Arc::new(S3BackendInner {
@@ -174,16 +176,17 @@ impl S3Backend {
             low_active: Mutex::new(HashMap::new()),
             client: reqwest::Client::new(),
             shutdown: AtomicBool::new(false),
+            verbose,
         });
 
         // Spawn high-priority workers
-        for _ in 0..4 {
+        for _ in 0..8 {
             let inner = Arc::clone(&inner);
             runtime_handle.spawn(worker_loop(inner, true));
         }
 
         // Spawn low-priority workers
-        for _ in 0..2 {
+        for _ in 0..8 {
             let inner = Arc::clone(&inner);
             runtime_handle.spawn(worker_loop(inner, false));
         }
@@ -234,6 +237,13 @@ impl Backend for S3Backend {
             cancel_token,
         });
         drop(q);
+        if self.inner.verbose {
+            eprintln!(
+                "[s6ui] queued id={} priority={} kind=list_buckets",
+                request_id,
+                RequestPriority::High.as_str(),
+            );
+        }
         self.inner.high_notify.notify_one();
     }
 
@@ -259,6 +269,16 @@ impl Backend for S3Backend {
             cancel_token,
         });
         drop(q);
+        if self.inner.verbose {
+            eprintln!(
+                "[s6ui] queued id={} priority={} kind=list_objects bucket={} prefix={} continuation={}",
+                request_id,
+                priority.as_str(),
+                bucket,
+                prefix,
+                continuation_state(continuation_token),
+            );
+        }
         notify.notify_one();
     }
 
@@ -288,6 +308,17 @@ impl Backend for S3Backend {
             cancel_token,
         });
         drop(q);
+        if self.inner.verbose {
+            eprintln!(
+                "[s6ui] queued id={} priority={} kind=stream_object bucket={} key={} range_start={} max_bytes={}",
+                request_id,
+                priority.as_str(),
+                bucket,
+                key,
+                range_start,
+                format_max_bytes(max_bytes),
+            );
+        }
         notify.notify_one();
     }
 
@@ -304,13 +335,73 @@ impl Backend for S3Backend {
         let cancelled_items = std::mem::take(&mut *queue.lock().unwrap());
         for item in cancelled_items {
             match item {
-                WorkItem::ListBuckets { cancel_token, .. }
-                | WorkItem::ListObjects { cancel_token, .. }
-                | WorkItem::StreamingGetObject { cancel_token, .. } => cancel_token.cancel(),
+                WorkItem::ListBuckets {
+                    request_id,
+                    cancel_token,
+                } => {
+                    cancel_token.cancel();
+                    if self.inner.verbose {
+                        eprintln!(
+                            "[s6ui] cancelled id={} priority={} kind=list_buckets",
+                            request_id,
+                            priority.as_str(),
+                        );
+                    }
+                }
+                WorkItem::ListObjects {
+                    bucket,
+                    prefix,
+                    request_id,
+                    continuation_token,
+                    cancel_token,
+                } => {
+                    cancel_token.cancel();
+                    if self.inner.verbose {
+                        eprintln!(
+                            "[s6ui] cancelled id={} priority={} kind=list_objects bucket={} prefix={} continuation={}",
+                            request_id,
+                            priority.as_str(),
+                            bucket,
+                            prefix,
+                            continuation_state(&continuation_token),
+                        );
+                    }
+                }
+                WorkItem::StreamingGetObject {
+                    bucket,
+                    key,
+                    request_id,
+                    range_start,
+                    max_bytes,
+                    cancel_token,
+                    ..
+                } => {
+                    cancel_token.cancel();
+                    if self.inner.verbose {
+                        eprintln!(
+                            "[s6ui] cancelled id={} priority={} kind=stream_object bucket={} key={} range_start={} max_bytes={}",
+                            request_id,
+                            priority.as_str(),
+                            bucket,
+                            key,
+                            range_start,
+                            format_max_bytes(max_bytes),
+                        );
+                    }
+                }
                 WorkItem::Shutdown => {}
             }
         }
         self.inner.cancel_active_requests(priority);
+    }
+}
+
+impl RequestPriority {
+    fn as_str(self) -> &'static str {
+        match self {
+            RequestPriority::High => "high",
+            RequestPriority::Low => "low",
+        }
     }
 }
 
@@ -358,10 +449,24 @@ async fn worker_loop(inner: Arc<S3BackendInner>, high_priority: bool) {
                     cancel_token,
                 } => {
                     if cancel_token.is_cancelled() {
+                        if inner.verbose {
+                            eprintln!(
+                                "[s6ui] cancelled id={} priority={} kind=list_buckets",
+                                request_id,
+                                priority.as_str(),
+                            );
+                        }
                         continue;
                     }
+                    if inner.verbose {
+                        eprintln!(
+                            "[s6ui] started id={} priority={} kind=list_buckets",
+                            request_id,
+                            priority.as_str(),
+                        );
+                    }
                     inner.register_active_request(priority, request_id, cancel_token.clone());
-                    process_list_buckets(&inner, request_id, &cancel_token).await;
+                    process_list_buckets(&inner, request_id, priority, &cancel_token).await;
                     inner.finish_active_request(priority, request_id);
                 }
                 WorkItem::ListObjects {
@@ -372,7 +477,27 @@ async fn worker_loop(inner: Arc<S3BackendInner>, high_priority: bool) {
                     cancel_token,
                 } => {
                     if cancel_token.is_cancelled() {
+                        if inner.verbose {
+                            eprintln!(
+                                "[s6ui] cancelled id={} priority={} kind=list_objects bucket={} prefix={} continuation={}",
+                                request_id,
+                                priority.as_str(),
+                                bucket,
+                                prefix,
+                                continuation_state(&continuation_token),
+                            );
+                        }
                         continue;
+                    }
+                    if inner.verbose {
+                        eprintln!(
+                            "[s6ui] started id={} priority={} kind=list_objects bucket={} prefix={} continuation={}",
+                            request_id,
+                            priority.as_str(),
+                            bucket,
+                            prefix,
+                            continuation_state(&continuation_token),
+                        );
                     }
                     inner.register_active_request(priority, request_id, cancel_token.clone());
                     process_list_objects(
@@ -381,6 +506,7 @@ async fn worker_loop(inner: Arc<S3BackendInner>, high_priority: bool) {
                         &prefix,
                         request_id,
                         &continuation_token,
+                        priority,
                         &cancel_token,
                     )
                     .await;
@@ -396,7 +522,29 @@ async fn worker_loop(inner: Arc<S3BackendInner>, high_priority: bool) {
                     cancel_token,
                 } => {
                     if cancel_token.is_cancelled() {
+                        if inner.verbose {
+                            eprintln!(
+                                "[s6ui] cancelled id={} priority={} kind=stream_object bucket={} key={} range_start={} max_bytes={}",
+                                request_id,
+                                priority.as_str(),
+                                bucket,
+                                key,
+                                range_start,
+                                format_max_bytes(max_bytes),
+                            );
+                        }
                         continue;
+                    }
+                    if inner.verbose {
+                        eprintln!(
+                            "[s6ui] started id={} priority={} kind=stream_object bucket={} key={} range_start={} max_bytes={}",
+                            request_id,
+                            priority.as_str(),
+                            bucket,
+                            key,
+                            range_start,
+                            format_max_bytes(max_bytes),
+                        );
                     }
                     inner.register_active_request(priority, request_id, cancel_token.clone());
                     process_streaming_get_object(
@@ -407,6 +555,7 @@ async fn worker_loop(inner: Arc<S3BackendInner>, high_priority: bool) {
                         request_id,
                         range_start,
                         max_bytes,
+                        priority,
                         &cancel_token,
                     )
                     .await;
@@ -415,6 +564,20 @@ async fn worker_loop(inner: Arc<S3BackendInner>, high_priority: bool) {
             }
         }
     }
+}
+
+fn continuation_state(continuation_token: &str) -> &'static str {
+    if continuation_token.is_empty() {
+        "initial"
+    } else {
+        "resume"
+    }
+}
+
+fn format_max_bytes(max_bytes: Option<u64>) -> String {
+    max_bytes
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "full".to_string())
 }
 
 /// Parse endpoint URL to extract host (with port)
@@ -496,6 +659,7 @@ fn resolve_region(inner: &S3BackendInner, bucket: &str) -> String {
 async fn process_list_buckets(
     inner: &S3BackendInner,
     request_id: u64,
+    priority: RequestPriority,
     cancel_token: &CancellationToken,
 ) {
     let profile = &inner.profile;
@@ -550,13 +714,32 @@ async fn process_list_buckets(
                     buckets,
                 });
             }
+            if inner.verbose {
+                eprintln!(
+                    "[s6ui] ended id={} priority={} kind=list_buckets",
+                    request_id,
+                    priority.as_str(),
+                );
+            }
         }
-        Err(RequestError::Cancelled) => {}
+        Err(RequestError::Cancelled) => {
+            if inner.verbose {
+                eprintln!(
+                    "[s6ui] cancelled id={} priority={} kind=list_buckets",
+                    request_id,
+                    priority.as_str(),
+                );
+            }
+        }
         Err(RequestError::Http(error)) => {
-            inner.push_event(StateEvent::BucketsError {
-                request_id,
-                error,
-            });
+            inner.push_event(StateEvent::BucketsError { request_id, error });
+            if inner.verbose {
+                eprintln!(
+                    "[s6ui] ended id={} priority={} kind=list_buckets",
+                    request_id,
+                    priority.as_str(),
+                );
+            }
         }
     }
 }
@@ -567,6 +750,7 @@ async fn process_list_objects(
     prefix: &str,
     request_id: u64,
     continuation_token: &str,
+    priority: RequestPriority,
     cancel_token: &CancellationToken,
 ) {
     let mut region = resolve_region(inner, bucket);
@@ -655,8 +839,31 @@ async fn process_list_objects(
                         is_truncated: result.is_truncated,
                     });
                 }
+                if inner.verbose {
+                    eprintln!(
+                        "[s6ui] ended id={} priority={} kind=list_objects bucket={} prefix={} continuation={}",
+                        request_id,
+                        priority.as_str(),
+                        bucket,
+                        prefix,
+                        continuation_state(continuation_token),
+                    );
+                }
+                return;
             }
-            Err(RequestError::Cancelled) => return,
+            Err(RequestError::Cancelled) => {
+                if inner.verbose {
+                    eprintln!(
+                        "[s6ui] cancelled id={} priority={} kind=list_objects bucket={} prefix={} continuation={}",
+                        request_id,
+                        priority.as_str(),
+                        bucket,
+                        prefix,
+                        continuation_state(continuation_token),
+                    );
+                }
+                return;
+            }
             Err(RequestError::Http(e)) => {
                 inner.push_event(StateEvent::ObjectsError {
                     bucket: bucket.to_string(),
@@ -664,9 +871,19 @@ async fn process_list_objects(
                     request_id,
                     error: e,
                 });
+                if inner.verbose {
+                    eprintln!(
+                        "[s6ui] ended id={} priority={} kind=list_objects bucket={} prefix={} continuation={}",
+                        request_id,
+                        priority.as_str(),
+                        bucket,
+                        prefix,
+                        continuation_state(continuation_token),
+                    );
+                }
+                return;
             }
         }
-        return;
     }
 }
 
@@ -679,9 +896,21 @@ async fn process_streaming_get_object(
     request_id: u64,
     range_start: u64,
     max_bytes: Option<u64>,
+    priority: RequestPriority,
     cancel_token: &CancellationToken,
 ) {
     if cancel_token.is_cancelled() {
+        if inner.verbose {
+            eprintln!(
+                "[s6ui] cancelled id={} priority={} kind=stream_object bucket={} key={} range_start={} max_bytes={}",
+                request_id,
+                priority.as_str(),
+                bucket,
+                key,
+                range_start,
+                format_max_bytes(max_bytes),
+            );
+        }
         return;
     }
     let mut region = resolve_region(inner, bucket);
@@ -746,7 +975,20 @@ async fn process_streaming_get_object(
                     // Check for redirect or error
                     let body = match read_response_text(resp, cancel_token).await {
                         Ok(body) => body,
-                        Err(RequestError::Cancelled) => return,
+                        Err(RequestError::Cancelled) => {
+                            if inner.verbose {
+                                eprintln!(
+                                    "[s6ui] cancelled id={} priority={} kind=stream_object bucket={} key={} range_start={} max_bytes={}",
+                                    request_id,
+                                    priority.as_str(),
+                                    bucket,
+                                    key,
+                                    range_start,
+                                    format_max_bytes(max_bytes),
+                                );
+                            }
+                            return;
+                        }
                         Err(RequestError::Http(error)) => {
                             preview.set_status(StreamingStatus::Error(error.clone()));
                             inner.push_event(StateEvent::PreviewError {
@@ -755,6 +997,17 @@ async fn process_streaming_get_object(
                                 request_id,
                                 error,
                             });
+                            if inner.verbose {
+                                eprintln!(
+                                    "[s6ui] ended id={} priority={} kind=stream_object bucket={} key={} range_start={} max_bytes={}",
+                                    request_id,
+                                    priority.as_str(),
+                                    bucket,
+                                    key,
+                                    range_start,
+                                    format_max_bytes(max_bytes),
+                                );
+                            }
                             return;
                         }
                     };
@@ -782,6 +1035,17 @@ async fn process_streaming_get_object(
                                 line_count: 1,
                                 status: StreamingStatus::Complete,
                             });
+                            if inner.verbose {
+                                eprintln!(
+                                    "[s6ui] ended id={} priority={} kind=stream_object bucket={} key={} range_start={} max_bytes={}",
+                                    request_id,
+                                    priority.as_str(),
+                                    bucket,
+                                    key,
+                                    range_start,
+                                    format_max_bytes(max_bytes),
+                                );
+                            }
                             return;
                         }
                     }
@@ -795,6 +1059,17 @@ async fn process_streaming_get_object(
                         request_id,
                         error,
                     });
+                    if inner.verbose {
+                        eprintln!(
+                            "[s6ui] ended id={} priority={} kind=stream_object bucket={} key={} range_start={} max_bytes={}",
+                            request_id,
+                            priority.as_str(),
+                            bucket,
+                            key,
+                            range_start,
+                            format_max_bytes(max_bytes),
+                        );
+                    }
                     return;
                 }
 
@@ -822,6 +1097,17 @@ async fn process_streaming_get_object(
                                     request_id,
                                     error: e,
                                 });
+                                if inner.verbose {
+                                    eprintln!(
+                                        "[s6ui] ended id={} priority={} kind=stream_object bucket={} key={} range_start={} max_bytes={}",
+                                        request_id,
+                                        priority.as_str(),
+                                        bucket,
+                                        key,
+                                        range_start,
+                                        format_max_bytes(max_bytes),
+                                    );
+                                }
                                 return;
                             }
 
@@ -845,9 +1131,35 @@ async fn process_streaming_get_object(
                                 request_id,
                                 error,
                             });
+                            if inner.verbose {
+                                eprintln!(
+                                    "[s6ui] ended id={} priority={} kind=stream_object bucket={} key={} range_start={} max_bytes={}",
+                                    request_id,
+                                    priority.as_str(),
+                                    bucket,
+                                    key,
+                                    range_start,
+                                    format_max_bytes(max_bytes),
+                                );
+                            }
                             return;
                         }
                     }
+                }
+
+                if cancel_token.is_cancelled() {
+                    if inner.verbose {
+                        eprintln!(
+                            "[s6ui] cancelled id={} priority={} kind=stream_object bucket={} key={} range_start={} max_bytes={}",
+                            request_id,
+                            priority.as_str(),
+                            bucket,
+                            key,
+                            range_start,
+                            format_max_bytes(max_bytes),
+                        );
+                    }
+                    return;
                 }
 
                 // Finalize stream (flush any remaining decompression state)
@@ -859,6 +1171,17 @@ async fn process_streaming_get_object(
                         request_id,
                         error: e,
                     });
+                    if inner.verbose {
+                        eprintln!(
+                            "[s6ui] ended id={} priority={} kind=stream_object bucket={} key={} range_start={} max_bytes={}",
+                            request_id,
+                            priority.as_str(),
+                            bucket,
+                            key,
+                            range_start,
+                            format_max_bytes(max_bytes),
+                        );
+                    }
                     return;
                 }
 
@@ -880,9 +1203,33 @@ async fn process_streaming_get_object(
                     status: preview.status(),
                 });
 
+                if inner.verbose {
+                    eprintln!(
+                        "[s6ui] ended id={} priority={} kind=stream_object bucket={} key={} range_start={} max_bytes={}",
+                        request_id,
+                        priority.as_str(),
+                        bucket,
+                        key,
+                        range_start,
+                        format_max_bytes(max_bytes),
+                    );
+                }
                 return;
             }
-            Err(RequestError::Cancelled) => return,
+            Err(RequestError::Cancelled) => {
+                if inner.verbose {
+                    eprintln!(
+                        "[s6ui] cancelled id={} priority={} kind=stream_object bucket={} key={} range_start={} max_bytes={}",
+                        request_id,
+                        priority.as_str(),
+                        bucket,
+                        key,
+                        range_start,
+                        format_max_bytes(max_bytes),
+                    );
+                }
+                return;
+            }
             Err(RequestError::Http(error)) => {
                 preview.set_status(StreamingStatus::Error(error.clone()));
                 inner.push_event(StateEvent::PreviewError {
@@ -891,6 +1238,17 @@ async fn process_streaming_get_object(
                     request_id,
                     error,
                 });
+                if inner.verbose {
+                    eprintln!(
+                        "[s6ui] ended id={} priority={} kind=stream_object bucket={} key={} range_start={} max_bytes={}",
+                        request_id,
+                        priority.as_str(),
+                        bucket,
+                        key,
+                        range_start,
+                        format_max_bytes(max_bytes),
+                    );
+                }
                 return;
             }
         }

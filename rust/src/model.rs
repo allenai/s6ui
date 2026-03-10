@@ -649,6 +649,7 @@ impl BrowserModel {
         self.current_bucket = bucket.to_string();
         self.current_prefix = prefix.to_string();
         self.ensure_folder_full(bucket, prefix);
+        self.prefetch_parent_folder(bucket, prefix);
     }
 
     pub fn add_manual_bucket(&mut self, bucket_name: &str) {
@@ -902,6 +903,12 @@ impl BrowserModel {
         }
     }
 
+    fn prefetch_parent_folder(&mut self, bucket: &str, prefix: &str) {
+        if let Some(parent_prefix) = Self::parent_prefix(prefix) {
+            self.prefetch_folder(bucket, &parent_prefix);
+        }
+    }
+
     fn schedule_child_preloads(&mut self, bucket: &str, prefix: &str) {
         let key = Self::make_node_key(bucket, prefix);
         let children = {
@@ -1057,6 +1064,22 @@ impl BrowserModel {
 
     fn make_preview_cache_key(bucket: &str, key: &str) -> String {
         format!("{}/{}", bucket, key)
+    }
+
+    fn parent_prefix(prefix: &str) -> Option<String> {
+        if prefix.is_empty() {
+            return None;
+        }
+
+        let trimmed = prefix.trim_end_matches('/');
+        if trimmed.is_empty() {
+            return Some(String::new());
+        }
+
+        match trimmed.rfind('/') {
+            Some(pos) => Some(trimmed[..pos + 1].to_string()),
+            None => Some(String::new()),
+        }
     }
 
     fn parse_s3_path(path: &str) -> Option<(String, String)> {
@@ -1405,6 +1428,40 @@ mod tests {
                     priority: RequestPriority::High,
                     request_id: 2,
                 },
+                RecordedRequest::List {
+                    bucket: "bucket".to_string(),
+                    prefix: String::new(),
+                    continuation_token: String::new(),
+                    priority: RequestPriority::Low,
+                    request_id: 3,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn navigating_into_folder_prefetches_parent_for_dotdot_entry() {
+        let (mut model, backend) = model_with_backend();
+
+        model.navigate_into("bucket", "parent/child/");
+
+        assert_eq!(
+            backend.requests(),
+            vec![
+                RecordedRequest::List {
+                    bucket: "bucket".to_string(),
+                    prefix: "parent/child/".to_string(),
+                    continuation_token: String::new(),
+                    priority: RequestPriority::High,
+                    request_id: 1,
+                },
+                RecordedRequest::List {
+                    bucket: "bucket".to_string(),
+                    prefix: "parent/".to_string(),
+                    continuation_token: String::new(),
+                    priority: RequestPriority::Low,
+                    request_id: 2,
+                },
             ]
         );
     }
@@ -1452,7 +1509,7 @@ mod tests {
                     prefix: "prefix/child/".to_string(),
                     continuation_token: String::new(),
                     priority: RequestPriority::Low,
-                    request_id: 2,
+                    request_id: 3,
                 },
                 RecordedRequest::Stream {
                     bucket: "bucket".to_string(),
@@ -1460,7 +1517,7 @@ mod tests {
                     range_start: 0,
                     max_bytes: Some(PREFETCH_BYTES),
                     priority: RequestPriority::Low,
-                    request_id: 3,
+                    request_id: 4,
                 },
             ]
         );
