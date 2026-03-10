@@ -1,0 +1,32 @@
+class S6ui < Formula
+  desc "Fast GUI for browsing AWS S3 buckets"
+  homepage "https://github.com/allenai/s6ui"
+  url "__S6UI_URL__"
+  sha256 "__S6UI_SHA256__"
+  license "Apache-2.0"
+  version "__S6UI_VERSION__"
+  head "https://github.com/allenai/s6ui.git", branch: "main"
+
+  depends_on "rust" => :build
+
+  on_linux do
+    depends_on "openssl@3"
+    depends_on "pkgconf" => :build
+    depends_on "libxcb"
+    depends_on "libx11"
+    depends_on "libxcursor"
+    depends_on "libxi"
+    depends_on "libxinerama"
+    depends_on "libxkbcommon"
+    depends_on "libxrandr"
+    depends_on "wayland"
+  end
+
+  def install
+    system "cargo", "install", "--locked", "--offline", *std_cargo_args(path: ".")
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/s6ui --version")
+  end
+end
