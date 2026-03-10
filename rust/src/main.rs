@@ -14,15 +14,21 @@ use dear_imgui_wgpu::WgpuRenderer;
 use dear_imgui_winit::WinitPlatform;
 use model::BrowserModel;
 use pollster::block_on;
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use ui::BrowserUI;
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
-    event::WindowEvent,
+    event::{StartCause, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     window::{Window, WindowId},
 };
+
+const ACTIVE_REDRAW_INTERVAL: Duration = Duration::from_millis(16);
+const IDLE_REDRAW_INTERVAL: Duration = Duration::from_millis(500);
 
 struct ImguiState {
     context: Context,
@@ -97,6 +103,8 @@ struct App {
     verbose_logging: bool,
     show_debug_window: bool,
     initial_path: Option<String>,
+    had_activity: bool,
+    activity_since_last_render: bool,
 }
 
 impl App {
@@ -132,6 +140,8 @@ impl App {
             verbose_logging: opts.verbose,
             show_debug_window: opts.debug,
             initial_path: opts.initial_path,
+            had_activity: true,
+            activity_since_last_render: true,
         }
     }
 
@@ -200,6 +210,24 @@ impl App {
 
         if let Err(err) = settings::save_settings(settings) {
             eprintln!("Failed to save settings: {err}");
+        }
+    }
+
+    fn mark_activity(&mut self) {
+        self.activity_since_last_render = true;
+    }
+
+    fn request_redraw(&self) {
+        if let Some(window) = &self.window {
+            window.window.request_redraw();
+        }
+    }
+
+    fn redraw_interval(&self) -> Duration {
+        if self.had_activity {
+            ACTIVE_REDRAW_INTERVAL
+        } else {
+            IDLE_REDRAW_INTERVAL
         }
     }
 }
@@ -303,7 +331,7 @@ impl AppWindow {
         model: &mut BrowserModel,
         browser_ui: &mut BrowserUI,
         show_debug_window: bool,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<bool, Box<dyn std::error::Error>> {
         let now = Instant::now();
         let delta_time = now - self.imgui.last_frame;
         self.imgui
@@ -316,9 +344,9 @@ impl AppWindow {
             Ok(frame) => frame,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                 self.surface.configure(&self.device, &self.surface_desc);
-                return Ok(());
+                return Ok(false);
             }
-            Err(wgpu::SurfaceError::Timeout) => return Ok(()),
+            Err(wgpu::SurfaceError::Timeout) => return Ok(false),
             Err(e) => return Err(Box::new(e)),
         };
 
@@ -328,7 +356,7 @@ impl AppWindow {
         let ui = self.imgui.context.frame();
 
         // Process backend events
-        model.process_events();
+        let had_backend_events = model.process_events();
 
         // Get window size for UI
         let size = self.window.inner_size();
@@ -387,17 +415,24 @@ impl AppWindow {
 
         self.queue.submit(Some(encoder.finish()));
         frame.present();
-        Ok(())
+        Ok(had_backend_events)
     }
 }
 
 impl ApplicationHandler<()> for App {
+    fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
+        if matches!(cause, StartCause::ResumeTimeReached { .. }) {
+            self.request_redraw();
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
             match AppWindow::new(event_loop) {
                 Ok(window) => {
                     self.window = Some(window);
                     self.init_backend();
+                    self.request_redraw();
                 }
                 Err(e) => {
                     eprintln!("Failed to create window: {e}");
@@ -408,10 +443,9 @@ impl ApplicationHandler<()> for App {
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
-        // Backend pushed events - request redraw
-        if let Some(window) = &self.window {
-            window.window.request_redraw();
-        }
+        // Backend pushed events - wake immediately and stay in active redraw mode.
+        self.mark_activity();
+        self.request_redraw();
     }
 
     fn window_event(
@@ -434,47 +468,79 @@ impl ApplicationHandler<()> for App {
             );
         }
 
+        let event_is_activity = matches!(
+            event,
+            WindowEvent::Resized(_)
+                | WindowEvent::ScaleFactorChanged { .. }
+                | WindowEvent::KeyboardInput { .. }
+                | WindowEvent::ModifiersChanged(_)
+                | WindowEvent::Ime(_)
+                | WindowEvent::CursorMoved { .. }
+                | WindowEvent::CursorEntered { .. }
+                | WindowEvent::CursorLeft { .. }
+                | WindowEvent::MouseWheel { .. }
+                | WindowEvent::MouseInput { .. }
+                | WindowEvent::PinchGesture { .. }
+                | WindowEvent::PanGesture { .. }
+                | WindowEvent::DoubleTapGesture { .. }
+                | WindowEvent::RotationGesture { .. }
+                | WindowEvent::TouchpadPressure { .. }
+                | WindowEvent::AxisMotion { .. }
+                | WindowEvent::Touch(_)
+                | WindowEvent::Focused(_)
+        );
+
+        if event_is_activity {
+            self.mark_activity();
+            self.request_redraw();
+        }
+
         match event {
             WindowEvent::Resized(size) => {
                 let window = self.window.as_mut().unwrap();
                 window.resize(size);
-                window.window.request_redraw();
             }
             WindowEvent::ScaleFactorChanged { .. } => {
                 let window = self.window.as_mut().unwrap();
                 let new_size = window.window.inner_size();
                 window.resize(new_size);
-                window.window.request_redraw();
             }
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => {
                 let prev_profile = self.model.selected_profile_idx;
+                let frame_had_activity = self.activity_since_last_render;
+                self.activity_since_last_render = false;
+                let mut had_backend_activity = false;
 
                 {
                     let window = self.window.as_mut().unwrap();
-                    if let Err(e) = window.render(
+                    match window.render(
                         &mut self.model,
                         &mut self.browser_ui,
                         self.show_debug_window,
                     ) {
-                        eprintln!("Render error: {e}");
+                        Ok(render_had_backend_activity) => {
+                            had_backend_activity = render_had_backend_activity;
+                        }
+                        Err(e) => {
+                            eprintln!("Render error: {e}");
+                        }
                     }
                 }
 
                 if self.model.selected_profile_idx != prev_profile {
+                    self.mark_activity();
                     self.recreate_backend();
                 }
 
-                self.window.as_ref().unwrap().window.request_redraw();
+                self.had_activity = frame_had_activity || had_backend_activity;
             }
             _ => {}
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(window) = &self.window {
-            window.window.request_redraw();
-        }
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        event_loop.set_control_flow(ControlFlow::wait_duration(self.redraw_interval()));
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
@@ -490,7 +556,6 @@ fn main() {
     }
 
     let event_loop = EventLoop::<()>::with_user_event().build().unwrap();
-    event_loop.set_control_flow(ControlFlow::Poll);
 
     let proxy = event_loop.create_proxy();
     let mut app = App::new(proxy, opts);
