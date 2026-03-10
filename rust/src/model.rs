@@ -33,8 +33,6 @@ enum PreviewLoadMode {
 
 /// A cached folder's contents
 pub struct FolderNode {
-    pub bucket: String,
-    pub prefix: String,
     pub objects: Vec<S3Object>,
     pub next_continuation_token: String,
     pub loading: bool,
@@ -50,10 +48,8 @@ pub struct FolderNode {
 }
 
 impl FolderNode {
-    fn new(bucket: String, prefix: String) -> Self {
+    fn new(_bucket: String, _prefix: String) -> Self {
         Self {
-            bucket,
-            prefix,
             objects: Vec::new(),
             next_continuation_token: String::new(),
             loading: false,
@@ -210,22 +206,6 @@ impl PreviewNode {
         self.preview.status()
     }
 
-    pub fn is_loading(&self) -> bool {
-        matches!(self.status(), PreviewStatus::Loading)
-    }
-
-    pub fn error(&self) -> Option<String> {
-        match self.preview.status() {
-            StreamingStatus::Error(e) => Some(e),
-            _ => None,
-        }
-    }
-
-    /// Get line count
-    pub fn line_count(&self) -> usize {
-        self.preview.line_count()
-    }
-
     /// Get decompressed bytes written
     pub fn bytes_written(&self) -> u64 {
         self.preview.bytes_written()
@@ -236,18 +216,9 @@ impl PreviewNode {
         self.preview.source_bytes()
     }
 
-    /// Read lines for display
-    pub fn read_lines(&self, start_line: usize, count: usize) -> Vec<String> {
-        self.preview.read_lines(start_line, count)
-    }
-
     /// Check if download is complete
     pub fn is_complete(&self) -> bool {
         matches!(self.preview.status(), StreamingStatus::Complete)
-    }
-
-    pub fn request_id(&self) -> u64 {
-        self.request_id
     }
 }
 
@@ -345,23 +316,11 @@ impl BrowserModel {
         self.current_bucket.is_empty()
     }
 
-    pub fn has_selection(&self) -> bool {
-        self.selected_preview.is_some()
-    }
-
     /// Get the currently selected preview node
     pub fn selected_preview(&self) -> Option<&PreviewNode> {
         self.selected_preview
             .as_ref()
             .and_then(|k| self.previews.get(k))
-    }
-
-    /// Get the currently selected preview node mutably
-    pub fn selected_preview_mut(&mut self) -> Option<&mut PreviewNode> {
-        match &self.selected_preview {
-            Some(k) => self.previews.get_mut(k),
-            None => None,
-        }
     }
 
     fn next_request_id(&mut self) -> u64 {
@@ -496,9 +455,6 @@ impl BrowserModel {
                     bucket,
                     key,
                     request_id,
-                    decompressed_bytes: _,
-                    source_bytes: _,
-                    line_count: _,
                     status,
                 } => {
                     let cache_key = Self::make_preview_cache_key(&bucket, &key);
@@ -549,7 +505,6 @@ impl BrowserModel {
                     bucket,
                     key,
                     request_id,
-                    error: _,
                 } => {
                     let cache_key = Self::make_preview_cache_key(&bucket, &key);
                     if let Some(node) = self.previews.get_mut(&cache_key) {
@@ -704,7 +659,6 @@ impl BrowserModel {
         }
         self.buckets.push(S3Bucket {
             name: bucket_name.to_string(),
-            creation_date: "(manually added)".to_string(),
         });
     }
 
@@ -1435,7 +1389,6 @@ mod tests {
             request_id: first_request_id,
             buckets: vec![S3Bucket {
                 name: "stale".to_string(),
-                creation_date: String::new(),
             }],
         });
         model.process_events();
@@ -1446,7 +1399,6 @@ mod tests {
             request_id: second_request_id,
             buckets: vec![S3Bucket {
                 name: "fresh".to_string(),
-                creation_date: String::new(),
             }],
         });
         model.process_events();
@@ -1587,14 +1539,12 @@ mod tests {
                     key: "prefix/child/".to_string(),
                     display_name: "child".to_string(),
                     size: 0,
-                    last_modified: String::new(),
                     is_folder: true,
                 },
                 S3Object {
                     key: "prefix/file.txt".to_string(),
                     display_name: "file.txt".to_string(),
                     size: 16,
-                    last_modified: String::new(),
                     is_folder: false,
                 },
             ],

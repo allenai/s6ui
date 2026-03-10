@@ -6,6 +6,7 @@
 
 use memmap2::Mmap;
 use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -78,79 +79,79 @@ impl Transform for IdentityTransform {
     }
 }
 
-/// Gzip decompression transform backed by flate2's incremental decompressor.
+/// Small sink that lets the gzip decoder stream output back to the preview.
+#[derive(Default)]
+struct GzipOutputBuffer {
+    bytes: Vec<u8>,
+}
+
+impl GzipOutputBuffer {
+    fn take(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.bytes)
+    }
+}
+
+impl Write for GzipOutputBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Gzip decompression transform backed by flate2's streaming writer.
 pub struct GzipTransform {
-    decoder: Option<flate2::bufread::GzDecoder<std::io::Cursor<Vec<u8>>>>,
+    decoder: flate2::write::GzDecoder<GzipOutputBuffer>,
     finished: bool,
 }
 
 impl GzipTransform {
     pub fn new() -> Self {
         Self {
-            decoder: None,
+            decoder: flate2::write::GzDecoder::new(GzipOutputBuffer::default()),
             finished: false,
         }
     }
 
-    fn drain_decoder(&mut self, output: &mut Vec<u8>, finalize: bool) -> Result<(), String> {
-        use std::io::Read;
-
-        if self.finished {
-            return Ok(());
-        }
-
-        let decoder = match self.decoder.as_mut() {
-            Some(decoder) => decoder,
-            None => return Ok(()),
-        };
-
-        loop {
-            let mut chunk = [0u8; 8192];
-            match decoder.read(&mut chunk) {
-                Ok(0) => {
-                    if finalize {
-                        self.finished = true;
-                    }
-                    return Ok(());
-                }
-                Ok(n) => output.extend_from_slice(&chunk[..n]),
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && !finalize => {
-                    return Ok(());
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && finalize => {
-                    return Err(format!("gzip decompress error: {}", e));
-                }
-                Err(e) => {
-                    if finalize && e.kind() == std::io::ErrorKind::InvalidData {
-                        return Err(format!("gzip decompress error: {}", e));
-                    }
-                    self.finished = true;
-                    return Err(format!("gzip decompress error: {}", e));
-                }
-            }
+    fn drain_output(&mut self, output: &mut Vec<u8>) {
+        let produced = self.decoder.get_mut().take();
+        if !produced.is_empty() {
+            output.extend_from_slice(&produced);
         }
     }
 }
 
 impl Transform for GzipTransform {
     fn process(&mut self, input: &[u8], output: &mut Vec<u8>) -> Result<(), String> {
+        if self.finished {
+            return Ok(());
+        }
+
         if input.is_empty() {
             return Ok(());
         }
 
-        match self.decoder.as_mut() {
-            Some(decoder) => decoder.get_mut().get_mut().extend_from_slice(input),
-            None => {
-                self.decoder = Some(flate2::bufread::GzDecoder::new(std::io::Cursor::new(
-                    input.to_vec(),
-                )));
-            }
-        }
-        self.drain_decoder(output, false)
+        self.decoder
+            .write_all(input)
+            .map_err(|e| format!("gzip decompress error: {}", e))?;
+        self.drain_output(output);
+        Ok(())
     }
 
     fn finish(&mut self, output: &mut Vec<u8>) -> Result<(), String> {
-        self.drain_decoder(output, true)
+        if self.finished {
+            return Ok(());
+        }
+
+        self.decoder
+            .try_finish()
+            .map_err(|e| format!("gzip decompress error: {}", e))?;
+        self.drain_output(output);
+        self.finished = true;
+        Ok(())
     }
 }
 
@@ -253,8 +254,6 @@ pub struct StreamingFilePreview {
     temp_path: PathBuf,
     /// Total size of source if known (Content-Length)
     total_source_size: AtomicU64,
-    /// Compression type
-    compression: Compression,
     /// Mutable state protected by mutex
     state: Mutex<StreamingState>,
 }
@@ -280,7 +279,6 @@ impl StreamingFilePreview {
             temp_file,
             temp_path,
             total_source_size: AtomicU64::new(0),
-            compression,
             state: Mutex::new(StreamingState {
                 bytes_written: 0,
                 source_bytes: 0,
@@ -305,20 +303,14 @@ impl StreamingFilePreview {
         Ok(preview)
     }
 
-    /// Get compression type
-    pub fn compression(&self) -> Compression {
-        self.compression
-    }
-
     /// Set total source size (from Content-Length header)
     pub fn set_total_source_size(&self, size: u64) {
         self.total_source_size.store(size, Ordering::SeqCst);
     }
 
     /// Get total source size if known
-    pub fn total_source_size(&self) -> Option<u64> {
-        let size = self.total_source_size.load(Ordering::SeqCst);
-        if size > 0 { Some(size) } else { None }
+    pub fn total_source_size(&self) -> u64 {
+        self.total_source_size.load(Ordering::SeqCst)
     }
 
     /// Get bytes written (decompressed)
@@ -481,6 +473,7 @@ impl StreamingFilePreview {
     }
 
     /// Read a range of lines for display
+    #[cfg(test)]
     pub fn read_lines(&self, start_line: usize, count: usize) -> Vec<String> {
         // Get line offsets and bytes_written under lock, then release
         let (offsets, next_offset, bytes_written) = {
@@ -681,5 +674,31 @@ mod tests {
         transform.finish(&mut output).unwrap();
 
         assert_eq!(String::from_utf8_lossy(&output), "Hello, compressed world!");
+    }
+
+    #[test]
+    fn test_gzip_streaming_preview_resumes_after_prefetch() {
+        use std::io::Write;
+
+        let payload = b"{\"text\":\"first\"}\n{\"text\":\"second\"}\n";
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let split = (compressed.len() / 2).max(1);
+        let preview = StreamingFilePreview::new(Compression::Gzip).unwrap();
+
+        preview.append_chunk(&compressed[..split]).unwrap();
+        preview.set_prefetch_ready();
+
+        preview.append_chunk(&compressed[split..]).unwrap();
+        preview.finish_stream().unwrap();
+        preview.set_complete();
+
+        assert_eq!(
+            preview.read_lines(0, 2),
+            vec!["{\"text\":\"first\"}", "{\"text\":\"second\"}"]
+        );
+        assert!(preview.is_line_complete(1));
     }
 }

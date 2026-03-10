@@ -533,11 +533,6 @@ impl MmapTextViewer {
         result
     }
 
-    /// Check if there's an active selection
-    pub fn has_selection(&self) -> bool {
-        self.selection_active
-    }
-
     /// Hit test: convert mouse position to TextPosition
     fn hit_test(
         &self,

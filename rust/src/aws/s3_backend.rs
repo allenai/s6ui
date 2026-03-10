@@ -580,6 +580,49 @@ fn format_max_bytes(max_bytes: Option<u64>) -> String {
         .unwrap_or_else(|| "full".to_string())
 }
 
+fn parse_content_range_total(content_range: &str) -> Option<u64> {
+    let (_, total) = content_range.rsplit_once('/')?;
+    if total == "*" {
+        return None;
+    }
+    total.parse().ok()
+}
+
+fn response_total_source_size(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    content_length: Option<u64>,
+    range_start: u64,
+    max_bytes: Option<u64>,
+) -> Option<u64> {
+    headers
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_content_range_total)
+        .or_else(|| {
+            if status == reqwest::StatusCode::PARTIAL_CONTENT {
+                if max_bytes.is_none() {
+                    content_length.map(|length| range_start.saturating_add(length))
+                } else {
+                    None
+                }
+            } else {
+                content_length
+            }
+        })
+}
+
+fn should_finalize_preview(
+    max_bytes: Option<u64>,
+    total_source_size: u64,
+    source_bytes: u64,
+) -> bool {
+    match max_bytes {
+        None => true,
+        Some(_) => total_source_size > 0 && source_bytes >= total_source_size,
+    }
+}
+
 /// Parse endpoint URL to extract host (with port)
 fn parse_endpoint_host(endpoint_url: &str) -> String {
     let mut url = endpoint_url;
@@ -995,7 +1038,6 @@ async fn process_streaming_get_object(
                                 bucket: bucket.to_string(),
                                 key: key.to_string(),
                                 request_id,
-                                error,
                             });
                             if inner.verbose {
                                 eprintln!(
@@ -1030,9 +1072,6 @@ async fn process_streaming_get_object(
                                 bucket: bucket.to_string(),
                                 key: key.to_string(),
                                 request_id,
-                                decompressed_bytes: 0,
-                                source_bytes: 0,
-                                line_count: 1,
                                 status: StreamingStatus::Complete,
                             });
                             if inner.verbose {
@@ -1057,7 +1096,6 @@ async fn process_streaming_get_object(
                         bucket: bucket.to_string(),
                         key: key.to_string(),
                         request_id,
-                        error,
                     });
                     if inner.verbose {
                         eprintln!(
@@ -1073,11 +1111,15 @@ async fn process_streaming_get_object(
                     return;
                 }
 
-                // Get content-length if available
-                if let Some(content_length) = resp.content_length() {
-                    if range_start == 0 {
-                        preview.set_total_source_size(content_length);
-                    }
+                let content_length = resp.content_length();
+                if let Some(total_source_size) = response_total_source_size(
+                    status,
+                    resp.headers(),
+                    content_length,
+                    range_start,
+                    max_bytes,
+                ) {
+                    preview.set_total_source_size(total_source_size);
                 }
 
                 inner.cache_region(bucket, &region);
@@ -1095,7 +1137,6 @@ async fn process_streaming_get_object(
                                     bucket: bucket.to_string(),
                                     key: key.to_string(),
                                     request_id,
-                                    error: e,
                                 });
                                 if inner.verbose {
                                     eprintln!(
@@ -1116,9 +1157,6 @@ async fn process_streaming_get_object(
                                 bucket: bucket.to_string(),
                                 key: key.to_string(),
                                 request_id,
-                                decompressed_bytes: preview.bytes_written(),
-                                source_bytes: preview.source_bytes(),
-                                line_count: preview.line_count(),
                                 status: preview.status(),
                             });
                         }
@@ -1129,7 +1167,6 @@ async fn process_streaming_get_object(
                                 bucket: bucket.to_string(),
                                 key: key.to_string(),
                                 request_id,
-                                error,
                             });
                             if inner.verbose {
                                 eprintln!(
@@ -1162,34 +1199,35 @@ async fn process_streaming_get_object(
                     return;
                 }
 
-                // Finalize stream (flush any remaining decompression state)
-                if let Err(e) = preview.finish_stream() {
-                    preview.set_status(StreamingStatus::Error(e.clone()));
-                    inner.push_event(StateEvent::PreviewError {
-                        bucket: bucket.to_string(),
-                        key: key.to_string(),
-                        request_id,
-                        error: e,
-                    });
-                    if inner.verbose {
-                        eprintln!(
-                            "[s6ui] ended id={} priority={} kind=stream_object bucket={} key={} range_start={} max_bytes={}",
+                if should_finalize_preview(
+                    max_bytes,
+                    preview.total_source_size(),
+                    preview.source_bytes(),
+                ) {
+                    // Only finalize transforms once we have the full object.
+                    if let Err(e) = preview.finish_stream() {
+                        preview.set_status(StreamingStatus::Error(e.clone()));
+                        inner.push_event(StateEvent::PreviewError {
+                            bucket: bucket.to_string(),
+                            key: key.to_string(),
                             request_id,
-                            priority.as_str(),
-                            bucket,
-                            key,
-                            range_start,
-                            format_max_bytes(max_bytes),
-                        );
+                        });
+                        if inner.verbose {
+                            eprintln!(
+                                "[s6ui] ended id={} priority={} kind=stream_object bucket={} key={} range_start={} max_bytes={}",
+                                request_id,
+                                priority.as_str(),
+                                bucket,
+                                key,
+                                range_start,
+                                format_max_bytes(max_bytes),
+                            );
+                        }
+                        return;
                     }
-                    return;
-                }
-
-                // Set final status
-                if is_prefetch {
-                    preview.set_prefetch_ready();
-                } else {
                     preview.set_complete();
+                } else if is_prefetch {
+                    preview.set_prefetch_ready();
                 }
 
                 // Final progress event
@@ -1197,9 +1235,6 @@ async fn process_streaming_get_object(
                     bucket: bucket.to_string(),
                     key: key.to_string(),
                     request_id,
-                    decompressed_bytes: preview.bytes_written(),
-                    source_bytes: preview.source_bytes(),
-                    line_count: preview.line_count(),
                     status: preview.status(),
                 });
 
@@ -1236,7 +1271,6 @@ async fn process_streaming_get_object(
                     bucket: bucket.to_string(),
                     key: key.to_string(),
                     request_id,
-                    error,
                 });
                 if inner.verbose {
                     eprintln!(
@@ -1353,13 +1387,9 @@ fn parse_list_buckets_xml(xml_body: &str) -> Vec<S3Bucket> {
         if let Some(end) = xml_body[abs_start..].find(bucket_end) {
             let bucket_xml = &xml_body[abs_start..abs_start + end + bucket_end.len()];
             let name = xml::extract_tag(bucket_xml, "Name").unwrap_or_default();
-            let creation_date = xml::extract_tag(bucket_xml, "CreationDate").unwrap_or_default();
 
             if !name.is_empty() {
-                buckets.push(S3Bucket {
-                    name,
-                    creation_date,
-                });
+                buckets.push(S3Bucket { name });
             }
             pos = abs_start + end + bucket_end.len();
         } else {
@@ -1415,7 +1445,6 @@ fn parse_list_objects_xml(xml_body: &str, _prefix: &str) -> ListObjectsResult {
                     key: prefix,
                     display_name,
                     size: 0,
-                    last_modified: String::new(),
                     is_folder: true,
                 });
             }
@@ -1437,7 +1466,6 @@ fn parse_list_objects_xml(xml_body: &str, _prefix: &str) -> ListObjectsResult {
             let size: i64 = xml::extract_tag(contents_xml, "Size")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
-            let last_modified = xml::extract_tag(contents_xml, "LastModified").unwrap_or_default();
 
             // Skip folder markers
             if !key.is_empty() && !key.ends_with('/') {
@@ -1449,7 +1477,6 @@ fn parse_list_objects_xml(xml_body: &str, _prefix: &str) -> ListObjectsResult {
                     key,
                     display_name,
                     size,
-                    last_modified,
                     is_folder: false,
                 });
             }
@@ -1460,4 +1487,27 @@ fn parse_list_objects_xml(xml_body: &str, _prefix: &str) -> ListObjectsResult {
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_content_range_total() {
+        assert_eq!(
+            parse_content_range_total("bytes 0-65535/123456"),
+            Some(123456)
+        );
+        assert_eq!(parse_content_range_total("bytes 0-0/*"), None);
+        assert_eq!(parse_content_range_total("not-a-range"), None);
+    }
+
+    #[test]
+    fn test_should_finalize_preview() {
+        assert!(should_finalize_preview(None, 0, 0));
+        assert!(!should_finalize_preview(Some(65536), 0, 65536));
+        assert!(!should_finalize_preview(Some(65536), 123456, 65536));
+        assert!(should_finalize_preview(Some(65536), 123456, 123456));
+    }
 }

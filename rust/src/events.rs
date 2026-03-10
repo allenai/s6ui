@@ -2,7 +2,6 @@
 #[derive(Debug, Clone)]
 pub struct S3Bucket {
     pub name: String,
-    pub creation_date: String,
 }
 
 /// S3 object metadata (file or folder)
@@ -11,7 +10,6 @@ pub struct S3Object {
     pub key: String,
     pub display_name: String,
     pub size: i64,
-    pub last_modified: String,
     pub is_folder: bool,
 }
 
@@ -47,9 +45,6 @@ pub enum StateEvent {
         bucket: String,
         key: String,
         request_id: u64,
-        decompressed_bytes: u64,
-        source_bytes: u64,
-        line_count: usize,
         status: StreamingStatus,
     },
     /// Streaming preview error
@@ -57,6 +52,5 @@ pub enum StateEvent {
         bucket: String,
         key: String,
         request_id: u64,
-        error: String,
     },
 }
