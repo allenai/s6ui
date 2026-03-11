@@ -109,6 +109,8 @@ pub struct MmapTextViewer {
 
     /// Cached monospace character width (all chars same width in fixed-width font)
     char_width: f32,
+    /// Font size used when char_width was last measured
+    last_font_size: f32,
 }
 
 // Constants
@@ -138,6 +140,7 @@ impl MmapTextViewer {
             avg_visual_rows: 1.0,
             avg_visual_rows_sample_line: 0,
             char_width: 0.0,
+            last_font_size: 0.0,
         }
     }
 
@@ -339,6 +342,7 @@ impl MmapTextViewer {
         let font = ui.current_font();
         let size = ui.current_font_size();
         self.char_width = font.calc_text_size(size, f32::MAX, -1.0, "M")[0];
+        self.last_font_size = size;
     }
 
     /// Compute wrap info for a line using the cached char width table
@@ -656,9 +660,12 @@ impl MmapTextViewer {
             self.anchor_line = lc - 1;
         }
 
-        // Ensure char width is measured
-        if self.char_width == 0.0 {
+        // Keep cached monospace metrics aligned with the active ImGui font size.
+        let current_font_size = ui.current_font_size();
+        if self.char_width == 0.0 || (self.last_font_size - current_font_size).abs() > f32::EPSILON
+        {
             self.update_char_width(ui);
+            self.wrap_cache.clear();
         }
 
         let line_height = ui.text_line_height_with_spacing();

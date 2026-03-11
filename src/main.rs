@@ -8,6 +8,7 @@ mod preview;
 mod settings;
 mod text_viewer;
 mod ui;
+mod ui_fonts;
 
 use app_clipboard::SystemClipboardBackend;
 use aws::credentials;
@@ -22,6 +23,7 @@ use std::{
     time::{Duration, Instant},
 };
 use ui::BrowserUI;
+use ui_fonts::configure_imgui_fonts;
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
@@ -236,7 +238,10 @@ impl App {
 }
 
 impl AppWindow {
-    fn new(event_loop: &ActiveEventLoop) -> Result<Self, Box<dyn std::error::Error>> {
+    fn new(
+        event_loop: &ActiveEventLoop,
+        verbose_logging: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
             ..Default::default()
@@ -292,6 +297,7 @@ impl AppWindow {
 
         let mut platform = WinitPlatform::new(&mut context);
         platform.attach_window(&window, dear_imgui_winit::HiDpiMode::Default, &mut context);
+        configure_imgui_fonts(&mut context, verbose_logging);
 
         let init_info =
             dear_imgui_wgpu::WgpuInitInfo::new(device.clone(), queue.clone(), surface_desc.format);
@@ -432,7 +438,7 @@ impl ApplicationHandler<()> for App {
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
-            match AppWindow::new(event_loop) {
+            match AppWindow::new(event_loop, self.verbose_logging) {
                 Ok(window) => {
                     self.window = Some(window);
                     self.init_backend();
