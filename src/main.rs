@@ -34,6 +34,7 @@ use winit::{
 
 const ACTIVE_REDRAW_INTERVAL: Duration = Duration::from_millis(16);
 const IDLE_REDRAW_INTERVAL: Duration = Duration::from_millis(500);
+const APP_WINDOW_TITLE: &str = concat!("s6ui ", env!("CARGO_PKG_VERSION"), " - S3 Browser");
 
 struct ImguiState {
     context: Context,
@@ -250,7 +251,7 @@ impl AppWindow {
         let window = Arc::new(
             event_loop.create_window(
                 Window::default_attributes()
-                    .with_title("s6ui - S3 Browser")
+                    .with_title(APP_WINDOW_TITLE)
                     .with_inner_size(LogicalSize::new(1280.0, 720.0)),
             )?,
         );

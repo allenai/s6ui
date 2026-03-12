@@ -1,3 +1,4 @@
+use crate::app_clipboard::copy_text_to_clipboard;
 use crate::jsonl_viewer::JsonlPreviewer;
 use crate::model::{BrowserModel, PreviewNode, PreviewStatus};
 use crate::preview::StreamingFilePreview;
@@ -143,9 +144,11 @@ impl BrowserUI {
 
                 // [..] navigate up
                 if !model.is_at_root() {
+                    let parent_path = parent_s3_path(&model.current_bucket, &model.current_prefix);
                     if ui.selectable("[..]") {
                         model.navigate_up();
                     }
+                    render_copy_path_context_menu(ui, &parent_path);
                     content_height -= ui.frame_height_with_spacing();
                 }
 
@@ -160,6 +163,10 @@ impl BrowserUI {
                         } else {
                             self.render_folder_contents(ui, model);
                         }
+
+                        let current_path =
+                            build_s3_path(&model.current_bucket, &model.current_prefix);
+                        render_browser_background_context_menu(ui, &current_path);
                     });
 
                 // Status bar
@@ -194,10 +201,12 @@ impl BrowserUI {
         let mut pending_hover_bucket: Option<String> = None;
         for name in &bucket_names {
             let label = format!("[B] {}", name);
+            let bucket_path = build_s3_path(name, "");
             if ui.selectable(label) {
                 model.navigate_into(name, "");
                 return;
             }
+            render_copy_path_context_menu(ui, &bucket_path);
             if ui.is_item_hovered() {
                 pending_hover_bucket = Some(name.clone());
             }
@@ -269,20 +278,24 @@ impl BrowserUI {
 
                 if is_folder_row {
                     let label = format!("[D] {}", obj.display_name);
+                    let copy_path = build_s3_path(&bucket, &obj.key);
                     if ui.selectable(label) {
                         pending_navigate = Some(obj.key.clone());
                     } else if ui.is_item_hovered() {
                         pending_hover_folder = Some(obj.key.clone());
                     }
+                    render_copy_path_context_menu(ui, &copy_path);
                 } else {
                     let label = format!("    {}  ({})", obj.display_name, format_size(obj.size));
                     let preview_key = format!("{}/{}", bucket, obj.key);
                     let is_selected = model.selected_preview.as_ref() == Some(&preview_key);
+                    let copy_path = build_s3_path(&bucket, &obj.key);
                     if ui.selectable_config(label).selected(is_selected).build() {
                         pending_select = Some(obj.key.clone());
                     } else if ui.is_item_hovered() {
                         pending_hover_file = Some(obj.key.clone());
                     }
+                    render_copy_path_context_menu(ui, &copy_path);
                 }
             }
         }
@@ -586,6 +599,50 @@ fn build_s3_path(bucket: &str, prefix: &str) -> String {
     }
 }
 
+fn parent_s3_path(bucket: &str, prefix: &str) -> String {
+    if bucket.is_empty() || prefix.is_empty() {
+        return "s3://".to_string();
+    }
+
+    let mut parent_prefix = prefix.to_string();
+    if parent_prefix.ends_with('/') {
+        parent_prefix.pop();
+    }
+
+    let parent_prefix = match parent_prefix.rfind('/') {
+        Some(pos) => &parent_prefix[..pos + 1],
+        None => "",
+    };
+
+    build_s3_path(bucket, parent_prefix)
+}
+
+fn render_copy_path_context_menu(ui: &Ui, path: &str) {
+    if let Some(_popup) = ui.begin_popup_context_item() {
+        render_copy_path_action(ui, path);
+    }
+}
+
+fn render_browser_background_context_menu(ui: &Ui, path: &str) {
+    if ui.is_window_hovered()
+        && !ui.is_any_item_hovered()
+        && ui.is_mouse_released(MouseButton::Right)
+    {
+        ui.open_popup("BrowserBackgroundContext");
+    }
+
+    if let Some(_popup) = ui.begin_popup("BrowserBackgroundContext") {
+        render_copy_path_action(ui, path);
+    }
+}
+
+fn render_copy_path_action(ui: &Ui, path: &str) {
+    if ui.selectable("Copy path") {
+        copy_text_to_clipboard(path);
+        ui.close_current_popup();
+    }
+}
+
 fn is_empty_complete_preview(bytes_written: u64, is_complete: bool) -> bool {
     is_complete && bytes_written == 0
 }
@@ -600,12 +657,33 @@ fn shortcut_mod_active(io: &Io) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_empty_complete_preview;
+    use super::{build_s3_path, is_empty_complete_preview, parent_s3_path};
 
     #[test]
     fn complete_zero_byte_preview_uses_empty_state() {
         assert!(is_empty_complete_preview(0, true));
         assert!(!is_empty_complete_preview(0, false));
         assert!(!is_empty_complete_preview(1, true));
+    }
+
+    #[test]
+    fn build_s3_path_formats_root_bucket_and_nested_prefixes() {
+        assert_eq!(build_s3_path("", ""), "s3://");
+        assert_eq!(build_s3_path("bucket", ""), "s3://bucket/");
+        assert_eq!(
+            build_s3_path("bucket", "folder/file.txt"),
+            "s3://bucket/folder/file.txt"
+        );
+    }
+
+    #[test]
+    fn parent_s3_path_returns_parent_folder_or_root() {
+        assert_eq!(parent_s3_path("", ""), "s3://");
+        assert_eq!(parent_s3_path("bucket", ""), "s3://");
+        assert_eq!(parent_s3_path("bucket", "folder/"), "s3://bucket/");
+        assert_eq!(
+            parent_s3_path("bucket", "folder/nested/"),
+            "s3://bucket/folder/"
+        );
     }
 }
