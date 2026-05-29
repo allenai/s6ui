@@ -31,3 +31,8 @@ futures-util = "0.3"
 flate2 = "1.0"
 zstd = "0.13"
 memmap2 = "0.9"
+
+# Image-WARC gallery: decode image payloads (png/jpeg/gif/webp/bmp/…)
+image = "0.25"
+# SVG rasterization for the gallery (the `image` crate doesn't handle SVG)
+resvg = "0.45"

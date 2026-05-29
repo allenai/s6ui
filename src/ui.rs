@@ -3,7 +3,9 @@ use crate::jsonl_viewer::JsonlPreviewer;
 use crate::model::{BrowserModel, PreviewNode, PreviewStatus};
 use crate::preview::StreamingFilePreview;
 use crate::text_viewer::MmapTextViewer;
+use crate::warc_viewer::WarcGallery;
 use dear_imgui_rs::*;
+use dear_imgui_wgpu::WgpuRenderer;
 use std::borrow::Cow;
 use std::sync::Arc;
 
@@ -12,6 +14,8 @@ pub struct BrowserUI {
     /// Text viewer for file preview
     text_viewer: MmapTextViewer,
     jsonl_previewer: JsonlPreviewer,
+    /// Image-WARC gallery viewer
+    warc_gallery: WarcGallery,
     /// Currently loaded preview key (bucket/key)
     viewer_preview_key: Option<String>,
     /// Backing preview object for the currently loaded preview key
@@ -24,9 +28,22 @@ impl BrowserUI {
             path_input: "s3://".to_string(),
             text_viewer: MmapTextViewer::new(),
             jsonl_previewer: JsonlPreviewer::new(),
+            warc_gallery: WarcGallery::new(),
             viewer_preview_key: None,
             viewer_preview_source_id: None,
         }
+    }
+
+    /// Decode + upload image-WARC textures for the selected preview. Must be called
+    /// once per frame *before* the ImGui frame begins (needs GPU access).
+    pub fn sync_warc_textures(
+        &mut self,
+        model: &BrowserModel,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        renderer: &mut WgpuRenderer,
+    ) {
+        self.warc_gallery.sync(model, device, queue, renderer);
     }
 
     pub fn render(&mut self, ui: &Ui, model: &mut BrowserModel, window_size: [f32; 2]) {
@@ -435,6 +452,14 @@ impl BrowserUI {
                     }
                     Some(node) => {
                         let filename = Self::filename_for_key(&node.key);
+
+                        // Image-WARC objects render as a thumbnail gallery (textures
+                        // were uploaded pre-frame in sync_warc_textures). Matches by
+                        // name or by content-sniff (extension-less Firehose batches).
+                        if WarcGallery::applies(node) {
+                            self.warc_gallery.render(ui, width, height);
+                            return;
+                        }
 
                         let handled_by_jsonl = JsonlPreviewer::can_handle(&node.key)
                             && self

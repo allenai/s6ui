@@ -1009,7 +1009,15 @@ impl BrowserModel {
     ) {
         let cache_key = Self::make_preview_cache_key(bucket, key);
         let request_id = self.next_request_id();
-        let compression = Compression::from_filename(key);
+        // WARC objects are parsed (and gzip-member-decoded) by the WARC gallery
+        // itself, so keep the on-disk preview as the raw object bytes rather than
+        // letting the single-stream gz/zstd transform touch them.
+        let lower = key.to_lowercase();
+        let compression = if lower.ends_with(".warc") || lower.ends_with(".warc.gz") {
+            Compression::None
+        } else {
+            Compression::from_filename(key)
+        };
 
         let preview = match StreamingFilePreview::new(compression) {
             Ok(preview) => Arc::new(preview),
@@ -1162,7 +1170,10 @@ impl BrowserModel {
     fn is_preview_supported(key: &str) -> bool {
         let dot_pos = match key.rfind('.') {
             Some(p) => p,
-            None => return false,
+            // Extension-less objects (e.g. Firehose-written WARC batches) are allowed
+            // through so the WARC gallery can content-sniff them; otherwise they'd
+            // fall back to the (harmless) text preview.
+            None => return true,
         };
         let mut ext = key[dot_pos..].to_lowercase();
 
@@ -1235,6 +1246,7 @@ impl BrowserModel {
                 | ".mk"
                 | ".gitignore"
                 | ".properties"
+                | ".warc"
         )
     }
 

@@ -9,6 +9,7 @@ mod settings;
 mod text_viewer;
 mod ui;
 mod ui_fonts;
+mod warc_viewer;
 
 use app_clipboard::SystemClipboardBackend;
 use aws::credentials;
@@ -361,13 +362,23 @@ impl AppWindow {
             Err(e) => return Err(Box::new(e)),
         };
 
+        // Process backend events
+        let had_backend_events = model.process_events();
+
+        // Upload/refresh image-WARC gallery textures before the ImGui frame, where
+        // the wgpu device/queue/renderer are reachable (the in-frame `ui` borrows
+        // self.imgui.context, so we touch self.imgui.renderer here instead).
+        browser_ui.sync_warc_textures(
+            model,
+            &self.device,
+            &self.queue,
+            &mut self.imgui.renderer,
+        );
+
         self.imgui
             .platform
             .prepare_frame(&self.window, &mut self.imgui.context);
         let ui = self.imgui.context.frame();
-
-        // Process backend events
-        let had_backend_events = model.process_events();
 
         // Get window size for UI
         let size = self.window.inner_size();
